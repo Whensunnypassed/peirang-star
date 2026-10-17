@@ -1,0 +1,4194 @@
+import * as THREE from 'three';
+import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+import { EffectComposer } from 'three/addons/postprocessing/EffectComposer.js';
+import { RenderPass } from 'three/addons/postprocessing/RenderPass.js';
+import { UnrealBloomPass } from 'three/addons/postprocessing/UnrealBloomPass.js';
+import { OutputPass } from 'three/addons/postprocessing/OutputPass.js';
+
+/* ===== ASTRO-BEGIN =====
+   纯函数天文核：不依赖 THREE / DOM，可整段抽出做数值自检。
+   ===== */
+const DEG = Math.PI / 180;
+const TAU = Math.PI * 2;
+const J2000_JD = 2451545.0;
+
+const norm360 = a => ((a % 360) + 360) % 360;
+const normRad = a => { a %= TAU; return a < 0 ? a + TAU : a; };
+function norm180(a) { a = norm360(a); return a > 180 ? a - 360 : a; }
+
+/* --- 行星根数：JPL/Standish 近似根数（1800–2050 AD）。
+       仅取算黄经所需的四项；后缀 R 表示每儒略世纪线性变率（L 为固定 J2000 春分点系）。
+       size 为画面半径：按「真实赤道半径比」开平方压缩后锚定地球=3.2，
+       既保持 木>土>天≈海>地≈金>火>水>月 的真实大小次序与相对观感，
+       又不至于让水星/月球在全系视野里缩成不可见像素。 --- */
+const PLANET_DATA = [
+  { key:'mercury', name:'水星', a: 0.38709927, aR: 0.00000037, e:0.20563593, eR: 0.00001906, L:252.25032350, LR:149472.67411175, w: 77.45779628, wR: 0.16047689, size:2.0, color:0xc9beb0 },
+  { key:'venus',   name:'金星', a: 0.72333566, aR: 0.00000390, e:0.00677672, eR:-0.00004107, L:181.97909950, LR: 58517.81538729, w:131.60246718, wR: 0.00268329, size:3.1, color:0xf2dcae },
+  { key:'earth',   name:'地球', a: 1.00000261, aR: 0.00000562, e:0.01671123, eR:-0.00004392, L:100.46645683, LR: 35999.37244981, w:102.93768193, wR: 0.32327364, size:3.2, color:0x3f7fd0 },
+  { key:'mars',    name:'火星', a: 1.52371034, aR: 0.00001847, e:0.09339410, eR: 0.00007882, L: -4.55343205, LR: 19140.30268499, w:-23.94362959, wR: 0.44441088, size:2.3, color:0xd05a3a },
+  { key:'jupiter', name:'木星', a: 5.20288700, aR:-0.00011607, e:0.04838624, eR:-0.00013253, L: 34.39644051, LR:  3034.74612775, w: 14.72847983, wR: 0.21252668, size:10.6, color:0xd8b98a },
+  { key:'saturn',  name:'土星', a: 9.53667594, aR:-0.00125060, e:0.05386179, eR:-0.00050991, L: 49.95424423, LR:  1222.49362201, w: 92.59887831, wR:-0.41897216, size:9.7, color:0xe0cf9a },
+  { key:'uranus',  name:'天王', a:19.18916464, aR:-0.00196176, e:0.04725744, eR:-0.00004397, L:313.23810451, LR:   428.48202785, w:170.95427630, wR: 0.40805281, size:6.4, color:0x8fd8e0 },
+  { key:'neptune', name:'海王', a:30.06992276, aR: 0.00026291, e:0.00859048, eR: 0.00005105, L:-55.12002969, LR:   218.45945325, w: 44.96476227, wR:-0.32241464, size:6.3, color:0x6f8fe0 }
+];
+const EMB = PLANET_DATA[2];          // 地月质心，当作「地球」观测原点
+
+/* --- 黄经总岁差（Meeus 21.5，单位弧度）：固定 J2000 春分点 → 当日春分点 --- */
+function precessionRad(T) {
+  return (5029.0966 * T + 1.11113 * T * T - 0.000006 * T * T * T) / 3600 * DEG;
+}
+
+/* --- 开普勒方程（牛顿迭代） --- */
+function solveKepler(M, e) {
+  M = normRad(M);
+  let E = (e < 0.8) ? M : Math.PI;
+  for (let i = 0; i < 12; i++) {
+    const d = (E - e * Math.sin(E) - M) / (1 - e * Math.cos(E));
+    E -= d;
+    if (Math.abs(d) < 1e-12) break;
+  }
+  return E;
+}
+
+/* --- 日心黄经与半径（黄道面内，共面）；黄经已加岁差，归算到当日春分点 --- */
+function helio(p, T) {
+  const a = p.a + p.aR * T;
+  const e = p.e + p.eR * T;
+  const w = (p.w + p.wR * T) * DEG;
+  const L = p.L + p.LR * T;
+  const M = L - (p.w + p.wR * T);
+  const E = solveKepler(M * DEG, e);
+  const xv = a * (Math.cos(E) - e);
+  const zv = a * Math.sqrt(1 - e * e) * Math.sin(E);
+  const nu = Math.atan2(zv, xv);
+  const prec = precessionRad(T);
+  return {
+    a, e, w: w + prec,
+    L: norm360(L + prec / DEG), M: norm360(M),
+    lon: norm360((nu + w + prec) / DEG),
+    r: Math.hypot(xv, zv)
+  };
+}
+
+/* --- 月球：Meeus 黄经主项 + 平升交点 + 平远地点（后二者即罗计与月孛） --- */
+function moonGeocentric(T) {
+  const Lp = 218.3164477 + 481267.88123421 * T;
+  const D  = 297.8501921 + 445267.1114034 * T;
+  const M  = 357.5291092 +  35999.0502909 * T;
+  const Mp = 134.9633964 + 477198.8675055 * T;
+  const F  =  93.2720950 + 483202.0175233 * T;
+  const S = d => Math.sin(d * DEG);
+  const lon = norm360(Lp
+    + 6.288774 * S(Mp)
+    + 1.274027 * S(2 * D - Mp)
+    + 0.658314 * S(2 * D)
+    + 0.213618 * S(2 * Mp)
+    - 0.185116 * S(M)
+    - 0.114332 * S(2 * F)
+    + 0.058793 * S(2 * D - 2 * Mp)
+    + 0.057066 * S(2 * D - M - Mp)
+    + 0.053322 * S(2 * D + Mp)
+    + 0.045758 * S(2 * D - M)
+    - 0.040923 * S(M - Mp)
+    - 0.034720 * S(D)
+    - 0.030383 * S(M + Mp)
+    + 0.015327 * S(2 * D - 2 * F)
+    - 0.012528 * S(Mp + 2 * F)
+    + 0.010980 * S(Mp - 2 * F));
+  const T2 = T * T, T3 = T2 * T, T4 = T3 * T;
+  const node = norm360(125.0445479 - 1934.1362891 * T + 0.0020754 * T2 + T3 / 467441 - T4 / 60616000);
+  return {
+    lon, node,
+    apogee: norm360(Lp - Mp + 180),
+    lat: 5.128 * S(F),
+    args: { Lp: norm360(Lp), D: norm360(D), M: norm360(M), Mp: norm360(Mp), F: norm360(F) }
+  };
+}
+
+/* --- 太阳黄经（真＝几何；视＝加光行差与章动主项） --- */
+function sunTrueLon(jd) { return norm360(helio(EMB, (jd - J2000_JD) / 36525).lon + 180); }
+function sunApparentLon(jd) {
+  const T = (jd - J2000_JD) / 36525;
+  const om = (125.04452 - 1934.136261 * T) * DEG;
+  return norm360(sunTrueLon(jd) - 0.00569 - 0.00478 * Math.sin(om));
+}
+function sunMeanLon(jd) {
+  const T = (jd - J2000_JD) / 36525;
+  return norm360(EMB.L + EMB.LR * T + precessionRad(T) / DEG + 180);
+}
+
+/* --- 紫炁：木之余气，顺行。历元取 Moira 排盘软件的定例：
+       period = 10227.1792 日（28 恒星年 = 28 x 365.2564）
+       1975-03-13 16:00 UT 紫炁在 230.5 度（0 度在亥宫与戌宫之间，逆时针前进）
+       —— 即 JD 2442480.1666667。另备《明史稿》行度 1/28 度/日（10080 日一周天），
+       其历元古籍未载，故同锚于 Moira 起点，仅周期不同，便于对照。 --- */
+const ZIQI_PERIOD = 10227.1792;
+const ZIQI_MODELS = [
+  { key: 'moira', name: 'Moira 定例（28 恒星年）', period: 10227.1792, baseJD: 2442480.1666667, baseLon: 230.5 },
+  { key: 'ming',  name: '明史稿行度（1/28 度/日）', period: 10080,     baseJD: 2442480.1666667, baseLon: 230.5 }
+];
+function ziqiLongitude(jd, arg) {
+  if (typeof arg === 'number') return norm360(arg + (jd - J2000_JD) * 360 / ZIQI_PERIOD);
+  const mm = (arg && typeof arg === 'object' && arg.period) ? arg : ZIQI_MODELS[0];
+  return norm360(mm.baseLon + (jd - mm.baseJD) * 360 / mm.period);
+}
+
+/* --- 儒略日与历日（1582-10-15 起格里历，之前儒略历） --- */
+function isGregorian(y, m, d) {
+  return (y > 1582) || (y === 1582 && (m > 10 || (m === 10 && d >= 15)));
+}
+function toJDN(y, m, d) {
+  let Y = y, M = m;
+  if (M <= 2) { Y -= 1; M += 12; }
+  const A = Math.floor(Y / 100);
+  const B = isGregorian(y, m, d) ? 2 - A + Math.floor(A / 4) : 0;
+  return Math.floor(365.25 * (Y + 4716)) + Math.floor(30.6001 * (M + 1)) + d + B - 1524;
+}
+function dateToJD(y, m, d, h, mi, s) {
+  return toJDN(y, m, d) - 0.5 + ((h || 0) + (mi || 0) / 60 + (s || 0) / 3600) / 24;
+}
+function jdToCalendar(jd) {
+  const z = Math.floor(jd + 0.5);
+  const f = jd + 0.5 - z;
+  const alpha = Math.floor((z - 1867216.25) / 36524.25);
+  const A = (z < 2299161) ? z : z + 1 + alpha - Math.floor(alpha / 4);
+  const B = A + 1524;
+  const C = Math.floor((B - 122.1) / 365.25);
+  const Dd = Math.floor(365.25 * C);
+  const E = Math.floor((B - Dd) / 30.6001);
+  const dayF = B - Dd - Math.floor(30.6001 * E) + f;
+  const day = Math.floor(dayF);
+  const frac = dayF - day;
+  const month = (E < 14) ? E - 1 : E - 13;
+  const year = (month > 2) ? C - 4716 : C - 4715;
+  let secs = Math.round(frac * 86400);
+  if (secs > 86399) secs = 86399;
+  return { y: year, m: month, d: day, h: Math.floor(secs / 3600), mi: Math.floor((secs % 3600) / 60), s: secs % 60 };
+}
+function pad2(n) { return (n < 10 ? '0' : '') + n; }
+function fmtCal(c) {
+  return c.y + '-' + pad2(c.m) + '-' + pad2(c.d) + ' ' + pad2(c.h) + ':' + pad2(c.mi) + ':' + pad2(c.s);
+}
+function isLeap(y) { return (y % 4 === 0 && y % 100 !== 0) || y % 400 === 0; }
+function daysInMonth(y, m) { return [31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31][m - 1] + (m === 2 && isLeap(y) ? 1 : 0); }
+
+/* --- 均时差（分钟）：真太阳时 − 平太阳时 --- */
+function equationOfTimeMin(jd) {
+  const T = (jd - J2000_JD) / 36525;
+  const lam = sunApparentLon(jd) * DEG;
+  const eps = (23.439291 - 0.0130042 * T) * DEG;
+  const ra = Math.atan2(Math.cos(eps) * Math.sin(lam), Math.cos(lam)) / DEG;
+  return 4 * norm180(sunMeanLon(jd) - ra);
+}
+
+/* --- 二十四节气：太阳视黄经为 15° 整数倍；下标 0 为春分，偶数中气、奇数节气 --- */
+const TERMS = ['春分','清明','谷雨','立夏','小满','芒种','夏至','小暑','大暑','立秋','处暑','白露',
+               '秋分','寒露','霜降','立冬','小雪','大雪','冬至','小寒','大寒','立春','雨水','惊蛰'];
+function findTermJD(jd, targetDeg) {
+  let x = jd;
+  for (let i = 0; i < 10; i++) {
+    const d = norm180(sunApparentLon(x) - targetDeg);
+    x -= d / 0.98564736;
+    if (Math.abs(d) < 1e-9) break;
+  }
+  return x;
+}
+function solarTermInfo(jd) {
+  const lam = sunApparentLon(jd);
+  const k = Math.floor(lam / 15);
+  const t0 = findTermJD(jd - norm360(lam - k * 15) / 0.98564736, k * 15);
+  const t1 = findTermJD(jd, (k + 1) * 15);
+  return { k, name: TERMS[k % 24], isJie: (k % 2 === 1), t0, t1 };
+}
+
+/* --- 干支 --- */
+const GAN = '甲乙丙丁戊己庚辛壬癸';
+const ZHI = '子丑寅卯辰巳午未申酉戌亥';
+function sexagenary(i) { i = ((i % 60) + 60) % 60; return GAN[i % 10] + ZHI[i % 12]; }
+function dayGanzhi(jdn) { return sexagenary(jdn + 49); }   // 锚点：1949-10-01 为甲子日
+function ganzhiYearOf(jd) {
+  const c = jdToCalendar(jd + 8 / 24);                     // 以北京时间定年
+  const lichun = findTermJD(dateToJD(c.y, 2, 4, 0, 0, 0), 315);
+  return sexagenary(((jd + 8 / 24 >= lichun) ? c.y : c.y - 1) - 4);
+}
+function monthGanzhi(lam, yearGanIdx) {
+  const j = Math.floor(norm360(lam - 315) / 30);           // 0 为寅月，自立春起
+  return { name: GAN[(2 * yearGanIdx + 2 + j) % 10] + ZHI[(j + 2) % 12], startTerm: TERMS[(21 + j * 2) % 24] };
+}
+function hourGanzhi(dayGanIdx, trueHour) {
+  const zhi = Math.floor(((trueHour + 1) % 24) / 2);
+  return GAN[(2 * dayGanIdx + zhi) % 10] + ZHI[zhi];
+}
+
+/* --- 十二宫：回归黄道，戌宫自 0° 起。宫名用地支，配古十二次；不用西方星座名 --- */
+const GONG = [
+  { chen:'戌', ci:'降娄' }, { chen:'酉', ci:'大梁' }, { chen:'申', ci:'实沈' },
+  { chen:'未', ci:'鹑首' }, { chen:'午', ci:'鹑火' }, { chen:'巳', ci:'鹑尾' },
+  { chen:'辰', ci:'寿星' }, { chen:'卯', ci:'大火' }, { chen:'寅', ci:'析木' },
+  { chen:'丑', ci:'星纪' }, { chen:'子', ci:'玄枵' }, { chen:'亥', ci:'娵訾' }
+];
+function gongIndex(lon) { return Math.floor(norm360(lon) / 30) % 12; }
+function gongText(lon) {
+  const l = norm360(lon), i = gongIndex(l);
+  return GONG[i].chen + '宫 ' + (l - i * 30).toFixed(2) + '°';
+}
+
+/* --- 十一曜：名、字、色 --- */
+const YAO = {
+  sun:      { char:'日', name:'太阳', color:'#ffd54a' },
+  moon:     { char:'月', name:'太阴', color:'#dfe9ff' },
+  mercury:  { char:'水', name:'水星', color:'#a9c8e8' },
+  venus:    { char:'金', name:'金星', color:'#ffe9a8' },
+  mars:     { char:'火', name:'火星', color:'#ff7a5c' },
+  jupiter:  { char:'木', name:'木星', color:'#7ddc9a' },
+  saturn:   { char:'土', name:'土星', color:'#d8b47a' },
+  rahu:     { char:'罗', name:'罗睺', color:'#c98bff' },
+  jidu:     { char:'计', name:'计都', color:'#8bb6ff' },
+  ziqi:     { char:'炁', name:'紫炁', color:'#79e6d0' },
+  yuebo:    { char:'孛', name:'月孛', color:'#ff9fd0' }
+};
+const SEVEN_PLANETS = ['mercury', 'venus', 'mars', 'jupiter', 'saturn'];
+
+/* --- 单一入口：给定儒略日，算出十一曜黄经与各行星地心几何 --- */
+function computeSnapshot(jd, ziqiEpochLon) {
+  const T = (jd - J2000_JD) / 36525;
+  const Tb = (jd + 0.5 - J2000_JD) / 36525;      // 半日后，用于求行度
+  const dt = 0.5;
+
+  const eH = helio(EMB, T), eHb = helio(EMB, Tb);
+  const ex = eH.r * Math.cos(eH.lon * DEG), ez = eH.r * Math.sin(eH.lon * DEG);
+  const exb = eHb.r * Math.cos(eHb.lon * DEG), ezb = eHb.r * Math.sin(eHb.lon * DEG);
+
+  const bodies = [];
+  const push = (id, lon, rate) => bodies.push({ id, char: YAO[id].char, name: YAO[id].name, color: YAO[id].color, lon, rate });
+
+  const sunLon = sunApparentLon(jd);
+  push('sun', sunLon, norm180(sunApparentLon(jd + dt) - sunLon) / dt);
+
+  const mo = moonGeocentric(T), mob = moonGeocentric(Tb);
+  push('moon', mo.lon, norm180(mob.lon - mo.lon) / dt);
+
+  const geo = {};
+  for (const p of PLANET_DATA) {
+    const h = helio(p, T), hb = helio(p, Tb);
+    const x = h.r * Math.cos(h.lon * DEG), z = h.r * Math.sin(h.lon * DEG);
+    const xb = hb.r * Math.cos(hb.lon * DEG), zb = hb.r * Math.sin(hb.lon * DEG);
+    const lon = norm360(Math.atan2(z - ez, x - ex) / DEG);
+    const lonb = norm360(Math.atan2(zb - ezb, xb - exb) / DEG);
+    const rate = norm180(lonb - lon) / dt;
+    geo[p.key] = { lon, rate, x, z, r: Math.hypot(x - ex, z - ez) };
+    if (SEVEN_PLANETS.indexOf(p.key) >= 0) push(p.key, lon, rate);
+  }
+
+  const rate = d => norm180(d) / dt;
+  push('rahu',  mo.node,             rate(mob.node - mo.node));
+  push('jidu',  norm360(mo.node + 180), rate(mob.node - mo.node));
+  const zqM = (ziqiEpochLon && typeof ziqiEpochLon === 'object' && ziqiEpochLon.period) ? ziqiEpochLon : null;
+  push('ziqi',  ziqiLongitude(jd, ziqiEpochLon), 360 / (zqM ? zqM.period : ZIQI_PERIOD));
+  push('yuebo', mo.apogee,           rate(mob.apogee - mo.apogee));
+
+  return { bodies, geo, moon: mo, earthHelio: { x: ex, z: ez, r: eH.r }, T };
+}
+/* --- 星辰庙旺：殿、垣、庙、旺、乐、喜、怒（依 Moira 「星辰{曜}=宫:状态」表） --- */
+const MIAO_SEQ = ['殿', '垣', '庙', '旺', '乐', '喜', '怒'];
+const MIAO = {
+  '日': { '午': '垣', '巳': '旺', '戌': '旺', '辰': '乐', '寅': '喜' },
+  '月': { '未': '垣', '戌': '庙', '酉': '旺', '卯': '喜', '亥': '喜' },
+  '金': { '酉': '垣', '辰': '垣', '午': '旺', '亥': '旺', '巳': '喜', '寅': '怒' },
+  '木': { '寅': '垣', '亥': '垣', '未': '旺', '子': '怒' },
+  '水': { '申': '垣', '巳': '垣', '午': '庙', '子': '旺', '辰': '喜', '戌': '怒' },
+  '火': { '卯': '垣', '戌': '垣', '丑': '旺', '申': '喜', '酉': '怒' },
+  '土': { '丑': '垣', '子': '垣', '辰': '旺', '卯': '旺', '午': '喜', '巳': '怒' },
+  '计': { '巳': '庙', '亥': '庙', '卯': '旺', '寅': '旺', '戌': '旺', '子': '喜' },
+  '罗': { '午': '庙', '寅': '庙', '卯': '旺', '戌': '喜' },
+  '炁': { '申': '庙', '丑': '旺', '亥': '旺', '戌': '喜' },
+  '孛': { '未': '庙', '巳': '旺', '寅': '旺', '子': '乐', '酉': '乐', '亥': '喜' }
+};
+const MIAO_SCORE = { '垣': 3, '庙': 3, '旺': 2, '乐': 2, '喜': 1, '怒': -2 };
+function miaoWang(char, chen) {
+  const t = MIAO[char];
+  return (t && t[chen]) ? t[chen] : '';
+}
+/* --- 失垣（落陷）：曜入「克我之曜」的本垣。
+       Moira：@{}[1]=${剋{}}；其宫之五行按该宫垣主取（卯戌属火、辰酉属金、子丑属土、
+       巳申属水、寅亥属木、午属火、未属水），故金在卯戌、木在辰酉、水在子丑、
+       火在巳申、土在寅亥皆为失垣；日居未（月位）、月居午（日宫）亦然。 --- */
+/* 十一曜五行（生克用）：日为「火之精」、月为「水之精」，故日＝火、月＝水；余九曜各归五行。
+   ——《七政四余（全）》第108页「太阳乃火之精」·第115页「太阴乃是水之精」；
+     《七政四余古赋注（上册）》第113页「（日为火之副，宜在寅午戌之宫）」「太阳为火精」
+     「（月乃水之精，妙临申子辰之位）」。
+   ⚠ 日月另有一层「阴阳」属性（日＝阳·君·乾，月＝阴·后·坤），与本表的五行属性并存、各司其职：
+   ——《七政四余择日·本原论》「日为阳精，君象也。月为阴精，后象也。五星为五行之精」；
+     《古赋注（上册）》第112页「太阳太阴，在星政上是阴阳的词属」；《古赋注（中册）·阴阳拱主朝真禄》「日为阳矅，月为阴」。
+   阴阳层见本文件另一表 CAMP_QI（日阳月阴），用于气息／昼夜生／营地；五行层（本表）用于生克、失垣、宫曜关系。
+   又：命度主为日月时不用五行套恩难，改用《（全）》第13页(十九)特殊条文（日喜金水·怕木，月喜火罗·怕土计）。 */
+const YAO_WUXING = { '日': '火', '月': '水', '金': '金', '木': '木', '水': '水', '火': '火', '土': '土', '计': '土', '罗': '火', '炁': '木', '孛': '水' };
+const GONG_WUXING = { '子': '土', '丑': '土', '寅': '木', '卯': '火', '辰': '金', '巳': '水', '午': '火', '未': '水', '申': '水', '酉': '金', '戌': '火', '亥': '木' };
+/* KE_OF[我] ＝ 克我者的五行；故「克我者」查 KE_OF，而 SHENG_OF[我] ＝ 我生者、「生我者」查 SHENG_ME。
+   两者互为对偶，用于「点曜看成因」的生克／帮扶连线。 */
+const KE_OF = { '金': '火', '木': '金', '水': '土', '火': '水', '土': '木' };
+const SHENG_OF = { '木': '火', '火': '土', '土': '金', '金': '水', '水': '木' };
+const SHENG_ME = (function () { const o = {}; for (const k of Object.keys(SHENG_OF)) o[SHENG_OF[k]] = k; return o; })();
+/* KE_ME_OF[我] ＝ 我克者的五行（KE_OF 的逆表）：KE_OF[金]='火' 即火克金，故 KE_ME_OF[火]='金'。 */
+const KE_ME_OF = (function () { const o = {}; for (const k of Object.keys(KE_OF)) o[KE_OF[k]] = k; return o; })();
+const SHIYUAN_SOLAR = { '日': ['未'], '月': ['午'] };
+function shiYuan(char, chen) {
+  const sp = SHIYUAN_SOLAR[char];
+  if (sp) return sp.indexOf(chen) >= 0;
+  const wx = YAO_WUXING[char];
+  return !!wx && GONG_WUXING[chen] === KE_OF[wx];
+}
+/* --- 二十八宿：距星黄经取 Moira 固定值（1997.0 年），再按黄经总岁差推进。
+       宿名末字即其七曜五行（娄金、胃土、昴日…），起点 0 度为戌宫之初。 --- */
+const SU_NAMES = ['娄金', '胃土', '昴日', '毕月', '觜火', '参水', '井木', '鬼金', '柳土', '星日', '张月', '翼火', '轸水', '角木', '亢金', '氐土', '房日', '心月', '尾火', '箕水', '斗木', '牛金', '女土', '虚日', '危月', '室火', '壁水', '奎木'];
+const SU_1997 = [33.95, 46.92, 59.40, 68.47, 83.67, 84.67, 95.28, 125.73, 130.71, 146.71, 154.70, 173.77, 190.71, 203.52, 214.52, 225.10, 242.95, 247.80, 256.06, 271.25, 280.20, 304.10, 311.77, 323.44, 333.40, 353.47, 10.22, 22.44];
+const SU_EPOCH_JD = 2450450.5;
+const SU_T_EPOCH = (SU_EPOCH_JD - J2000_JD) / 36525;
+function suLon(i, jd) {
+  const T = (jd - J2000_JD) / 36525;
+  return norm360(SU_1997[i] + (precessionRad(T) - precessionRad(SU_T_EPOCH)) / DEG);
+}
+function suOf(jd, lon) {
+  const l = norm360(lon);
+  for (let i = 0; i < 28; i++) {
+    const a = suLon(i, jd), span = norm360(suLon((i + 1) % 28, jd) - a);
+    if (norm360(l - a) < span) {
+      const nm = SU_NAMES[i];
+      return { i: i, name: nm, short: nm.charAt(0), attr: nm.charAt(1), deg: norm360(l - a), start: a };
+    }
+  }
+  const nm = SU_NAMES[0];
+  return { i: 0, name: nm, short: nm.charAt(0), attr: nm.charAt(1), deg: 0, start: SU_1997[0] };
+}
+/* --- 五星迟速阈值（Moira slow_speed / fast_speed，度/日，序：金木水火土） --- */
+const SLOW_SPEED = { '金': 0.71, '木': 0.05, '水': 0.88, '火': 0.4, '土': 0.02 };
+const FAST_SPEED = { '金': 1.245, '木': 0.23, '水': 1.50, '火': 0.70, '土': 0.13 };
+const STATIONARY_GAP = { '金': 0.15, '木': 0.07, '水': 0.1, '火': 0.2, '土': 0.05 };
+const INVISIBLE_GAP = { '金': 3.0, '木': 3.0, '水': 3.0, '火': 3.0, '土': 3.0 };
+function speedClass(char, rate) {
+  const s = SLOW_SPEED[char], f = FAST_SPEED[char];
+  if (s === undefined || f === undefined) return '';
+  if (rate < 0) return '';
+  const a = Math.abs(rate);
+  if (a < s) return '迟';
+  if (a > f) return '速';
+  return '平';
+}
+
+/* ===== ASTRO-END ===== */
+
+
+/* ---------------- 尺度与场景 ---------------- */
+const AU_SCALE = 120;
+/* 太阳画面半径：真实比例（109 倍地球）即使开方也达 33.5，会吞掉水星轨道；
+   取 24 ≈ 7.5 倍地球，仍是全画面最大天体，且与水星轨道（46.5）保持清晰间隙。 */
+const SUN_SIZE = 24;
+const MOON_ORBIT_VISUAL = 18;
+const XUYU_RING = 23;
+/* 各行星真实转轴倾角（度，相对各自轨道面）与自转周期（小时，负值＝逆行自转）。
+   只用于 3D 的「姿态呈现」——自转速度由 simJD 直接推得，故与时间轴同步：
+   默认 1× 时几乎看不出来，调到 5000× 即地球约 17 秒转一圈。不参与任何黄经或规则计算。 */
+const PLANET_SPIN = {
+  mercury: { tilt: 0.034, hours: 1407.6 },
+  venus:   { tilt: 177.4, hours: -5832.5 },
+  earth:   { tilt: 23.44, hours: 23.9345 },
+  mars:    { tilt: 25.19, hours: 24.6229 },
+  jupiter: { tilt: 3.13,  hours: 9.925 },
+  saturn:  { tilt: 26.73, hours: 10.656 },
+  uranus:  { tilt: 97.77, hours: -17.24 },
+  neptune: { tilt: 28.32, hours: 16.11 }
+};
+/* 自转角：以自转周期为分母，从儒略日直接推，负周期自然得到反向自转。
+   球面纹理随「行星半径/单位」缩放，条纹速度因此看起来与体积相称。 */
+function spinAngle(jd, hours) {
+  const per = hours / 24;                    /* 自转周期（日） */
+  if (!per || !isFinite(per)) return 0;
+  let f = (jd / per) % 1; if (f < 0) f += 1;
+  return f * TAU;
+}
+const ECL_RING = 30;
+const STAR_COUNT = 1800;
+const MOON_INCL = 5.145 * DEG;
+
+const renderer = new THREE.WebGLRenderer({ antialias: true });
+renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+renderer.setSize(window.innerWidth, window.innerHeight);
+/* 电影级色调映射 + sRGB 输出：点光高光不再死白，暗部保留层次，
+   配合后面的泛光通道，太阳/能量线/状态环的「辉光」才有物理感。 */
+renderer.toneMapping = THREE.ACESFilmicToneMapping;
+renderer.toneMappingExposure = 1.18;
+renderer.outputColorSpace = THREE.SRGBColorSpace;
+document.body.appendChild(renderer.domElement);
+
+const scene = new THREE.Scene();
+const camera = new THREE.PerspectiveCamera(50, window.innerWidth / window.innerHeight, 0.5, 400000);
+
+/* ---------------- OrbitControls ----------------
+   地心盘要求「地球恒居画面中心」，故 target 锁定原点、禁用平移；
+   左键旋转 + 滚轮缩放由 OrbitControls 接管（带阻尼，手感平滑）。 */
+const controls = new OrbitControls(camera, renderer.domElement);
+controls.target.set(0, 0, 0);
+controls.enableDamping = true;
+controls.dampingFactor = 0.07;
+controls.rotateSpeed = 0.55;
+controls.zoomSpeed = 0.9;
+controls.enablePan = false;
+controls.minDistance = 8;
+controls.maxDistance = 200000;
+/* 初始视角：原「内行星」预设（theta=0, phi≈56.25°, dist=430） */
+camera.position.setFromSphericalCoords(430, Math.PI / 3.2, 0);
+controls.update();
+
+/* ---------------- 泛光通道 ----------------
+   只对亮度过阈的像素起辉：太阳本体、加色混合的能量流光、选中态的环
+   自然发光；宫环/轨道等低亮度线条保持细线观感，不会被光晕糊掉。 */
+const composer = new EffectComposer(renderer);
+composer.addPass(new RenderPass(scene, camera));
+const bloomPass = new UnrealBloomPass(
+  new THREE.Vector2(window.innerWidth, window.innerHeight), 0.5, 0.6, 0.85);
+composer.addPass(bloomPass);
+composer.addPass(new OutputPass());
+
+/* solarFrame：日心系（太阳与行星的真实日心位置都在这里，每帧整体平移使地球落到原点） */
+const solarFrame = new THREE.Group();
+scene.add(solarFrame);
+
+/* geoFrame：地心系。地球恒在场景原点，故一切「以地心为准」的东西
+   （月球、白道、交点线、四余虚星、十二宫刻度环）都挂在这里，不能挂 solarFrame。 */
+const geoFrame = new THREE.Group();
+scene.add(geoFrame);
+
+const sunLight = new THREE.PointLight(0xfff2d0, 3.2, 0, 0);
+solarFrame.add(sunLight);
+/* 环境光压到很低（深蓝冷调）：否则整颗星体被均匀照亮，太阳点光造成的明暗界线被冲淡，
+   月相与各星体的「阴晴圆缺」就看不出来了。0.45 仍保证背光面不至于全黑。 */
+scene.add(new THREE.AmbientLight(0x2a3550, 0.45));
+
+/* 星空 */
+const stars = (() => {
+  const g = new THREE.BufferGeometry();
+  const pos = new Float32Array(STAR_COUNT * 3);
+  for (let i = 0; i < STAR_COUNT; i++) {
+    const u = Math.random() * 2 - 1, th = Math.random() * TAU, r = 60000;
+    const s = Math.sqrt(1 - u * u);
+    pos[i * 3] = r * s * Math.cos(th);
+    pos[i * 3 + 1] = r * u;
+    pos[i * 3 + 2] = r * s * Math.sin(th);
+  }
+  g.setAttribute('position', new THREE.BufferAttribute(pos, 3));
+  const p = new THREE.Points(g, new THREE.PointsMaterial({ color: 0x9fb4d8, size: 150, sizeAttenuation: true }));
+  scene.add(p);
+  return p;
+})();
+
+/* 太阳：本体色压到 HDR（>1）让泛光通道吃得住，外加一圈程序化日冕光晕。
+   光晕用加色精灵（径向渐变纹理），永远面向相机，缩放随「太阳/相机距离」
+   自然淡出，全系远景时不至于糊满画面。 */
+const sunMesh = new THREE.Mesh(
+  new THREE.SphereGeometry(SUN_SIZE, 48, 32),
+  new THREE.MeshBasicMaterial({ color: new THREE.Color(0xffd257).multiplyScalar(2.4) })
+);
+solarFrame.add(sunMesh);
+
+const sunGlow = (() => {
+  const cv = document.createElement('canvas');
+  cv.width = cv.height = 256;
+  const g = cv.getContext('2d');
+  const grad = g.createRadialGradient(128, 128, 0, 128, 128, 128);
+  grad.addColorStop(0.00, 'rgba(255,236,170,0.8)');
+  grad.addColorStop(0.18, 'rgba(255,214,110,0.38)');
+  grad.addColorStop(0.42, 'rgba(255,170,70,0.14)');
+  grad.addColorStop(0.70, 'rgba(255,120,50,0.05)');
+  grad.addColorStop(1.00, 'rgba(255,100,40,0)');
+  g.fillStyle = grad; g.fillRect(0, 0, 256, 256);
+  const tex = new THREE.CanvasTexture(cv);
+  const sp = new THREE.Sprite(new THREE.SpriteMaterial({
+    map: tex, transparent: true, depthWrite: false,
+    blending: THREE.AdditiveBlending
+  }));
+  sp.scale.setScalar(SUN_SIZE * 3);
+  solarFrame.add(sp);
+  return sp;
+})();
+const SUN_GLOW_BASE = SUN_SIZE * 3;
+
+/* 径向柔光贴图：现用于四余气体球外围的光晕 sprite（加色混合，边缘自然消融）。
+   原先也用作能量线流光粒子的圆点贴图，流光已按需求移除。 */
+const SPARK_TEX = (() => {
+  const cv = document.createElement('canvas');
+  cv.width = cv.height = 64;
+  const g = cv.getContext('2d');
+  const grad = g.createRadialGradient(32, 32, 0, 32, 32, 32);
+  grad.addColorStop(0.00, 'rgba(255,255,255,1)');
+  grad.addColorStop(0.35, 'rgba(255,255,255,0.85)');
+  grad.addColorStop(0.75, 'rgba(255,255,255,0.25)');
+  grad.addColorStop(1.00, 'rgba(255,255,255,0)');
+  g.fillStyle = grad; g.fillRect(0, 0, 64, 64);
+  const tex = new THREE.CanvasTexture(cv);
+  tex.colorSpace = THREE.SRGBColorSpace;
+  return tex;
+})();
+
+/* ---------------- 真实地表纹理 ----------------
+   行星表面纹理来自 Solar System Scope（https://www.solarsystemscope.com/textures/ ，
+   许可 CC BY 4.0，出处标注见左侧面板底部），已本地化到 public/textures/，离线运行不联网。
+   某张图加载失败时回退到下面的程序化纹理（种子固定 → 每次刷新一致、不会闪烁）。 */
+const REAL_TEX = {
+  mercury: 'textures/2k_mercury.jpg',
+  venus:   'textures/2k_venus_atmosphere.jpg',
+  earth:   'textures/2k_earth_daymap.jpg',
+  mars:    'textures/2k_mars.jpg',
+  jupiter: 'textures/2k_jupiter.jpg',
+  saturn:  'textures/2k_saturn.jpg',
+  uranus:  'textures/2k_uranus.jpg',
+  neptune: 'textures/2k_neptune.jpg',
+  moon:    'textures/2k_moon.jpg'
+};
+const texLoader = new THREE.TextureLoader();
+function loadRealTex(key, apply) {
+  if (!REAL_TEX[key] || !texLoader || !texLoader.load) return;
+  texLoader.load(REAL_TEX[key], function (t) {
+    t.colorSpace = THREE.SRGBColorSpace;
+    if (t.wrapS !== undefined) t.wrapS = THREE.RepeatWrapping;
+    apply(t);
+  });
+}
+
+/* 程序化回退纹理：纯色球自转时看不出在转，按天体类型生成一张确定性小纹理 */
+function mulberry32(a) {
+  return function () {
+    a |= 0; a = a + 0x6D2B79F5 | 0;
+    let t = Math.imul(a ^ a >>> 15, 1 | a);
+    t = t + Math.imul(t ^ t >>> 7, 61 | t) ^ t;
+    return ((t ^ t >>> 14) >>> 0) / 4294967296;
+  };
+}
+function makeSurfaceTexture(key, baseHex) {
+  const W = 256, H = 128;
+  const cv = document.createElement('canvas');
+  cv.width = W; cv.height = H;
+  const g = cv.getContext('2d');
+  const bc = new THREE.Color(baseHex);
+  g.fillStyle = '#' + bc.getHexString(); g.fillRect(0, 0, W, H);
+  const SEED = { mercury: 11, venus: 23, earth: 37, mars: 53, jupiter: 71, saturn: 89, uranus: 97, neptune: 113, moon: 131 };
+  const rnd = mulberry32(SEED[key] || 5);
+  const hsl = { h: 0, s: 0, l: 0 };
+  bc.getHSL(hsl);
+  const tint = function (dL, alpha) {
+    const c = new THREE.Color();
+    c.setHSL(hsl.h + (rnd() - 0.5) * 0.05,
+      Math.max(0, Math.min(1, hsl.s + (rnd() - 0.5) * 0.2)),
+      Math.max(0.04, Math.min(0.96, hsl.l + dL)));
+    return 'rgba(' + Math.round(c.r * 255) + ',' + Math.round(c.g * 255) + ',' + Math.round(c.b * 255) + ',' + alpha + ')';
+  };
+  if (key === 'jupiter' || key === 'saturn' || key === 'uranus' || key === 'neptune') {
+    for (let y = 0; y < H; y += 2 + Math.floor(rnd() * 3)) {
+      g.fillStyle = tint((rnd() - 0.5) * 0.20, 0.55);
+      g.fillRect(0, y, W, 2 + Math.floor(rnd() * 4));
+    }
+  } else if (key === 'moon') {
+    g.fillStyle = 'rgba(88,94,110,0.66)';
+    g.beginPath(); g.ellipse(W * 0.5, H * 0.42, 46, 30, 0, 0, TAU); g.fill();
+    for (let i = 0; i < 34; i++) {
+      g.fillStyle = 'rgba(122,130,146,' + (0.18 + rnd() * 0.3).toFixed(2) + ')';
+      g.beginPath(); g.arc(rnd() * W, rnd() * H, 2 + rnd() * 8, 0, TAU); g.fill();
+    }
+  } else {
+    for (let i = 0; i < 46; i++) {
+      const r = 3 + rnd() * 16;
+      g.fillStyle = tint((rnd() - 0.42) * 0.3, 0.32 + rnd() * 0.36);
+      g.beginPath();
+      g.ellipse(rnd() * W, rnd() * H, r * (0.7 + rnd() * 0.8), r * (0.5 + rnd() * 0.7), rnd() * Math.PI, 0, TAU);
+      g.fill();
+    }
+    if (key === 'earth' || key === 'mars') {
+      g.fillStyle = 'rgba(238,246,255,0.7)';
+      g.fillRect(0, 0, W, 7); g.fillRect(0, H - 7, W, 7);
+    }
+  }
+  const tex = new THREE.CanvasTexture(cv);
+  if (tex.wrapS !== undefined) tex.wrapS = THREE.RepeatWrapping;
+  return tex;
+}
+
+/* 行星与轨道线 */
+const planetObjects = [];
+for (const p of PLANET_DATA) {
+  const group = new THREE.Group();
+  /* 自转轴倾角用一层 pivot 承担，网格自身只绕本地 y 轴自转：
+     直接在同一个对象上叠加「倾角 + 自转」会被默认 XYZ 欧拉序互相污染。 */
+  const pivot = new THREE.Group();
+  const sp = PLANET_SPIN[p.key] || { tilt: 0, hours: 24 };
+  pivot.rotation.z = sp.tilt * DEG;
+  const mesh = new THREE.Mesh(
+    new THREE.SphereGeometry(p.size, 24, 18),
+    new THREE.MeshStandardMaterial({ color: p.color, roughness: 0.85, metalness: 0.05, map: makeSurfaceTexture(p.key, p.color) })
+  );
+  /* 真实贴图加载成功后换图并取消本色（color 会乘进贴图，留着本色会把真实地貌染偏） */
+  loadRealTex(p.key, function (t) {
+    mesh.material.map = t;
+    mesh.material.color.setHex(0xffffff);
+    mesh.material.needsUpdate = true;
+  });
+  pivot.add(mesh);
+  if (p.key === 'saturn') {
+    /* 土星环是真实物理特征（环面即赤道面），故随 pivot 一起倾斜、不随本体自转。
+       内外径取真实环系比例（C 环内缘≈1.24R、A 环外缘≈2.27R）；
+       改用受光材质：环面背光侧随本体一起入夜，而不是永远自发光。 */
+    const ringGeo = new THREE.RingGeometry(p.size * 1.24, p.size * 2.27, 96);
+    /* 真实环带贴图是 2048×125 的横向条带，默认 UV（覆盖外接方框）会把条带斜切进环面；
+       按半径重映射：u＝该点半径在环系内的归一化位置，v 取条带中线 */
+    const rp = ringGeo.attributes.position, ruv = ringGeo.attributes.uv;
+    const rIn = p.size * 1.24, rOut = p.size * 2.27;
+    for (let i = 0; i < rp.count; i++) {
+      const r = Math.hypot(rp.getX(i), rp.getY(i));
+      ruv.setXY(i, (r - rIn) / (rOut - rIn), 0.5);
+    }
+    const ring = new THREE.Mesh(
+      ringGeo,
+      new THREE.MeshStandardMaterial({ color: 0xd9c48a, side: THREE.DoubleSide, transparent: true, opacity: 0.6, roughness: 0.9, metalness: 0 })
+    );
+    /* 环的疏密（Cassini 缝等）用 alphaMap 表达：黑＝缝、亮＝环带 */
+    texLoader.load('textures/2k_saturn_ring_alpha.png', function (t) {
+      t.colorSpace = THREE.SRGBColorSpace;
+      ring.material.alphaMap = t;
+      ring.material.needsUpdate = true;
+    });
+    ring.rotation.x = Math.PI / 2;
+    pivot.add(ring);
+  }
+  group.add(pivot);
+  solarFrame.add(group);
+
+  const orbitGeo = new THREE.BufferGeometry();
+  orbitGeo.setAttribute('position', new THREE.BufferAttribute(new Float32Array(241 * 3), 3));
+  const orbit = new THREE.Line(orbitGeo, new THREE.LineBasicMaterial({ color: p.color, transparent: true, opacity: 0.35 }));
+  solarFrame.add(orbit);
+
+  planetObjects.push({ data: p, group, pivot, spin: sp, mesh, orbit, helio: { x: 0, z: 0, r: 0 }, geoLon: 0 });
+}
+const earthGroup = planetObjects[2].group;
+
+/* 月球（地心系） */
+const moonMesh = new THREE.Mesh(
+  new THREE.SphereGeometry(1.7, 24, 16),
+  new THREE.MeshStandardMaterial({
+    color: 0xd8dde8, roughness: 0.9, metalness: 0,
+    /* 正面暗「海」纹理：潮汐锁定时这块始终朝向地球，加上太阳点光即可看出阴晴圆缺 */
+    map: makeSurfaceTexture('moon', 0xd8dde8)
+  })
+);
+loadRealTex('moon', function (t) {
+  moonMesh.material.map = t;
+  moonMesh.material.color.setHex(0xffffff);
+  moonMesh.material.needsUpdate = true;
+});
+geoFrame.add(moonMesh);
+
+const moonOrbitGeo = new THREE.BufferGeometry();
+moonOrbitGeo.setAttribute('position', new THREE.BufferAttribute(new Float32Array(129 * 3), 3));
+const moonOrbitLine = new THREE.Line(moonOrbitGeo, new THREE.LineBasicMaterial({ color: 0x6d86b8, transparent: true, opacity: 0.5 }));
+geoFrame.add(moonOrbitLine);
+
+const nodeLineGeo = new THREE.BufferGeometry();
+nodeLineGeo.setAttribute('position', new THREE.BufferAttribute(new Float32Array(2 * 3), 3));
+const nodeLine = new THREE.Line(nodeLineGeo, new THREE.LineBasicMaterial({ color: 0x9a6fd0, transparent: true, opacity: 0.42 }));
+geoFrame.add(nodeLine);
+
+/* 十二宫刻度环 */
+const gongGroup = new THREE.Group();
+const gongLabels = [];
+const gongCiLabels = [];
+(function buildRing() {
+  const N = 720, pts = [];
+  for (let i = 0; i <= N; i++) {
+    const a = TAU * i / N;
+    pts.push(new THREE.Vector3(Math.cos(a) * ECL_RING, 0, Math.sin(a) * ECL_RING));
+  }
+  gongGroup.add(new THREE.Line(new THREE.BufferGeometry().setFromPoints(pts), new THREE.LineBasicMaterial({ color: 0x2f4a70 })));
+
+  const minor = [], major = [];
+  for (let d = 0; d < 360; d += 5) {
+    const a = d * DEG, isMajor = (d % 30 === 0), L = isMajor ? 3.6 : 1.5;
+    const arr = isMajor ? major : minor;
+    arr.push(Math.cos(a) * ECL_RING, 0, Math.sin(a) * ECL_RING,
+             Math.cos(a) * (ECL_RING - L), 0, Math.sin(a) * (ECL_RING - L));
+  }
+  for (const spec of [[minor, 0x2b3f5c, 0.85], [major, 0x4b6d9c, 1.0]]) {
+    const g = new THREE.BufferGeometry();
+    g.setAttribute('position', new THREE.BufferAttribute(new Float32Array(spec[0]), 3));
+    gongGroup.add(new THREE.LineSegments(g, new THREE.LineBasicMaterial({ color: spec[1], transparent: true, opacity: spec[2] })));
+  }
+
+  /* 宫界：只向外画短标记，不从环心拉辐条
+     （辐条会在近景下变成一张盖住画面的网，且穿过地球本体） */
+  const bnd = [];
+  for (let i = 0; i < 12; i++) {
+    const a = i * 30 * DEG;
+    bnd.push(Math.cos(a) * ECL_RING, 0, Math.sin(a) * ECL_RING,
+             Math.cos(a) * (ECL_RING + 5), 0, Math.sin(a) * (ECL_RING + 5));
+  }
+  const bg = new THREE.BufferGeometry();
+  bg.setAttribute('position', new THREE.BufferAttribute(new Float32Array(bnd), 3));
+  gongGroup.add(new THREE.LineSegments(bg, new THREE.LineBasicMaterial({ color: 0x4b6d9c, transparent: true, opacity: 0.9 })));
+})();
+geoFrame.add(gongGroup);
+
+/* 四余虚星：虚星没有固态表面，但也要有「体」——表达为一团半透明气体：
+   内核是斑驳的气团球，外壳再罩一层更大的加色薄雾，外围叠一枚柔光晕 sprite。
+   自转极慢且内外壳不同速，看起来像气团在涌动。
+   拾取仍用不可见球体（Geometry 的 radius 参数供 bodyRadius 定状态环大小），点选行为与其它曜一致。 */
+const XUYU_MARK_R = 1.7;
+const xuyuGas = {};
+function makeGasTexture(seed, hex, alphaMax) {
+  const W = 256, H = 128;
+  const cv = document.createElement('canvas');
+  cv.width = W; cv.height = H;
+  const g = cv.getContext('2d');
+  const base = new THREE.Color(hex);
+  const rnd = mulberry32(seed);
+  for (let i = 0; i < 70; i++) {
+    const x = rnd() * W, y = rnd() * H, r = 6 + rnd() * 26;
+    const c = new THREE.Color().copy(base);
+    c.offsetHSL((rnd() - 0.5) * 0.08, (rnd() - 0.5) * 0.25, (rnd() - 0.5) * 0.28);
+    const a = (0.04 + rnd() * alphaMax).toFixed(3);
+    const grad = g.createRadialGradient(x, y, 0, x, y, r);
+    grad.addColorStop(0, 'rgba(' + Math.round(c.r * 255) + ',' + Math.round(c.g * 255) + ',' + Math.round(c.b * 255) + ',' + a + ')');
+    grad.addColorStop(1, 'rgba(0,0,0,0)');
+    g.fillStyle = grad;
+    g.beginPath(); g.arc(x, y, r, 0, TAU); g.fill();
+    /* 跨缝副本：保证经度 0/255 处贴图接缝不出现硬边 */
+    if (x < r) { g.save(); g.translate(W, 0); g.beginPath(); g.arc(x, y, r, 0, TAU); g.fillStyle = grad; g.fill(); g.restore(); }
+  }
+  const tex = new THREE.CanvasTexture(cv);
+  tex.colorSpace = THREE.SRGBColorSpace;
+  if (tex.wrapS !== undefined) tex.wrapS = THREE.RepeatWrapping;
+  return tex;
+}
+const GAS_SEED = { rahu: 201, jidu: 233, ziqi: 269, yuebo: 307 };
+function makeXuyuMesh(id) {
+  const col = new THREE.Color(YAO[id].color);
+  const m = new THREE.Mesh(
+    new THREE.SphereGeometry(XUYU_MARK_R, 12, 8),
+    new THREE.MeshBasicMaterial({ visible: false })
+  );
+  const inner = new THREE.Mesh(
+    new THREE.SphereGeometry(XUYU_MARK_R * 1.05, 24, 16),
+    new THREE.MeshBasicMaterial({ map: makeGasTexture(GAS_SEED[id], col.getHex(), 0.5), transparent: true, opacity: 0.92, depthWrite: false })
+  );
+  const outer = new THREE.Mesh(
+    new THREE.SphereGeometry(XUYU_MARK_R * 1.5, 24, 16),
+    new THREE.MeshBasicMaterial({ map: makeGasTexture(GAS_SEED[id] + 7, col.getHex(), 0.35), transparent: true, opacity: 0.4, depthWrite: false, blending: THREE.AdditiveBlending })
+  );
+  const glow = new THREE.Sprite(new THREE.SpriteMaterial({
+    map: SPARK_TEX, color: col, transparent: true, opacity: 0.5,
+    depthWrite: false, blending: THREE.AdditiveBlending
+  }));
+  glow.scale.setScalar(XUYU_MARK_R * 7);
+  m.add(inner); m.add(outer); m.add(glow);
+  xuyuGas[id] = { inner: inner, outer: outer };
+  geoFrame.add(m);
+  return m;
+}
+const xuyuMesh = { rahu: makeXuyuMesh('rahu'), jidu: makeXuyuMesh('jidu'), ziqi: makeXuyuMesh('ziqi'), yuebo: makeXuyuMesh('yuebo') };
+
+/* 标签 */
+const labelLayer = document.getElementById('labels');
+function createLabel(cls, text) {
+  const el = document.createElement('div');
+  el.className = 'lbl ' + cls;
+  el.textContent = text;
+  labelLayer.appendChild(el);
+  return el;
+}
+const LBL = {};
+for (const id of Object.keys(YAO)) {
+  const cls = (id === 'sun') ? 'sun' : (id === 'moon') ? 'moon' : (['rahu','jidu','ziqi','yuebo'].indexOf(id) >= 0 ? 'xuyu' : 'planet');
+  LBL[id] = createLabel(cls, YAO[id].name);
+}
+LBL.earth = createLabel('planet', '地球（观测原点）');
+for (const p of PLANET_DATA) {
+  if (p.key === 'uranus' || p.key === 'neptune') LBL[p.key] = createLabel('planet', p.name + '（非七政）');
+}
+for (let i = 0; i < 12; i++) gongLabels.push(createLabel('gong', GONG[i].chen));
+for (let i = 0; i < 12; i++) gongCiLabels.push(createLabel('gongci', GONG[i].ci));
+
+/* ---------------- 状态 ---------------- */
+const nowJD = () => Date.now() / 86400000 + 2440587.5;
+let simJD = nowJD();
+let paused = false;
+let speed = 1;
+let lastRealMs = performance.now();
+let ziqiModel = ZIQI_MODELS[0];
+let ziqiOffset = 0;
+let lonDeg = 120;
+
+const show = { labels: true, ring: true, orbits: true, moon: true, xuyu: true, stars: true, strip: true, state: true, geju: true, spin: true, energy: true, qiGeo: true };
+
+/* ---------------- 投影与标签 ---------------- */
+const _v = new THREE.Vector3(), _w = new THREE.Vector3();
+function projectScreen(v) {
+  _w.copy(v).project(camera);
+  return { x: (_w.x * 0.5 + 0.5) * window.innerWidth, y: (-_w.y * 0.5 + 0.5) * window.innerHeight, z: _w.z };
+}
+/* 视距自适应字号：近景放大曜名（默认 430 距离≈11px，与旧版一致），
+   远景收小避免满屏大字打架；宫名/次名保持 CSS 固定小字号不参与缩放。 */
+function placeLabel(el, worldPos, dy) {
+  if (!el) return;
+  if (!show.labels) { el.style.display = 'none'; return; }
+  const s = projectScreen(worldPos);
+  if (s.z > 1 || s.z < -1) { el.style.display = 'none'; return; }
+  el.style.display = 'block';
+  el.style.left = s.x + 'px';
+  el.style.top = (s.y + (dy || 0)) + 'px';
+  if (!el.classList.contains('gong') && !el.classList.contains('gongci')) {
+    const camDist = camera.position.length();
+    el.style.fontSize = Math.max(9.5, Math.min(14, 4730 / camDist)).toFixed(1) + 'px';
+  }
+}
+/* 屏幕空间标签避让：按「悬浮/选中的曜 > 其它曜 > 十二辰 > 十二次」贪心取舍。
+   被压住的标签加 .cull 淡出（不是删除，转视角/缩放后会自己回来），
+   目的是让盘面中央不再把宫名、次名、曜名叠成一团。
+   曜名之间只在重度重叠（取 72% 外框）时才让位，且悬浮/选中的曜名永不让位。 */
+function cullLabels() {
+  if (!show.labels) return;
+  const list = [];
+  const add = (e2, pri, tol) => { if (e2 && e2.style.display !== 'none') list.push({ el: e2, pri: pri, tol: tol }); };
+  for (const id of Object.keys(LBL)) {
+    const e2 = LBL[id];
+    if (!e2) continue;
+    const hot = !!(e2.classList && e2.classList.contains('hot'));
+    add(e2, hot ? -1 : 0, hot ? 1 : 0.72);
+  }
+  for (let i = 0; i < 12; i++) add(gongLabels[i], 1, 1);
+  for (let i = 0; i < 12; i++) add(gongCiLabels[i], 2, 1);
+  /* 先全部复位再重判，否则上一帧被压住者会继续压住别人（连锁误伤） */
+  for (let i = 0; i < list.length; i++) if (list[i].el.classList) list[i].el.classList.remove('cull');
+  list.sort((a, b) => a.pri - b.pri);
+  const kept = [];
+  for (let i = 0; i < list.length; i++) {
+    const it = list[i], e2 = it.el;
+    /* stub/离屏环境下 offsetWidth 可能为 0，此时矩形退化成一个点，永不判为重叠 */
+    const w = (e2.offsetWidth || 0) * it.tol, h = (e2.offsetHeight || 0) * it.tol;
+    const px = parseFloat(e2.style.left) || 0, py = parseFloat(e2.style.top) || 0;
+    const x0 = px - w / 2, x1 = px + w / 2, y0 = py - h / 2, y1 = py + h / 2;
+    let hit = false;
+    for (let j = 0; j < kept.length; j++) {
+      const k = kept[j];
+      if (x0 < k[1] && x1 > k[0] && y0 < k[3] && y1 > k[2]) { hit = true; break; }
+    }
+    if (hit && it.pri >= 0) { if (e2.classList) e2.classList.add('cull'); }
+    else kept.push([x0, x1, y0, y1]);
+  }
+}
+/* 日心系物体的世界坐标 = solarFrame 平移 + 本地坐标 */
+function worldOf(local) { return _v.copy(local).add(solarFrame.position); }
+
+/* ---------------- 每帧更新 ---------------- */
+let lastOrbitT = -999;
+function updateOrbits(T) {
+  if (Math.abs(T - lastOrbitT) < 0.008) return;
+  lastOrbitT = T;
+  const prec = precessionRad(T);
+  for (const po of planetObjects) {
+    const p = po.data;
+    const a = p.a + p.aR * T, e = p.e + p.eR * T, w = (p.w + p.wR * T) * DEG + prec;
+    const cw = Math.cos(w), sw = Math.sin(w);
+    const arr = po.orbit.geometry.attributes.position.array;
+    const N = 240;
+    for (let i = 0; i <= N; i++) {
+      const E = TAU * i / N;
+      const x = a * (Math.cos(E) - e), z = a * Math.sqrt(1 - e * e) * Math.sin(E);
+      arr[i * 3]     = (x * cw - z * sw) * AU_SCALE;
+      arr[i * 3 + 1] = 0;
+      arr[i * 3 + 2] = (x * sw + z * cw) * AU_SCALE;
+    }
+    po.orbit.geometry.attributes.position.needsUpdate = true;
+    po.orbit.geometry.computeBoundingSphere();
+  }
+}
+
+let snap = null;
+function updateAll() {
+  snap = computeSnapshot(simJD, { key: ziqiModel.key, period: ziqiModel.period, baseJD: ziqiModel.baseJD, baseLon: ziqiModel.baseLon + ziqiOffset });
+
+  /* 行星日心位置与轨道 */
+  for (const po of planetObjects) {
+    const g = snap.geo[po.data.key];
+    po.helio = { x: g.x, z: g.z, r: g.r };
+    po.geoLon = g.lon;
+    po.group.position.set(g.x * AU_SCALE, 0, g.z * AU_SCALE);
+    /* 自转：角速度由真实自转周期决定，取自 simJD，故与时间轴同步；
+       pivot 承担轴倾角，这里只让网格绕本地 y 轴转。 */
+    if (show.spin && po.mesh) po.mesh.rotation.y = spinAngle(snap.T, po.spin.hours);
+  }
+  /* 四余气体球极慢自转：内核与外壳不同速，制造「气团在涌动」的层次感 */
+  if (show.spin) {
+    const ga = spinAngle(snap.T, 720);
+    for (const id of ['rahu', 'jidu', 'ziqi', 'yuebo']) {
+      const gm = xuyuGas[id];
+      if (gm) { gm.inner.rotation.y = ga; gm.outer.rotation.y = ga * 0.63; }
+    }
+  }
+  updateOrbits(snap.T);
+
+  /* 地心：把地球平移到画面原点 */
+  solarFrame.position.set(-snap.earthHelio.x * AU_SCALE, 0, -snap.earthHelio.z * AU_SCALE);
+  solarFrame.updateMatrixWorld(true);
+
+  /* 月球在白道平面内，升交角距 u = 黄经 − 升交点黄经，因此其黄经与算得的 λ 一致 */
+  const mo = snap.moon;
+  const O = mo.node * DEG, cO = Math.cos(O), sO = Math.sin(O);
+  const ci = Math.cos(MOON_INCL), si = Math.sin(MOON_INCL);
+  const nx = cO, nz = sO;
+  const mx = -sO * ci, my = si, mz = cO * ci;
+  const u = normRad((mo.lon - mo.node) * DEG);
+  const cu = Math.cos(u), su = Math.sin(u);
+  moonMesh.position.set(
+    (nx * cu + mx * su) * MOON_ORBIT_VISUAL,
+    (my * su) * MOON_ORBIT_VISUAL,
+    (nz * cu + mz * su) * MOON_ORBIT_VISUAL
+  );
+  /* 潮汐锁定：月球自转周期＝公转周期（恒星月），故永远同一面朝向地球。
+     这里直接令其 +Z 轴指向地心（地球恒在世界原点），即锁定关系；
+     再绕本地 y 转 −90° 把纹理正中的暗「海」转到朝地的那一面（SphereGeometry 的
+     u=0.5 子午线在 +X，绕 y 转 −90° 后落到 +Z），锁定关系因此肉眼可辨。
+     —— 这一步不改变任何黄经/规则结果，纯姿态。 */
+  if (show.spin) {
+    moonMesh.lookAt(0, 0, 0);
+    moonMesh.rotateY(-Math.PI / 2);
+  }
+
+  const mArr = moonOrbitGeo.attributes.position.array;
+  for (let i = 0; i <= 128; i++) {
+    const a = TAU * i / 128, ca = Math.cos(a), sa = Math.sin(a);
+    mArr[i * 3]     = (nx * ca + mx * sa) * MOON_ORBIT_VISUAL;
+    mArr[i * 3 + 1] = (my * sa) * MOON_ORBIT_VISUAL;
+    mArr[i * 3 + 2] = (nz * ca + mz * sa) * MOON_ORBIT_VISUAL;
+  }
+  moonOrbitGeo.attributes.position.needsUpdate = true;
+  moonOrbitGeo.computeBoundingSphere();
+
+  const nArr = nodeLineGeo.attributes.position.array;
+  nArr[0] = nx * XUYU_RING; nArr[1] = 0; nArr[2] = nz * XUYU_RING;
+  nArr[3] = -nx * XUYU_RING; nArr[4] = 0; nArr[5] = -nz * XUYU_RING;
+  nodeLineGeo.attributes.position.needsUpdate = true;
+
+  /* 四余位置（黄道面、定半径） */
+  for (const body of snap.bodies) {
+    const m = xuyuMesh[body.id];
+    if (!m) continue;
+    const a = body.lon * DEG;
+    m.position.set(Math.cos(a) * XUYU_RING, 0, Math.sin(a) * XUYU_RING);
+  }
+
+  /* 标签：日心系用 worldOf，地心系直接用本地坐标 */
+  placeLabel(LBL.sun, worldOf(new THREE.Vector3(0, 0, 0)), -18);
+  /* 地球世界坐标恒为原点（solarFrame 已把它平移过来），必须用 worldOf，
+     不能直接用 earthGroup.position（那是日心本地坐标，在世界空间里是别处） */
+  placeLabel(LBL.earth, worldOf(earthGroup.position), -20);
+  for (const po of planetObjects) {
+    if (po.data.key === 'earth') continue;   // 地球单独标注（其世界坐标恒为原点）
+    placeLabel(LBL[po.data.key], worldOf(po.group.position), -18);
+  }
+  placeLabel(LBL.moon, moonMesh.position, -16);
+  placeLabel(LBL.rahu, xuyuMesh.rahu.position, -16);
+  placeLabel(LBL.jidu, xuyuMesh.jidu.position, 16);
+  placeLabel(LBL.ziqi, xuyuMesh.ziqi.position, -16);
+  placeLabel(LBL.yuebo, xuyuMesh.yuebo.position, 16);
+  for (let i = 0; i < 12; i++) {
+    const a = (i * 30 + 15) * DEG;
+    placeLabel(gongLabels[i], new THREE.Vector3(Math.cos(a) * (ECL_RING + 6), 0, Math.sin(a) * (ECL_RING + 6)), 0);
+  }
+  for (let i = 0; i < 12; i++) {
+    const a2 = (i * 30 + 15) * DEG;
+    const cl = gongCiLabels[i];
+    placeLabel(cl, new THREE.Vector3(Math.cos(a2) * (ECL_RING + 13), 0, Math.sin(a2) * (ECL_RING + 13)), 0);
+    if (!show.ring) cl.style.display = 'none';
+  }
+  cullLabels();
+
+  /* 可见性 */
+  gongGroup.visible = show.ring;
+  moonOrbitLine.visible = show.moon;
+  nodeLine.visible = show.moon;
+  moonMesh.visible = show.moon;
+  for (const id of ['rahu', 'jidu', 'ziqi', 'yuebo']) xuyuMesh[id].visible = show.xuyu;
+  for (const po of planetObjects) po.orbit.visible = show.orbits;
+  stars.visible = show.stars;
+
+  updatePanel();
+  drawStrip(snap);
+  gejuFrame();
+  gejuViewFrame();
+  gejuPersistFrame(performance.now());
+  gongPanelFrame();
+  dayunFrame();
+  updateEnergy3D(performance.now());
+}
+
+/* ---------------- 面板 ---------------- */
+const el = id => document.getElementById(id);
+const timeNowEl = el('timeNow'), timeInfoEl = el('timeInfo'), julianEl = el('julianOut'), tbodyEl = el('tbody');
+const calInputs = Array.prototype.slice.call(document.querySelectorAll('input.cal'));
+/* 用户一旦改动过时间输入框，就停止用当前盘时回填，直到点「跳转/回到现在/±步进」——
+   否则运行中会被逐帧覆盖成当下时刻，点「跳转」读到的仍是现在，看起来「跳了没反应」 */
+let calDirty = false;
+for (const inp of calInputs) inp.addEventListener('input', () => { calDirty = true; });
+
+function updatePanel() {
+  const c = jdToCalendar(simJD);
+  timeNowEl.textContent = 'UTC ' + fmtCal(c) + '   [' + (paused ? '暂停' : '运行 ' + speed + '×') + ']';
+
+  const eot = equationOfTimeMin(simJD);
+  const jdMean = simJD + lonDeg * 4 / 1440;
+  const jdTrue = jdMean + eot / 1440;
+  const cMean = jdToCalendar(jdMean), cTrue = jdToCalendar(jdTrue);
+  const bj = jdToCalendar(simJD + 8 / 24);
+
+  const lam = sunApparentLon(simJD);
+  const st = solarTermInfo(simJD);
+  const yGz = ganzhiYearOf(simJD);
+  const mGz = monthGanzhi(lam, GAN.indexOf(yGz.charAt(0)));
+  const jdn = Math.floor(jdTrue + 0.5);
+  const dGz = dayGanzhi(jdn);
+  const hGz = hourGanzhi(GAN.indexOf(dGz.charAt(0)), cTrue.h + cTrue.mi / 60);
+
+  timeInfoEl.innerHTML =
+    '北京时间　' + fmtCal(bj) + '　（东八区）<br />' +
+    '地方平时　' + fmtCal(cMean) + '　（经度 ' + lonDeg.toFixed(2) + '°E）<br />' +
+    '<span class="hl">真太阳时　' + fmtCal(cTrue) + '</span>　（均时差 ' + (eot >= 0 ? '+' : '') + eot.toFixed(2) + ' 分）' +
+    '　<span class="dyemark ' + (dayNightNow() === 'day' ? 'dayC' : 'nightC') + '">' + DYEWORD[dayNightNow()] + '</span><br />' +
+    '本节气　　' + st.name + (st.isJie ? '（节）' : '（中气）') + '　始于 ' + fmtCal(jdToCalendar(st.t0)) + '<br />' +
+    '下一节气　' + TERMS[(st.k + 1) % 24] + '　　' + fmtCal(jdToCalendar(st.t1)) + '<br />' +
+    '<span class="hl">' + yGz + '年　' + mGz.name + '月　' + dGz + '日　' + hGz + '时</span>　（月建起' + mGz.startTerm + '）<br />' +
+    '太阳视黄经　' + lam.toFixed(4) + '°　' + gongText(lam);
+
+  julianEl.textContent = 'JD ' + simJD.toFixed(5) + '　JDN ' + jdn;
+
+  let html = '';
+  for (const b of snap.bodies) {
+    const r = b.rate;
+    const cls = Math.abs(r) < 0.0055 ? 'stat' : (r < 0 ? 'retro' : '');
+    const tag = Math.abs(r) < 0.0055 ? '留' : (r < 0 ? '逆' : '顺');
+    /* 昼夜阵营在表内做极轻区分：昼生项偏暖、夜生项偏冷（不加图标、不占列宽） */
+    const cls2 = (cls ? cls + ' ' : '') + (campIsDay(b.char) ? 'dayc' : 'nightc');
+    html += '<tr class="' + cls2 + '">' +
+      '<td class="nm"><span class="dot" style="background:' + b.color + '"></span>' + b.name + '</td>' +
+      '<td class="lon">' + b.lon.toFixed(3) + '°</td>' +
+      '<td class="pos">' + gongText(b.lon) + '<br /><span class="su">入' + suOf(simJD, b.lon).name + ' ' + suOf(simJD, b.lon).deg.toFixed(2) + '°' +
+        (miaoWang(b.char, GONG[gongIndex(b.lon)].chen) ? '　' + miaoWang(b.char, GONG[gongIndex(b.lon)].chen) : (shiYuan(b.char, GONG[gongIndex(b.lon)].chen) ? '　失垣' : '')) + '</span></td>' +
+      '<td class="rate">' + (r >= 0 ? '+' : '') + r.toFixed(4) + ' ' + tag + (speedClass(b.char, r) && speedClass(b.char, r) !== '平' ? '·' + speedClass(b.char, r) : '') + '</td>' +
+      '</tr>';
+  }
+  tbodyEl.innerHTML = html;
+
+  /* 回填时间输入框（用户正在编辑时不覆盖） */
+  if (!calDirty && calInputs.indexOf(document.activeElement) < 0) {
+    el('inYear').value = c.y; el('inMonth').value = c.m; el('inDay').value = c.d;
+    el('inHour').value = c.h; el('inMin').value = c.mi; el('inSec').value = c.s;
+  }
+}
+
+/* ---------------- 底部黄道十二宫带 ---------------- */
+const stripCanvas = el('stripCanvas');
+/* 宫带是 canvas 画的，没有可点的 DOM，故把 drawStrip 算出的屏幕映射存这里供点击命中用。 */
+let stripPick = null;
+/* 点宫带上的曜名 → 与点 3D 标签同义（选中那一曜，展开成因与能量线）。 */
+stripCanvas.style.cursor = 'pointer';
+stripCanvas.addEventListener('click', function (ev) {
+  if (!stripPick) return;
+  const r = stripCanvas.getBoundingClientRect();
+  const px = ev.clientX - r.left, py = ev.clientY - r.top;
+  /* 命中判据：y 落在曜名标注带内（宫格与宫名那一行不算），x 落在某曜「圆点 + 标签」的
+     覆盖范围内；同时压在两条标签上时取圆点更近的那个。 */
+  if (py < stripPick.dotY - 10) return;
+  let best = null, bd = 1e9;
+  for (const it of stripPick.items) {
+    if (px < it.x1 || px > it.x2) continue;
+    const d = Math.abs(it.dx - px);
+    if (d < bd) { bd = d; best = it; }
+  }
+  if (best) selectYao(best.id);
+});
+/* 冲突：五行相克（KE_OF 互为克）且位置相犯——同宫、相距 ≤8°、或对照（≥172°）。
+   只作「能不能看出这两曜贴在一起相犯」的提示，不替代规则库的判定。 */
+function clashOf(ch, s) {
+  const wx = YAO_WUXING[ch];
+  if (!wx || !s || !s.bodies) return [];
+  let mine = null;
+  for (const b of s.bodies) if (b.char === ch) { mine = b; break; }
+  if (!mine) return [];
+  const out = [];
+  for (const b of s.bodies) {
+    if (b.char === ch) continue;
+    const ow = YAO_WUXING[b.char];
+    if (!ow || !(KE_OF[wx] === ow || KE_OF[ow] === wx)) continue;
+    const d = Math.abs(norm180(b.lon - mine.lon));
+    if (d <= 8 || d >= 172 || gongIndex(b.lon) === gongIndex(mine.lon)) out.push(b.char);
+  }
+  return out;
+}
+
+function drawStrip(s) {
+  const ctx = stripCanvas.getContext('2d');
+  const dpr = Math.min(window.devicePixelRatio, 2);
+  const W = stripCanvas.clientWidth, H = stripCanvas.clientHeight;
+  if (stripCanvas.width !== Math.round(W * dpr) || stripCanvas.height !== Math.round(H * dpr)) {
+    stripCanvas.width = Math.round(W * dpr);
+    stripCanvas.height = Math.round(H * dpr);
+  }
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  ctx.clearRect(0, 0, W, H);
+
+  const mL = 40, mR = 40;
+  const bw = W - mL - mR;
+  /* 不能在这里 norm360：360° 会被折成 0°，最后一个宫格（亥宫 330–360°）宽度算成负数
+     就画不出来，宫名与次名也会被画到 x=mL 处压住别的格。改为线性映射，lon 允许取到 360。 */
+  const X = lon => mL + lon / 360 * bw;
+  const bandY = 26, bandH = 38;
+  const CJK = '"Source Han Sans SC", "思源黑体", "Microsoft YaHei", "PingFang SC", sans-serif';
+  const dxD = dayunCalc();   /* 大限（洞微百六限）：定盘后在本宫带上直接标出行限位置 */
+
+  /* 标题行：左标题 + 副标题（＋大限进度），右侧图例 */
+  ctx.textBaseline = 'middle';
+  ctx.textAlign = 'left';
+  ctx.font = 'bold 13.5px ' + CJK;
+  ctx.fillStyle = '#a9c3e0';
+  ctx.fillText('黄道十二宫带', mL, 14);
+  ctx.font = '12px ' + CJK;
+  ctx.fillStyle = '#6f89a8';
+  const sub = '回归黄道 · 每格 30° · 戌宫起 0° · 十一曜按地心黄经落点';
+  ctx.fillText(sub, mL + 100, 14);
+  if (dxD) {
+    ctx.fillStyle = '#7fe0c8';
+    ctx.fillText(' · 大限行' + GONG[dxD.dxIdx].chen + '宫（' + dxD.startAge + '–' + dxD.endAge +
+      '岁）· 已行 ' + dxD.xianDeg.toFixed(1) + '°', mL + 100 + ctx.measureText(sub).width + 4, 14);
+  }
+  ctx.textAlign = 'right';
+  ctx.font = '12px ' + CJK;
+  ctx.fillStyle = '#8aa6c8';
+  ctx.fillText('日 月 水 金 火 木 土 罗 计 炁 孛 ＝ 七政四余十一曜', W - mR, 14);
+
+  /* 宫格 */
+  for (let i = 0; i < 12; i++) {
+    const x0 = X(i * 30), x1 = X(i * 30 + 30);
+    ctx.fillStyle = (i % 2) ? '#1b2b46' : '#111e33';
+    ctx.fillRect(x0, bandY, x1 - x0, bandH);
+    ctx.strokeStyle = '#3a5a85';
+    ctx.lineWidth = 1;
+    ctx.strokeRect(x0 + 0.5, bandY + 0.5, x1 - x0 - 1, bandH - 1);
+  }
+  /* 大限指示：淡青＝当前大限宫整格 · 亮青＝已行度数 · 白青竖线＋倒三角＝限度所在 */
+  if (dxD) {
+    const gx0 = X(dxD.dxIdx * 30), gx1 = X(dxD.dxIdx * 30 + 30);
+    ctx.fillStyle = 'rgba(127,224,200,.16)';
+    ctx.fillRect(gx0 + 1, bandY + 1, gx1 - gx0 - 2, bandH - 2);
+    const mx = X(dxD.dxIdx * 30 + dxD.xianDeg);
+    ctx.fillStyle = 'rgba(127,224,200,.42)';
+    ctx.fillRect(gx0 + 1, bandY + 1, Math.max(0, mx - gx0 - 1), bandH - 2);
+    ctx.strokeStyle = '#d6fff0';
+    ctx.lineWidth = 2;
+    ctx.beginPath(); ctx.moveTo(mx, bandY); ctx.lineTo(mx, bandY + bandH); ctx.stroke();
+    ctx.fillStyle = '#d6fff0';
+    ctx.beginPath(); ctx.moveTo(mx - 4, bandY - 6); ctx.lineTo(mx + 4, bandY - 6); ctx.lineTo(mx, bandY + 2); ctx.closePath(); ctx.fill();
+    ctx.lineWidth = 1;
+  }
+  /* 宫内 5° 细刻度（画在宫格底边内侧） */
+  for (let d = 5; d < 360; d += 5) {
+    if (d % 30 === 0) continue;
+    const x = X(d);
+    ctx.strokeStyle = '#26395a';
+    ctx.beginPath(); ctx.moveTo(x, bandY + bandH); ctx.lineTo(x, bandY + bandH - 5); ctx.stroke();
+  }
+  /* 宫名（窄窗口下自动缩字，避免 3 字宫名溢出宫格） */
+  const gongPx = Math.max(10, Math.min(14, bw / 12 / 3.2));
+  ctx.textAlign = 'center';
+  ctx.font = 'bold ' + gongPx.toFixed(1) + 'px ' + CJK;
+  ctx.fillStyle = '#c2d6ee';
+  for (let i = 0; i < 12; i++) {
+    const x0 = X(i * 30), x1 = X(i * 30 + 30);
+    ctx.fillText(GONG[i].chen + '宫', (x0 + x1) / 2, bandY + bandH / 2 - 2);
+  }
+  /* 古十二次（不用西方星座名） */
+  /* 十二次名原先 10px + 低对比度，在宫带下方几乎看不清；放大提亮 */
+  ctx.font = '11.5px ' + CJK;
+  ctx.fillStyle = '#a8c2e2';
+  for (let i = 0; i < 12; i++) {
+    const x0 = X(i * 30), x1 = X(i * 30 + 30);
+    ctx.fillText(GONG[i].ci, (x0 + x1) / 2, bandY + bandH + 11);
+  }
+  /* 宫界与度数 */
+  ctx.font = '12px Consolas, "Source Han Sans SC", "Microsoft YaHei", monospace';
+  for (let d = 0; d <= 360; d += 10) {
+    const x = X(d), big = (d % 30 === 0);
+    ctx.strokeStyle = big ? '#5b83b8' : '#2f4666';
+    ctx.beginPath();
+    ctx.moveTo(x, bandY + bandH);
+    ctx.lineTo(x, bandY + bandH + (big ? 8 : 4));
+    ctx.stroke();
+    if (big && d < 360) {
+      ctx.fillStyle = '#8fa9c6';
+      ctx.fillText(String(d), x, bandY + bandH + 18);
+    }
+  }
+
+  /* 十一曜落点：引线 + 圆点 + 三行错开标签（按实测文字宽度避让，不再互相压字） */
+  const items = s.bodies.slice().sort((a, b) => norm360(a.lon) - norm360(b.lon));
+  const dotY = bandY + bandH + 32;
+  const rowY = [dotY + 23, dotY + 43, dotY + 63];
+  const rowRight = [-1e9, -1e9, -1e9];
+  const hits = [];                                   /* 每曜标签的屏幕占位，供点击命中 */
+  const labelPx = W < 900 ? 11 : 13;                 /* 窄窗口缩小标签字号 */
+  ctx.font = 'bold ' + labelPx + 'px Consolas, "Source Han Sans SC", "Microsoft YaHei", monospace';
+  for (const it of items) {
+    const lon = norm360(it.lon);
+    const x = X(lon);
+
+    ctx.strokeStyle = it.color;
+    ctx.lineWidth = 1.4;
+    ctx.beginPath(); ctx.moveTo(x, bandY + bandH + 9); ctx.lineTo(x, dotY - 6); ctx.stroke();
+    ctx.beginPath(); ctx.arc(x, dotY, 4, 0, TAU);
+    ctx.fillStyle = it.color; ctx.fill();
+    ctx.lineWidth = 1.5; ctx.strokeStyle = '#05080f'; ctx.stroke();
+
+    /* 标签语言：曜名+度（亮度看状态）· 方向箭头（顺→/逆←/留·）· 状态符 · 冲突曜（×某曜）
+       状态不直写「吉／凶／平」汉字，改用线描符号（见 drawStateGlyph）：
+       亮度 baseA 与符号线宽同步随状态变化，字号一致也能一眼分出好坏。 */
+    const stq = stateMap[it.id] || { cls: 'mid' };
+    const qcls = stq.cls || 'mid';
+    const baseA = qcls === 'good' ? 1 : (qcls === 'bad' ? 0.68 : 0.86);
+    const dirSym = (it.rate > 0.0055) ? '→' : ((it.rate < -0.0055) ? '←' : '·');
+    const stCol = qcls === 'good' ? '#8ed9a2' : (qcls === 'bad' ? '#e08a8a' : '#93a9c4');
+    const GLYPH_W = 12;
+    const cf = clashOf(it.char, s);
+    const segs = [
+      { t: it.char + ' ' + lon.toFixed(1) + '°', c: it.color, a: baseA },
+      { t: ' ' + dirSym, c: '#9fbfe2', a: 0.9 },
+      { g: qcls, c: stCol, a: 0.95, w: GLYPH_W }
+    ];
+    if (cf.length) segs.push({ t: ' ×' + cf.join(''), c: '#e6b0b0', a: 0.85 });
+    let w = 0;
+    for (const sg of segs) w += (sg.g ? sg.w : ctx.measureText(sg.t).width);
+    const right = (x + 7 + w > W - mR + 30);          /* 靠右边界时改为左向标 */
+    const left = right ? x - 7 - w : x + 7;
+    let row = -1;
+    for (let r = 0; r < 3; r++) if (left >= rowRight[r] + 7) { row = r; break; }
+    if (row < 0) { row = 0; for (let r = 1; r < 3; r++) if (rowRight[r] < rowRight[row]) row = r; }
+    rowRight[row] = left + w;
+    /* 记下「引线圆点 + 标签文字」的横向覆盖范围（含两端各 6px 余量）。
+       宫带是 canvas 画的，命中只能靠这个范围反查：点标签文字或圆点都能选中该曜。 */
+    hits.push({ id: it.id, dx: x, x1: Math.min(x, left) - 6, x2: Math.max(x, left + w) + 6 });
+
+    if (row > 0) {                                     /* 换行时补细引导线，避免标签与圆点失联 */
+      ctx.globalAlpha = 0.45; ctx.lineWidth = 1;
+      ctx.strokeStyle = it.color;
+      ctx.beginPath(); ctx.moveTo(x, dotY + 6); ctx.lineTo(x, rowY[row] - 9); ctx.stroke();
+      ctx.globalAlpha = 1;
+    }
+    ctx.textAlign = 'left';
+    let sx = right ? x - 7 - w : x + 7;
+    for (const sg of segs) {
+      ctx.globalAlpha = sg.a;
+      ctx.fillStyle = sg.c;
+      if (sg.g) {
+        /* 线描符号画在文本基线上方对齐（基线在 rowY，故圆心略抬） */
+        drawStateGlyph(ctx, sx + GLYPH_W / 2 - 2.5, rowY[row] - 4.2, sg.g, sg.c, sg.a);
+      } else {
+        ctx.fillText(sg.t, sx, rowY[row]);
+      }
+      sx += (sg.g ? sg.w : ctx.measureText(sg.t).width);
+    }
+    ctx.globalAlpha = 1;
+  }
+  /* 供点击命中使用：把本条带的屏幕映射存下来（宫带是 canvas 画的，没有 DOM 可点，
+     故点选只能靠这里算出的坐标）。 */
+  stripPick = { dotY: dotY, items: hits };
+}
+
+/* 状态符（不用「吉／凶／平」汉字，改用线描符号）：
+     吉＝双环 ◎（饱满）· 平＝单环 ○（中等）· 凶＝环加斜杠 ⊘（最暗最细）
+   同一个字号下，凭「环的数量 + 线宽 + 亮度」即可一眼分出好坏，不必读字。 */
+function drawStateGlyph(ctx, cx, cy, cls, col, alpha) {
+  ctx.save();
+  ctx.globalAlpha = alpha;
+  ctx.strokeStyle = col;
+  ctx.lineWidth = cls === 'good' ? 1.9 : (cls === 'mid' ? 1.35 : 1.1);
+  ctx.beginPath(); ctx.arc(cx, cy, 3.9, 0, TAU); ctx.stroke();
+  if (cls === 'good') { ctx.beginPath(); ctx.arc(cx, cy, 1.7, 0, TAU); ctx.stroke(); }
+  if (cls === 'bad') {
+    const d = 3.9 * 0.7071;
+    ctx.beginPath(); ctx.moveTo(cx - d, cy + d); ctx.lineTo(cx + d, cy - d); ctx.stroke();
+  }
+  ctx.restore();
+}
+/* 3D 标签沿用同一套语义（DOM 里画不了矢量，用等义字体符号） */
+const ST_SYM = { good: '◎', mid: '○', bad: '\u2298' };
+
+/* ---------------- 主循环 ---------------- */
+function animate() {
+  requestAnimationFrame(animate);
+  const now = performance.now();
+  const dt = (now - lastRealMs) / 86400000;
+  lastRealMs = now;
+  if (!paused) simJD += dt * speed;
+
+  /* OrbitControls 接管视角：阻尼平滑，target 恒为地心原点 */
+  controls.update();
+
+  /* 日冕轻微呼吸：与泛光叠加后太阳不再是一张死板的圆片 */
+  const pulse = 1 + 0.045 * Math.sin(now / 1400) + 0.02 * Math.sin(now / 610);
+  sunGlow.scale.setScalar(SUN_GLOW_BASE * pulse);
+
+  updateAll();
+  qiGeoFrame(now);
+  pingceFrame();
+  composer.render();
+}
+
+/* ---------------- 交互 ----------------
+   旋转/缩放全部交给 OrbitControls；这里只保留：
+   ① dragging 标志（供悬浮拾取在拖拽期间静默，避免射线抖动）；
+   ② 右键菜单屏蔽与窗口尺寸同步（含泛光通道）。 */
+let dragging = false;
+renderer.domElement.addEventListener('pointerdown', () => { dragging = true; });
+window.addEventListener('pointerup', () => { dragging = false; });
+window.addEventListener('contextmenu', e => e.preventDefault());
+window.addEventListener('resize', () => {
+  camera.aspect = window.innerWidth / window.innerHeight;
+  camera.updateProjectionMatrix();
+  renderer.setSize(window.innerWidth, window.innerHeight);
+  composer.setSize(window.innerWidth, window.innerHeight);
+});
+
+/* ---------------- 控件 ---------------- */
+function setSpeed(v) {
+  speed = v;
+  const btns = document.querySelectorAll('.spd');
+  for (const b of btns) b.classList.toggle('on', +b.dataset.s === v);
+}
+for (const b of document.querySelectorAll('.spd')) b.addEventListener('click', () => setSpeed(+b.dataset.s));
+
+function setPaused(v) {
+  paused = v;
+  el('btnPause').textContent = paused ? '继续' : '暂停';
+  el('btnPause').classList.toggle('on', paused);
+}
+el('btnPause').addEventListener('click', () => setPaused(!paused));
+el('btnNow').addEventListener('click', () => { simJD = nowJD(); calDirty = false; setPaused(false); updateAll(); });
+
+el('btnJump').addEventListener('click', () => {
+  const num = id => parseInt(el(id).value, 10);
+  const cur = jdToCalendar(simJD);
+  const y = num('inYear'), m = num('inMonth'), d = num('inDay');
+  /* 只填了年份也能跳；缺的月/日/时/分/秒取当前盘面，不再静默失败 */
+  if (!isFinite(y)) { timeNowEl.textContent = '请先填写年份（例：1900）'; return; }
+  const mm = Math.min(12, Math.max(1, isFinite(m) ? m : cur.m));
+  const dd = Math.min(daysInMonth(y, mm), Math.max(1, isFinite(d) ? d : cur.d));
+  const hh = Math.min(23, Math.max(0, isFinite(num('inHour')) ? num('inHour') : cur.h));
+  const mi = Math.min(59, Math.max(0, isFinite(num('inMin')) ? num('inMin') : cur.mi));
+  const ss = Math.min(59, Math.max(0, isFinite(num('inSec')) ? num('inSec') : cur.s));
+  simJD = dateToJD(y, mm, dd, hh, mi, ss);
+  if (el('chkPauseJump').checked) setPaused(true);
+  calDirty = false;
+  updateAll();
+});
+function stepDays(n) { simJD += n; calDirty = false; updateAll(); }
+function stepMonths(n) {
+  const c = jdToCalendar(simJD);
+  let y = c.y, m = c.m + n;
+  while (m > 12) { m -= 12; y += 1; }
+  while (m < 1) { m += 12; y -= 1; }
+  simJD = dateToJD(y, m, Math.min(daysInMonth(y, m), c.d), c.h, c.mi, c.s);
+  calDirty = false; updateAll();
+}
+function stepYears(n) {
+  const c = jdToCalendar(simJD);
+  const y = c.y + n;
+  simJD = dateToJD(y, c.m, Math.min(daysInMonth(y, c.m), c.d), c.h, c.mi, c.s);
+  calDirty = false; updateAll();
+}
+el('btnYm').addEventListener('click', () => stepYears(-1));
+el('btnYp').addEventListener('click', () => stepYears(1));
+el('btnMm').addEventListener('click', () => stepMonths(-1));
+el('btnMp').addEventListener('click', () => stepMonths(1));
+el('btnDm').addEventListener('click', () => stepDays(-1));
+el('btnDp').addEventListener('click', () => stepDays(1));
+
+function bindToggle(id, key) {
+  el(id).addEventListener('click', () => {
+    show[key] = !show[key];
+    el(id).classList.toggle('on', show[key]);
+  });
+}
+bindToggle('btnLabels', 'labels');
+bindToggle('btnRing', 'ring');
+bindToggle('btnOrbits', 'orbits');
+bindToggle('btnMoon', 'moon');
+bindToggle('btnXuyu', 'xuyu');
+bindToggle('btnStars', 'stars');
+bindToggle('btnState', 'state');
+bindToggle('btnGeju', 'geju');
+bindToggle('btnSpin', 'spin');     /* 自转与月相（只影响姿态呈现，不影响黄经与规则） */
+bindToggle('btnEnergy', 'energy'); /* 生克／帮扶能量线 */
+bindToggle('btnQiGeo', 'qiGeo');   /* 赤道面阴阳气息测地积分数显小窗 */
+el('btnStrip').addEventListener('click', () => {
+  show.strip = !show.strip;
+  el('btnStrip').classList.toggle('on', show.strip);
+  el('skyStrip').style.display = show.strip ? '' : 'none';
+});
+/* 视野预设：AU_SCALE=120 下，太阳距地心 120 单位、木星可达 750 单位。
+   默认取「内行星」430，首屏即可看到太阳与五星；「地心近景」118 保证
+   十二宫刻度环（半径 30）及其宫名（半径 36）完整落在视锥内。 */
+/* 视野预设改为在 OrbitControls 的球坐标上操作：
+   只改半径（或同时改方位角/仰角），保留当前观察方位，与阻尼动画兼容。 */
+const _sph = new THREE.Spherical();
+function setView(d, theta, phi) {
+  _sph.setFromVector3(camera.position);
+  if (theta !== undefined) _sph.theta = theta;
+  if (phi !== undefined) _sph.phi = phi;
+  _sph.radius = Math.max(controls.minDistance, Math.min(controls.maxDistance, d));
+  camera.position.setFromSpherical(_sph);
+  controls.update();
+}
+el('btnV1').addEventListener('click', () => setView(118, 0, Math.PI / 3.2));
+el('btnV2').addEventListener('click', () => setView(430));
+el('btnV3').addEventListener('click', () => setView(1900));
+el('btnV4').addEventListener('click', () => setView(6400));
+el('btnReset').addEventListener('click', () => setView(430, 0, Math.PI / 3.2));
+
+el('btnPanel').addEventListener('click', () => {
+  const p = el('panel'), b = el('btnPanel');
+  const hidden = p.style.display === 'none';
+  p.style.display = hidden ? '' : 'none';
+  b.textContent = hidden ? '收起面板' : '展开面板';
+});
+/* 窄窗口下默认收起面板，否则面板会盖住大半个画面 */
+if (window.innerWidth && window.innerWidth < 1100) {
+  el('panel').style.display = 'none';
+  el('btnPanel').textContent = '展开面板';
+}
+
+el('selZiqi').addEventListener('change', () => {
+  const k = el('selZiqi').value;
+  for (const m of ZIQI_MODELS) if (m.key === k) ziqiModel = m;
+  updateAll();
+});
+el('inZiqi').addEventListener('input', () => {
+  const v = parseFloat(el('inZiqi').value);
+  ziqiOffset = isFinite(v) ? v : 0;
+});
+el('inLon').addEventListener('input', () => {
+  const v = parseFloat(el('inLon').value);
+  lonDeg = isFinite(v) ? Math.max(-180, Math.min(180, v)) : 120;
+});
+
+/* ==================================================================
+   七政四余排盘：2D 天盘 + 八本古籍条文检索
+   · 天盘用干支十二宫（南上北下：午上子下），黄经逆时针递增
+   · 点选任十一曜（天盘或左表），检索 KB 中命中该曜的条文，
+     按「当下宫位 / 庙旺 / 星性 / 行度」相关度排序展示，并给出出处页码
+   ================================================================== */
+/* ===== KB-BEGIN ===== */
+const KB = [{"b":"古赋注（上册）","p":"3","t":"）使天下和同，则自不必论矣，使人所设富贵。则又将官命以定三元。命则命，官则官，官者，太阳所在","y":["日"]},{"b":"古赋注（上册）","p":"7","t":"（罗计二星，天之阴阳，交初为罗喉，交中为计都。罗乃天首之星，计乃天尾之星，相对而行，拦截诸星","y":["罗","计"]},{"b":"古赋注（上册）","p":"10","t":"（昼生人以太阳为重，太阳升于东南，与命同宫，又得金水引从于前后。夜生人以月为重，太阴升于西北，与命同宫，又得火罗辅卫于左右，此皆向明，得之为贵","y":["日","月"]},{"b":"古赋注（上册）","p":"10","t":"身近词林掌百官之制诰。）合得阴阳分明，合得阴阳不背。合得阴阳得宜。怎么合向背呢，白天生，太阴亦有朝者，夜里生，太阳亦有朝者","y":["日","月"]},{"b":"古赋注（上册）","p":"10","t":"金水不离太阳，金水辅阳的太常见了，火星约二月一宫，火要与月或同宫，或拱照太容易了","y":["日","火"]},{"b":"古赋注（上册）","p":"11","t":"至若五曜连珠。（五曜即木、火、土、金、水是也。如子宫安命，而土星在丑，木星在寅，火星在卯，金星在辰，木星在巳，五星如贯珠然序次一边，以各居垣，大贵之局，世不多见","y":["金","火","木","土"]},{"b":"古赋注（上册）","p":"11","t":"人要须识得真。）取奎壁文府象。实际从星象角度讲，单纯字面的组合会比较容易成。因每年太阳皆过壁","y":["日"]},{"b":"古赋注（上册）","p":"13","t":"）孛月居未。计都朝斗于丑牛。（斗牛亦文章之府，计临反吉，化贱为贵。）计土居丑水星伴月向未巳，为朝主背君","y":["水","计"]},{"b":"古赋注（上册）","p":"14","t":"切见天地清宁（日月居于午未，而金水各奠其垣，以清于上。土星居于子丑，木火各奠其垣，以宁于下","y":["土"]},{"b":"古赋注（上册）","p":"14","t":"更得气孛罗计单行得所为美，而安命于午未者极贵。或乾为天门，又且木星居之，巽为地户，水星居之亦合此格","y":["水","木"]},{"b":"古赋注（上册）","p":"15","t":"若罗计在辰戌中拦为破格。）如前文己提及，再强调下。郑注己道出罗计怎么用。山泽通气（艮为山，木星居之，兑为泽，金星居之，二星得所，为通气","y":["金","木"]},{"b":"古赋注（上册）","p":"21","t":"太阳逢朔而蚀，太阴逢望而蚀。太阳太阴与罗计可以说，经常或同宫，或三方对照，很易碰到，其中特别是太阳，在有些年份里，太阳在整个月都会与罗计在一起，而太阴则更是一月一周天","y":["日","月"]},{"b":"古赋注（上册）","p":"24","t":"杀金为刃休逢。（阳刃乃刀刃也，金星主杀，掌刃为杀愈烈，辰酉二宫为刃星也。金刃劫木为灾难避","y":["金"]},{"b":"古赋注（上册）","p":"24","t":"（木星如梃杖之属，掌劫亦能害人，命限切忌逢之，寅亥二宫，犯劫是也。）诸天所排，木永不为刃","y":["木"]},{"b":"古赋注（上册）","p":"24","t":"华盖紫气是良辰。（华紫二星为善星，人命得之，必主好善慈祥，出家乐道。）闲吉之星","y":["炁"]},{"b":"古赋注（上册）","p":"25","t":"（金孛水星为天上之咸池，乃人间之淫秽。奚宜坐桃花驿马之宫，冠带临官之上。）金水之性","y":["水"]},{"b":"古赋注（上册）","p":"28","t":"则水或火星为主。即然为主，则要“先观”。为什么言水火而不言木呢。以二十八宿为本","y":["火"]},{"b":"古赋注（上册）","p":"28","t":"（此言寅宫尾箕，坐命合格论也。）大意为水与木星同入轸水度，月的话居井。到这里其实就要断语了","y":["木"]},{"b":"古赋注（上册）","p":"29","t":"其二，二曜朝阳，一星伴月，二品之命也。（二曜火也，一星水也，火星朝君，水星辅日之类","y":["水","火"]},{"b":"古赋注（上册）","p":"29","t":"）到此，则或朝阳，或伴月。尊莫尊乎日月也。其三，火星入奎娄，金水会翼轸，太乙抱蟾，兼以命主逢生，身主得垣，福禄不背，皆二品至五品之命也","y":["火"]},{"b":"古赋注（上册）","p":"32","t":"连着四句教人怎么看了。子午卯酉，巳为的杀。八煞犯贯索，身命带勾绞，限遇火星主缢死；","y":["火"]},{"b":"古赋注（上册）","p":"34","t":"有甲寅生人，亥宫立命，木星在子，水星在戌，命躔壁度，坐天门之上。此是经纬夹拱，今为商贾之人何也？","y":["水","木"]},{"b":"古赋注（上册）","p":"37","t":"得，我也不跟你扯。你看下，四月卯时，太阳兄弟在那？命与太阳逢空，这象不就出来了嘛","y":["日"]},{"b":"古赋注（上册）","p":"39","t":"以度言之，自角至亢，自氐至房，谓之右旋。）昨夜火逼金龙（逼克也，此言限到亢金。昨晚流火克金太白","y":["金"]},{"b":"古赋注（上册）","p":"39","t":"）今午太白金星合退于辰，火金交战，必有大难。我当化象太乙以禳之。言未毕，明皇果诏试之，饮以毒药酒三杯","y":["金"]},{"b":"古赋注（上册）","p":"41","t":"）以名败身。（金水二星，不离太阳前后三宫，此离太阳五宫者，抑恐唐朝历法，与今之授时不同故耳","y":["日"]},{"b":"古赋注（上册）","p":"43","t":"（度主，命度也。禄主，官禄也。）起从阳于福德宫。（言命主禄主，辅佐太阳于福德宫","y":["日"]},{"b":"古赋注（上册）","p":"44","t":"是以将四日，四月，四木金水土火皆大约讲一下。其中四日特别。特别在即是太阳，又是火精，又是父，又可以是目，又可以命","y":["日"]},{"b":"古赋注（上册）","p":"44","t":"（此谓之杀迭杀凶不可解。）亦同此推。（不曰早丧母，亦主伤盲。）其中四月亦是如此，即是太阴月，又是水精，又是母，又可是以目，又可以是命","y":["月"]},{"b":"古赋注（上册）","p":"47","t":"但偏偏不好的地方是，计都杀星也在同度相克。这时我们要明白，计在戌，则罗必在辰。意思就是，这水耗于罗，受克于计杀太重了","y":["计"]},{"b":"古赋注（上册）","p":"47","t":"到了参水时，必三方会罗。而水限限主又受克受耗。是以说，如果有个金星也在度相生，则必不至耗克死，但金离得太远了","y":["金"]},{"b":"古赋注（上册）","p":"48","t":"殊不知当生水星，壮旺为福，否则而凶危矣。（此言只知命度受生为吉，而不知命度受生为凶","y":["水"]},{"b":"古赋注（上册）","p":"48","t":"且如限行水度，以水为限，主必看水星起躔，垣庙壮旺则为福。论设使水星起躔，衰弱失陷，则为凶断","y":["水"]},{"b":"古赋注（上册）","p":"48","t":"）倘若翼火起弱，亦不能窃我之木也。（此言以命去生限度，为窃气，乃凶。且如限行翼火，火星起躔，失次陷弱，亦不能窃我命木也","y":["火"]},{"b":"古赋注（上册）","p":"48","t":"若火星，起躔高旺，则能焚我木也。）举完李憕命后，憕默然。而此语到后有二例。虽又有各自的特别处","y":["火"]},{"b":"古赋注（上册）","p":"48","t":"（以其塑像年月日时推排。）先生不视，却之。忽炉中风荡，火星堕地。先生起而言曰：此寺不久人间，经旬灰于火","y":["火"]},{"b":"古赋注（上册）","p":"48","t":"（言十日后，必遭火焚也。）憕曰：先生因金刚命知之乎。（问是因金刚命而知之。适火星自炉中下，金刚命亦可试也","y":["火"]},{"b":"古赋注（上册）","p":"49","t":"憕课其命限，行虚日。（虚日在子，太阳为用）罗申火辰，攻破日鼠。（三合拱限，日怕火罗，限度被伤，其凶可决","y":["日"]},{"b":"古赋注（上册）","p":"49","t":"又刚好，炉火风荡，动起火星。火起则克金矣。是以先生起而叹：“此寺不久人间矣“。将易的易变，易占性通过一小段发挥的得尽","y":["火"]},{"b":"古赋注（上册）","p":"49","t":"憕很惊讶，心想，我盘都没排呢。莫非老仙你起盘如喝水，分针间就可以将盘起好。老仙直指关键：”否，是你没事做乱问问题，刚好你问完，火星即起，正是克应","y":["火"]},{"b":"古赋注（上册）","p":"51","t":"（如子星属火，被水孛克之，若罗侯得所，必有继子也。又如嗣星是木土水星失陷。若得气计孛余专权，亦同此例推之","y":["水"]},{"b":"古赋注（上册）","p":"52","t":"还有更狠的。注意到妻星水没。以寅宫命，申为妻。但寅宫命，巳正好为官禄，水星正好是官禄主","y":["水"]},{"b":"古赋注（上册）","p":"52","t":"明面上的词是，妻星水星失经而坐阳刃。实则指，这人的官禄主，正好坐在阳刃凶煞之上，一片狠象","y":["水"]},{"b":"古赋注（上册）","p":"53","t":"言而能匡世。金水引辅阳，引辅君从其正位，卯正太阳升位。一则名僧，一则清谈儒。一则官主退远居刃，一则水金引从太阳有情","y":["日"]},{"b":"古赋注（上册）","p":"53","t":"（午乃太阳从火，故曰孛星破局，又有孛骑狮子之论。）此当贫乎，富乎。（命坐唐符而孛星破局，故问之","y":["日"]},{"b":"古赋注（上册）","p":"53","t":"然破了就是破了，为了财而破了命。更关键的是，破的是太阳君位，偏不举木打宝瓶，偏要举孛破午太阳之位","y":["日"]},{"b":"古赋注（上册）","p":"54","t":"诚星家之良文，能说的都说了。诚星家之要不离此篇，能说的都说了。而暗藏的东西如下：太阳则君位，而月身则身","y":["日"]},{"b":"古赋注（上册）","p":"54","t":"是以安碌山的盘，太阳官禄都很好，金水不离阳，而太阳者正君，指君之好也。然不合，碌山月身一片阴暗之象，土计环身","y":["日"]},{"b":"古赋注（上册）","p":"54","t":"而土计正是克太阳君辅之水的，而水正为官。如果说，此文真的成就于开元年间，则直指安碌山反象","y":["日"]},{"b":"古赋注（上册）","p":"54","t":"到此就停下，一定要注意此象，才能明下文。同理，老仙为代表的人物，怕人不悟，是以又加一句，禄主武夫，亦用何怀疑，要注意啊，要注意啊，别看着金水太阳在命啊，要看这禄山真正用的是什么啊，是土计啊","y":["日"]},{"b":"古赋注（上册）","p":"55","t":"（日躔室，月躔危，金娄水，壁从阳，木火土辅太阴。）命坐室宿（汝可观之。观斯贵格，七政环拱","y":["月"]},{"b":"古赋注（上册）","p":"56","t":"则杨妃一事。再言，奎之危，则金星对克，金即为情星，为情事起。直指玄宗之好情，再言翼之不出，孛坏之","y":["金"]},{"b":"古赋注（上册）","p":"56","t":"则事起金孛，金孛者淫荡之星。乙酉生人，午为桃花，太阳桃花入命，乙酉生人则酉为沐浴","y":["日"]},{"b":"古赋注（上册）","p":"56","t":"而当行氐度，土星绕阳，正是臣也。而土正生金，则当朝重臣通于金杀胡人也。都不用再写下去了","y":["土"]},{"b":"古赋注（上册）","p":"57","t":"火罗临旺，福尤昌炽。钓起飞居垣庙，（如土星命主起在他宫，入垣居庙。）纵逢木气不为忌","y":["土"]},{"b":"古赋注（上册）","p":"57","t":"因阅天纲集有曰：烁烁阳光，火罗可忌。（星、虚、房、昴四日度也。）太阳怕火罗，烁烁者昼","y":["日"]},{"b":"古赋注（上册）","p":"57","t":"如是夜生呢？悟老仙点题否。娟娟蟾影，土计为防。（心、张、危、毕四月度也。）太阴怕土晦，娟娟者夜","y":["月"]},{"b":"古赋注（上册）","p":"62","t":"如太阳居午，得金水左右夹之，或水前金后，名曰引从辅弼拱夹是也。倘罗计截于卯酉，日在紫微，金水列于巳未，或同一宫并无别星混杂，此乃三公之象","y":["日"]},{"b":"古赋注（上册）","p":"62","t":"或木星在午，水为岁星君象也，得金水巳未，或寅戌二方拱合，亦曰三奇，此木所主，惟春夏得用，秋冬不取","y":["木"]},{"b":"古赋注（上册）","p":"63","t":"君临帝座，身处崇勋（太阳君象也，居午乃帝座也，身乃太阴，坐禄勋为美，如甲禄到寅，辛禄到酉之类，太阴居之为妙","y":["日","月"]},{"b":"古赋注（上册）","p":"63","t":"）此则注一解，另一解帝座者时支也命主得局而朝元（元即本年岁星支辰是也，各得其局，如亥卯未、三方四正拱之为妙，此亦罕值，乃少会见也，又如主是火，得居寅午戌为入局，躔四火度为朝元","y":["木"]},{"b":"古赋注（上册）","p":"63","t":"）解得宜，能称元者不多。太岁为岁之元。太阳为星之元，朝元之重。而解之后句则否。以元即元，局即局，如是考之精纪等，局得可为垣局意","y":["日"]},{"b":"古赋注（上册）","p":"63","t":"与朝元当另一义。太阳引远而从近（太阳，君象，要有引从，在前为引，在后为从，引宜远，从宜近","y":["日"]},{"b":"古赋注（上册）","p":"63","t":"不宜火土计孛罗同行。）太阳则君威，不宜孤，易有引从。而引宜引，从宜近。计罗截断，观其漏出何星（漏蟾光宜值夜，不宜残晦","y":["日"]},{"b":"古赋注（上册）","p":"63","t":"是以多语指向只太阳不可漏，而只太阳不可孤之意。官禄朝拱，无见他方恶曜。（官福二主，列居九五之宫以拱命位为吉","y":["日"]},{"b":"古赋注（上册）","p":"64","t":"）此解黄道又是一意。择日上的黄道吉日多与此相关。而另一解则，日月互补之道也，太阳所主之道，上下弦晦朔者","y":["日"]},{"b":"古赋注（上册）","p":"64","t":"）美莫美乎官福。而互换吉意重，明健为上则自然之理。金水辅日，在停均而为佳。（金水辅太阳，须要分明不乱，不破为佳，停均一作停午，乃正昼也","y":["日"]},{"b":"古赋注（上册）","p":"65","t":"）皆朝命而有宜谓临兆民行政令，乃宿分一道以辅君。（治万民、总庶政，必宜吉恩辅佐太阳，余难，必列有制之垣","y":["日"]},{"b":"古赋注（上册）","p":"66","t":"太阴系身坐田财宫，有吉星助主富。）恩随日月。更有傍身安母是富格之谓。田财而财意","y":["月"]},{"b":"古赋注（上册）","p":"66","t":"如入局得经，太阳躔星，太阴宁张更妙。）更命强之意。命为强无非日月拱夹，得时得垣得殿","y":["日","月"]},{"b":"古赋注（上册）","p":"66","t":"田财最喜临身命，身命又喜傍父母。（田财二星喜临身主命主。恩星同太阴，曰傍母安身，得人维持","y":["月"]},{"b":"古赋注（上册）","p":"69","t":"太阴身主怕居的刃、劫亡之地，叠恶杀尤凶。）恩与奴居，则恩情无我也。与上句奴入库禄同理同源","y":["月"]},{"b":"古赋注（上册）","p":"70","t":"）福又亏则更难为。（贱格）主居恶弱，身陷休囚。（命主坐恶弱之宫，太阴化刑囚，又临蚀晦，居休囚死绝之地","y":["月"]},{"b":"古赋注（上册）","p":"70","t":"（如木星居亢，既失其位，气星反得寅亥居之，其余罗卯戌，计子丑，孛巳申皆是。）主失而奴反成","y":["木"]},{"b":"古赋注（上册）","p":"71","t":"（日月遇蚀，暗昧失道而少精彩，金水二星，常随太阳而行不过三宫，水宜先行，金宜后行乃吉，如金行先，水返于后，或退或留，失其次则乱","y":["日"]},{"b":"古赋注（上册）","p":"71","t":"）这句则如注中语。会很关键，一则太阳太阴之重，昼则太阳，夜则太阴。二则五星歌赋亦有约摸语，则非从这句解不可","y":["日","月"]},{"b":"古赋注（上册）","p":"71","t":"这句是要二用的，因之即制则易战，此易伤也。日月夹刑囚，闲神攘殿。（太阳太阴被刑囚凶星夹之，午未二宫乃日月之殿，被木气土计居之，躔日月之度亦是","y":["日","月"]},{"b":"古赋注（上册）","p":"72","t":"身处高强，无杀星而犯殿。（太阴泊处，高强诸杀不犯，官福与田财之垣。）身强高键，自然之断","y":["月"]},{"b":"古赋注（上册）","p":"72","t":"（日月夹命宫，令星居田宅，若令星又是本命纳音星最吉。如甲子乙丑，金星寿元又得秋令","y":["金"]},{"b":"古赋注（上册）","p":"72","t":"）田者，上己解，而日月最权最吉，则”最妙“两字金水辅身临命位，为母曜而尤佳。（金水星辅太阴，或临本命位，或金水为母星乃妙","y":["月","水"]},{"b":"古赋注（上册）","p":"72","t":"）金水之吉。更主要者，金水不离阳，实盘又金水不离太阴。是以为母曜恩吉而尤佳。下有一句大喜之句同此句","y":["月"]},{"b":"古赋注（上册）","p":"73","t":"大喜金水日月之满用。（盘中最喜太阳，太阴，金水二星四者合照夹拱，两相合用为吉也","y":["日","月"]},{"b":"古赋注（上册）","p":"74","t":"（主星失垣，躔克是也，如夏金躔室，秋木躔亢之类。或杀星同命主共躔克主，又太阴受伤，诸煞同位","y":["月"]},{"b":"古赋注（上册）","p":"75","t":"（金水二星入命，或命坐金水，其星本垣也。木气星同太阴，必贤达者，或老成。功而能设策，处公道之人也","y":["月"]},{"b":"古赋注（上册）","p":"75","t":"）金水吉秀，而木气仁祥。名甲朝阳，躬亲临于君驾。（科名者，即甲乙木星也，科甲者，命官对宫主是也","y":["木"]},{"b":"古赋注（上册）","p":"75","t":"得入午宫、或临太阳、或临岁驾，可为清贤之士，金水亦然也。）科名科甲随阳。强其吉，而太阳者，君象","y":["日"]},{"b":"古赋注（上册）","p":"75","t":"金水秉令，独相助于月华。（金水助月，或只一星随太阴，倘得月华上弦，秋令尤妙。）金水实盘不离月也","y":["月"]},{"b":"古赋注（上册）","p":"75","t":"而助之一字关键。前面有几句皆如此。或身泊于斗牛之间，或命躔于奎壁之府。（斗牛奎壁之府，文武大人之位，若太阴泊守，或命主星于此，皆贤哲之人也","y":["月"]},{"b":"古赋注（上册）","p":"75","t":"）斗牛之间有秀吉，而奎壁间文吉。日居日庙，单联两傍之金水。（如太阳坐星日马、昴日鸡、虚日鼠、房日兔，得两傍金水夹之为吉","y":["日"]},{"b":"古赋注（上册）","p":"76","t":"（太阴居张月鹿、危月燕、心月狐，又毕月乌之舍。不见三方土计为吉。）两语一放会发现日月不同用处","y":["月"]},{"b":"古赋注（上册）","p":"76","t":"）混泥直取，金水秀背之断。日月沉沦又沾翳，命母落陷而失位。（太阳太阴值晦遇蚀，或被木气掩土计刑，又命母星失陷、居弱，此谓不明也","y":["日","月"]},{"b":"古赋注（上册）","p":"76","t":"（命主同太阴俱坐六宫、并驿马、阳刃之地，更忌奴星犯主值杀。）76九紫辰QQ：1900308216","y":["月"]},{"b":"古赋注（上册）","p":"78","t":"日为众曜之尊，月乃一身之主。（太阳人君之象，宜升殿得位。太阴人臣之象，一身之主","y":["日","月"]},{"b":"古赋注（上册）","p":"78","t":"如人之命，倘生时有差，各星不准，惟太阴循行晦明经度，每每有宫度堪好。）太阳至尊，凡太阳星性不离此尊字","y":["日","月"]},{"b":"古赋注（上册）","p":"78","t":"命身全方有人命。太阳正照，诸杀罢战斗之锋。（如诸星值战斗之间，若太阳临之，必不相攻也","y":["日"]},{"b":"古赋注（上册）","p":"78","t":"是以孤明之则诸凶不犯，而断一世康宁。日月最喜拱夹，水金须要分明。（太阳太阴，最宜吉星拱夹辅佐","y":["日","月"]},{"b":"古赋注（上册）","p":"78","t":"金水分明，水前金后，不宜混失退逆。）日月至权。然于盘言则金水不离太阳。于之实盘则金水不离月","y":["日"]},{"b":"古赋注（上册）","p":"78","t":"（太阳忌朔逢罗，太阴忌望见计，昼生忌火罗，夜生忌土计。）同是朔望，罗计不同。火罗夏会多招哭泣之灾，金水冬生难免孤寒之叹","y":["日","月"]},{"b":"古赋注（上册）","p":"79","t":"（金水星宜附近身命，日月喜拱夹于官福为妙。金水之吉，官福之美，日月之尊。日月次星张，有引从端为贵客","y":["水"]},{"b":"古赋注（上册）","p":"80","t":"火忌昼犯于太阳，土嫌夜截于孤月。（火化暗，昼生忌与太阳同躔；土化刑，夜生嫌与月同行","y":["日"]},{"b":"古赋注（上册）","p":"80","t":"）太阳怕火争光。然需重“昼”之一字。月怕土晦，同理需明“夜”之一字。日陷奴宫终不利，月居闲极反为祥","y":["日"]},{"b":"古赋注（上册）","p":"80","t":"（太阳忌入奴宫，欠利也。耶律经云：兄弟宫虽为恶弱，太阴居之反吉也。）日无为也。月而挂艮而明","y":["日","月"]},{"b":"古赋注（上册）","p":"81","t":"直白点：猴精猴精的。鬼主诡诈奸谋，更强健必为戎首。（命躔鬼，太阴躔觜，皆浅薄之人也，为人诡诈，终见崎岖","y":["月"]},{"b":"古赋注（上册）","p":"81","t":"（木星照临，主人技艺学术，亦是文人才士；金星守照，为人刚强方正，必好花酒色欲。）木主艺术文才，金主丽质欲情","y":["金","木"]},{"b":"古赋注（上册）","p":"82","t":"）孛流，孛慧星。孛月孛，等等己可推孛性。罗则火，火决之象。紫气清高，性必孤介。（紫气孤高节介之曜，守命临身，为人好静有道德之士，也恐未免孤刑，难为骨肉者","y":["炁","孛"]},{"b":"古赋注（上册）","p":"82","t":"）四余之中，常多凶语。以四余带煞重。大成有言，四余之气多带煞，唯化禄而吉之谓。唯紫气多许以吉语","y":["炁"]},{"b":"古赋注（上册）","p":"82","t":"福官驿马朝阳，玉堂贵客。（福主官星掌天马地驿，又近太阳得位得时，定是玉堂金马高贵之客","y":["日"]},{"b":"古赋注（上册）","p":"83","t":"（木气罗乃孤星也，不宜守命，太阴忌泊孤辰寡宿之乡，主清高孤寡之士。）木气罗等孤克性，加以神煞","y":["月"]},{"b":"古赋注（上册）","p":"83","t":"）金水孛的流荡性，加以神煞。荡之两神，冠带咸池。水星化暗入四宫，必伤祖业。（水星本无定性、飘流之星也，况又化暗守田宅，主祖业无依","y":["水"]},{"b":"古赋注（上册）","p":"83","t":"）水流荡再凶。四宫者田祖宗父母。太阴带禄登七位，定得妻财。（太阴阴星也，化禄临妻，主室家富厚，或太阴官禄之主亦同此论，必有妻财也，不然主妻内助","y":["月"]},{"b":"古赋注（上册）","p":"83","t":"）注中直解，然未言明，太阴者，与太阳相对。即妻可配属论。虽古多有是言，然人多不用，以其难应也","y":["日","月"]},{"b":"古赋注（上册）","p":"85","t":"）夫用被伤也。太阴升殿在福位，可贵于子。（太阴当望，化吉无翳玷，或天门奎壁角娄张毕","y":["月"]},{"b":"古赋注（上册）","p":"85","t":"生子必主聪明贤贵也。）身福得成也。只其中仍有另理，则福永与男女宫相对也。太阳当道临对宫，必尊其夫","y":["日"]},{"b":"古赋注（上册）","p":"85","t":"（对宫夫位，太阳君象临午，子宫安命是也，又如张度夜生，必尊敬夫，忌土计水气共位","y":["日"]},{"b":"古赋注（上册）","p":"85","t":"）太阳者，尊星。对宫者夫位。再深理，则上文有解。命为官、身为福，必居恭淑。夫化贵，子化禄，可任封章","y":["日"]},{"b":"古赋注（上册）","p":"86","t":"度擘浅深须明，岐界太阳所泊为准。86九紫辰QQ：1900308216","y":["日"]},{"b":"古赋注（上册）","p":"87","t":"）使交界不明，深浅欲明，则必以太阳为准。细观度宿，究察命源。（宜细观度分，何星吉、何星凶、何星用力，何星有伤","y":["日"]},{"b":"古赋注（上册）","p":"87","t":"当何以源，命源为究，仍是上句所谓太阳为准也。四空无曜，宫主须论。本度有星，加盘莫问","y":["日"]},{"b":"古赋注（上册）","p":"88","t":"）遇凶则凶，逢吉则吉。太阳临难地，能散诸凶。（太阳人君也，临杀地众凶自散，杀不能为害也","y":["日"]},{"b":"古赋注（上册）","p":"88","t":"）太阳尊星，上己解。杀星坐限宫，要知非福。（诸杀聚限，不逢空亡无制伏，必然为祸大矣","y":["日"]},{"b":"古赋注（上册）","p":"88","t":"）凶杀当道，亦同为一夫当关也。太阳为难，临蚀何凶；彗曜兴妖，逢庚反吉。（太阳为难虽忌，当逢蚀晦无凶，值此无大害；","y":["日"]},{"b":"古赋注（上册）","p":"88","t":"太阳能伏煞，使太阳本煞呢？太阳为难一句，直醒学者也。太阳之吉，吉在其尊，然千变万化","y":["日"]},{"b":"古赋注（上册）","p":"89","t":"（如限主属木，所忌金星伤克，其余仿此推之。）这句关键了。以应期之寻也。使如杀则当道，未必不能过也","y":["金"]},{"b":"古赋注（上册）","p":"89","t":"如木杀逢金星制之。一杀当限得势，抑且无救，患难奈何。）杀自乱，则无忧。杀当道，则深可虑","y":["金"]},{"b":"古赋注（上册）","p":"91","t":"祿馬拱身夾命，及祿馬主起拱夾身命者亦貴也。日月合用日邊紅杏，早占鰲頭。紅杏者木星也，木為官恩命令等用者，與太陽同行","y":["木"]},{"b":"古赋注（上册）","p":"91","t":"木为用而随阳。雪壓寒梅，終身餓莩。寒梅者木星也，木水同躔，夜生冬值倘或在子丑地及水宮、水度者亦是","y":["木"]},{"b":"古赋注（上册）","p":"93","t":"柳絮隨風，萍水他鄉之客。木星秉令躔箕度，或在巳宮巽地。雨驟花殘，窮愁萬種。春生木躔畢度，蓋畢宿好雨故也","y":["木"]},{"b":"古赋注（上册）","p":"95","t":"土掌官恩、命令，同太陽躔虛星房、昴日度。土星得令得用而随阳花裏停驂，封侯列仕。木為命宮、恩令，同太陰與馬元在張心危、畢月度","y":["土"]},{"b":"古赋注（上册）","p":"99","t":"鳳駕北歸，帝王之象。金水輔日，在虛昴度。太阳喜金水之辅據巽歸乾，應當富貴。巽居巳，乾居亥，如命在亥，而主在巳合格","y":["日"]},{"b":"古赋注（上册）","p":"101","t":"火随其阳，使阳而火，则火日争光。太乙抱蟾，孤兒寡婦。月孛同躔，以月為夫子星則忌","y":["孛"]},{"b":"古赋注（上册）","p":"104","t":"木垣寅亥水至巳申，诚入局气象俱新。水垣巳申阳君先月，躔狮子普照无私。太阳垣午，普照之性阴后次阳，逊臣蟹自安非泛","y":["日"]},{"b":"古赋注（上册）","p":"105","t":"名题雁塔，天首周邦罗入午宫足蹑蟾宫，太阳鲁分。各庙旺水日合星张之位，陛庭补衮赞皇明","y":["日","罗"]},{"b":"古赋注（上册）","p":"106","t":"巳宫得垣，是以是断。孛坐元枵，权谋百变。孛亦水坎，子为正坎，是以是断。掠他人之物为利己，盖缘水会计都","y":["计"]},{"b":"古赋注（上册）","p":"106","t":"捐自己之财以济人，必是木同紫气。（木主刚毅，气为慈祥）木主仁，仁而再仁亦偏。白话点就是，仁慈过头了","y":["炁"]},{"b":"古赋注（上册）","p":"106","t":"又是火星，为离为言，为礼，为法，而罗为偏余。一身迍蹇，火星怕与水星交。火则炎上，使克而不炎上也","y":["水","火"]},{"b":"古赋注（上册）","p":"106","t":"性逸素无拘，盖喜火临燕地。皆非泛泛语。早抛父母，太阳不喜遇罗候。（太阳为父，怕逢罗蚀）太阳怕罗蚀","y":["日"]},{"b":"古赋注（上册）","p":"107","t":"中弃妻孥，搀抢切忌逢天尾。（孛为妾星，忌计侵克）计孛之凶，而金孛妻妾。女招产厄，暗曜伤身","y":["计"]},{"b":"古赋注（上册）","p":"107","t":"金照卫而主寿，遇荧惑而夭天年。即居垣而火来就克。这句会让人忽视。果老后有周若水论月，和果老论月的一些句子有提及此用法","y":["火"]},{"b":"古赋注（上册）","p":"109","t":"以布宇宙，定中天。日出扶桑，遇白羊而金乌朗烈，月生沧海，到金牛而玉兔辉煌。太阳则喜卯戌","y":["日"]},{"b":"古赋注（上册）","p":"109","t":"太阴则喜卯酉。木入秦州，旺鬼而初归巨蟹。其中鬼更庙旺土居郑国，好亢而正庙秤宫。其中亢正庙旺","y":["月"]},{"b":"古赋注（上册）","p":"109","t":"给谏功臣，定是水临双女。参政学士，盖缘土好宝瓶。加以近天君。而子午端门。南方荧惑在卯宫，贵饶衣食","y":["火"]},{"b":"古赋注（上册）","p":"109","t":"火居卯垣西方太白向卫分，益寿延年。金居酉垣要知浅薄，无过土埋双女土巳怒地欲问荣华，大抵金居亢位","y":["金"]},{"b":"古赋注（上册）","p":"109","t":"即垣，而又言殿。克妻害子，太乙与天尾同宫。（孛计同躔于五七之宫）计孛相战，而据以星性","y":["计"]},{"b":"古赋注（上册）","p":"110","t":"足智多才，木星与太阳交会（木日相会于身命之位）木日之应。木者文才之星。中年命蹇，火孛而守申酉","y":["日","木"]},{"b":"古赋注（上册）","p":"110","t":"火入金乡，此命早抛兄弟。妻无子息，都缘孛在七宫。子授官班，紫气在于儿位。多荣产业，木金会于田园","y":["炁"]},{"b":"古赋注（上册）","p":"111","t":"年年获福，皆因三日逢金（太阴泊处，前后宫共四十五度，谓三日宫）三日宫日日有灾，盖谓八宫见火","y":["月"]},{"b":"古赋注（上册）","p":"112","t":"太阳乐昼，自卯以至于申。（日喜于昼，自卯时以至于申时生者佳。）月魄逢宵，终寅而始于酉","y":["日"]},{"b":"古赋注（上册）","p":"112","t":"（月爱夜生，自酉时以至于寅时者为美）太阳喜昼，月亮喜夜。然不可等闲视之。一则从太阳太阴的角度的讲，这两句将昼夜在理论上确定了，让学者论盘时，不会因为每地的太阳不同，而变得不定论，又将卯酉一线的重要性给提示了","y":["日","月"]},{"b":"古赋注（上册）","p":"112","t":"二则，太阳太阴，在星政上是阴阳的词属。这时有些学过易的人会笑了，由子午而阴阳交会图，你搞个卯酉太极图，有没学过易啊，这个只能说我也看过几本书的，如笑的要去看道家丹道的易图就112九紫辰QQ：1900308216","y":["日","月"]},{"b":"古赋注（上册）","p":"113","t":"寅午戌属火位，太阳偏乐此宫。（日为火之副，宜在寅午戌之宫）寅午戌局火，太阳喜于阳地，又太阳为火精","y":["日"]},{"b":"古赋注（上册）","p":"113","t":"申子辰属水局，太阴宜居此位。（月乃水之精，妙临申子辰之位）即然太阳火精喜于寅午戌火位，太阴水精，喜于申子辰水位","y":["日","月"]},{"b":"古赋注（上册）","p":"113","t":"属土，木入子为木打宝瓶忌格。月居日位，反致也。亥子乃江湖之位，太阳不足为奇。亥子丑水方","y":["日"]},{"b":"古赋注（上册）","p":"113","t":"亥子而取江湖。太阳者火精。火在水位，是以曰太阳不足为奇。巳午乃盛夏之时，月魄晦明为忌","y":["日"]},{"b":"古赋注（上册）","p":"113","t":"一天黯淡，只缘火曜临阳。火争光也，而太阳则尊。六合溟蒙，必是罗候犯日。113九紫辰QQ：1900308216","y":["日"]},{"b":"古赋注（上册）","p":"114","t":"皆庙旺之地。木临东井，要神首以加临。木临井位，神首者罗星。木罗会于井。气占金牛，见月孛而无害","y":["孛"]},{"b":"古赋注（上册）","p":"114","t":"气木也，牛金也，月孛者水也。以气古语取其孤吉之象，而被克，水能生之。男人切忌女人曜，夜里须防日里星","y":["孛"]},{"b":"古赋注（上册）","p":"114","t":"罗居午位，罗本火，而水相致。则克，则战。太乙躔虚，最喜太阴同度。子虚本坎，而太乙孛水，月又水精，取其精诚之象","y":["月"]},{"b":"古赋注（上册）","p":"114","t":"计都切忌三阳位，太乙专喜夜里生。计忌居寅，孛喜夜生。水孛同度性偏淫，水火同临寿必损","y":["计"]},{"b":"古赋注（上册）","p":"115","t":"要理解此断，需明四余之星多带煞。太阳为性威严，月孛厥心淫毒。太阳则君父也。月孛者，阴物也，又为余星，又为水星，是以此断语","y":["日","水","孛"]},{"b":"古赋注（上册）","p":"115","t":"紫气一心兮退藏，不为福兮不为殃。紫气清闲之星。四余之星断语多凶，唯紫气一星多尚吉","y":["炁"]},{"b":"古赋注（上册）","p":"115","t":"计都在历名豹尾，若非有刑必有忌。计更取豹尾象。或者这样说：老虎的屁股摸不得。金水文辞为智巧，火孛通明必外迁","y":["计"]},{"b":"古赋注（上册）","p":"116","t":"酉月卯日，定卿监郎官之位。酉月卯日，指月太阴在酉，指日太阳在卯。然可深推，亦可为月太阴酉时，日太阳卯时","y":["日","月"]},{"b":"古赋注（上册）","p":"116","t":"月孛周天皆祼体，惟宜朝斗与朝天。月孛慧孛之星。虽斗与乾天之地能伏。神躔度以横天，所临庙寅而庙午","y":["孛"]},{"b":"古赋注（上册）","p":"116","t":"相济自然是仁义并，而否，则会有断语为：不仁不义之断。水星无心常好动，向昼楚晋郑为强","y":["水"]},{"b":"古赋注（上册）","p":"119","t":"乾天伏煞则自然不用说了。其它赋也多有此句。若八煞朝天之格，无不多带此意。太阴长缺，子地必圆","y":["月"]},{"b":"古赋注（上册）","p":"119","t":"诸星之中，唯太阴之多变。以夜中而最明。此处何以说子地必圆？以午太阳也。古人常爱如此用语","y":["日","月"]},{"b":"古赋注（上册）","p":"119","t":"即此“子”非全是明面字眼上的“子”太阳常明，离邦必正。同理，太阳又与太阴相反。常明普照诸物源","y":["日","月"]},{"b":"古赋注（上册）","p":"121","t":"太阳午宫，太阴未宫。自此之句而阐各星。则此赋从垣宫入手。寅亥属木，而卯戌属火。寅亥则木垣，卯戌则火垣","y":["日","月"]},{"b":"古赋注（上册）","p":"122","t":"火星临此二宫，兵将之权）卯戌宫性如是魁星显，有震世之文。武宿高，作擎天之柱。为公为侯，顺于昼夜","y":["火"]},{"b":"古赋注（上册）","p":"123","t":"寸土卓锥，亦有好乐庙旺。（庙旺好乐，有吉有凶。）是以人皆可有好乐庙旺。岂不以荣名水星，遇之者登科及第","y":["水"]},{"b":"古赋注（上册）","p":"126","t":"这是明面上的。实则还含另一理法。即昼需观太阳，夜需观月。以其日月之权也。众星乱杀，禀阳尊不敢施威（太阳正照，诸星罢战斗之锋）看赋不可独看，实际这几句，无不就是阐发开始的两句","y":["日"]},{"b":"古赋注（上册）","p":"126","t":"只在阐发时，又带了独特的理技。如此句，太阳者尊也，使杀乱斗，则太阳有降伏诸凶之谓","y":["日"]},{"b":"古赋注（上册）","p":"126","t":"往往人之思考到这一步就停下了。是以未达理致。这时如自己问自己一句：如太阳也是乱杀呢？","y":["日"]},{"b":"古赋注（上册）","p":"126","t":"三日逢刑，纵月光不能为福（太阴泊处前后四十五度内，谓之三日宫）如注所解，太阴前后四十五度","y":["月"]},{"b":"古赋注（上册）","p":"126","t":"谓之三日宫。以太阴身也。即行速而前后所处关键。然为什么是四十五度。这个我查了很多赋注，其实都不解说，也就是这句就只是口诀了","y":["月"]},{"b":"古赋注（上册）","p":"127","t":"则又要多思。此则专就论日月也，是以昼夜为相分之要。不可一插到底。背太阳于父有撼，背太阴于母有亏","y":["日","月"]},{"b":"古赋注（上册）","p":"127","t":"更而伏有伏之喜，逆有逆之吉。不可因文害意。金星守命，好色而主清高（金之色美，人皆好之，故主义）、金质丽容而色美，金水情字而带","y":["金"]},{"b":"古赋注（上册）","p":"127","t":"木则仁，火则炎上。巧算多机，盖是计居垣位。独孛则为人悭吝，单罗则赋性贪婪。紫气照临，必主伶俐","y":["炁"]},{"b":"古赋注（上册）","p":"132","t":"官魁配论，前面己有。既参官星本宿，当以太阳相参。太阳者，君也。虽论刑煞星辰，合以天杀互论","y":["日"]},{"b":"古赋注（上册）","p":"132","t":"各取其意吧。杀火无情，若居杀凶恶难免（火星掌杀不宜居疾厄之地）火本凶星，若再带为杀，其无情之甚","y":["火"]},{"b":"古赋注（上册）","p":"134","t":"孤日临于命限，勤苦劳心。太阳君也，不宜孤。如孤而直读，孤无辅象。一月单行于官禄，精宁可爱","y":["日"]},{"b":"古赋注（上册）","p":"135","t":"武将功臣，但重火罗计孛）大约木气金水星性上多偏吉，火罗计孛星性多偏凶。五星歌赋专阐发星性也","y":["水"]},{"b":"古赋注（上册）","p":"138","t":"）夏火不妨见月。（夏火本炎，遇太阴以解酷热，火得令能助月。）君见古之才子春咏否？","y":["月"]},{"b":"古赋注（上册）","p":"138","t":"未垣坐命、太阳行限，则柔而能刚。（未乃阴宫，行限遇太阳，则阴从阳以刚济柔也，昴日度","y":["日"]},{"b":"古赋注（上册）","p":"138","t":"）太阴之月则假日而明。是以再行其阳日，则增其光。月者，善变化者，由日而变。而乾阳者，刚健","y":["月"]},{"b":"古赋注（上册）","p":"138","t":"星度为元、太阴司用则懦而无力。（星乃阳度，行限遇太阴，则阳从阴受制于阴故懦。）乾阳为刚","y":["月"]},{"b":"古赋注（上册）","p":"139","t":"寒土何生金之有。（所谓土寒者，不生之故。）冬木萧瑟。太阳其照而虽萧有意。向阳之木，直如老人之熠熠之容","y":["日"]},{"b":"古赋注（上册）","p":"140","t":"而归垣归殿。生克制化，刑冲破害。非简单之论矣。娄乃金石之火，触日方发。（娄金安命相从太阳","y":["日"]},{"b":"古赋注（上册）","p":"141","t":"强论之，时之至而明于道。时之不至，亦无非问对之橙。不可谓无其径。冬水为命，太阳行限，财不足而福有余","y":["日"]},{"b":"古赋注（上册）","p":"141","t":"春土作主，火星发用，彼无力而我何藉。（春土本不旺而火恩躔泄，则母无力而我何藉。）太阳之辉无分春冬","y":["日","火"]},{"b":"古赋注（上册）","p":"141","t":"使非如此，何太阳为君？而于中国之社会，农时之起，祭祀之礼，莫非由时。以天时而推星情","y":["日"]},{"b":"古赋注（上册）","p":"141","t":"广寒赋七政之法有别于他。还有个命身之用。“日赋尔命，月躔仍身”。太阳太阴，天地之转，则寅申而阴阳交关","y":["日","月"]},{"b":"古赋注（上册）","p":"141","t":"昼夜之出入则卯酉之要。太阳为天地之源，是以太阳转出，而有命宫，命度。是以“赋”，太阴日行十三度有余，而有身宫，身度","y":["日","月"]},{"b":"古赋注（上册）","p":"142","t":"而阴晴圆缺相属之。注意是单论。2.以太阳为源，则天地转动。而太阳为父，则月配母","y":["日"]},{"b":"古赋注（上册）","p":"142","t":"以人之所生，谁人无父母？而日月之意正合。3.太阳转动，而命宫命度。太阴转动则月身其立","y":["日","月"]},{"b":"古赋注（上册）","p":"142","t":"于是推天地而有准，定日月于掌中。于中太阳物源，而月清明明，是以广寒专立月阴而顺言之","y":["日"]},{"b":"古赋注（上册）","p":"142","t":"日赋尔命，月躔乃身。子夜朗耀于双鱼，宜逢太乙。（夜半月居亥，宜孛星抱之）太阳则万物之源，而人亦受其生，是以日赋尔之命，月则论其身","y":["日"]},{"b":"古赋注（上册）","p":"143","t":"（五更月居未喜，金星助之。）夜权而月挂天宫，是以乾亥以象之，即五更，则月于未地","y":["金"]},{"b":"古赋注（上册）","p":"143","t":"夜生为向，昼生为背。）又昼夜之不同。太阴之多变，每见学者不知所论。即未悟太阴从昼夜宫分时地己很多变化","y":["月"]},{"b":"古赋注（上册）","p":"143","t":"（月为后，为母，又为身）太阴之多变，不单上面几句不同角度的阐发。更主要的是，一星兼几职","y":["月"]},{"b":"古赋注（上册）","p":"144","t":"（上弦之后，月渐明。下弦之后，月渐晦）晦望上下弦。而一日间己不同。二十八宿循环，祸福晓矣（二十八宿所属，太阴躔此者，有祸福之所据","y":["月"]},{"b":"古赋注（上册）","p":"144","t":"）四十五度向背，吉凶了然。（四十五度中间，太阴泊此者，有吉凶之所辨）历行二十八而祸福现，向背左右四十五而吉凶然","y":["月"]},{"b":"古赋注（上册）","p":"145","t":"不以火罗计孛为凶，不以木气金水为凶。凡金星伴月以躔亢，水星伴月而入轸，火星伴月向南斗，木星伴月朝东井","y":["水","金","火","木"]},{"b":"古赋注（上册）","p":"145","t":"孟春之时，犹有微寒未退，借火罗以温其枝，则木无盘屈之拘，当有舒泰之美。如木与太阳同宫，名为向阳花木，必然早占鳌头，富贵之人也","y":["日"]},{"b":"古赋注（上册）","p":"146","t":"）夏末秋初之木，斯时气脉虚矣。昼生忌躔四火之度，又不宜与太阳交互。盖是日烈木焦，不足论也","y":["日"]},{"b":"古赋注（上册）","p":"146","t":"昼生木躔四水之度，而与太阳交光，此是上下济润，不可以木焦日烈而论。乃木之秀丽，枝叶繁茂，精神富贵","y":["日"]},{"b":"古赋注（上册）","p":"146","t":"九月寒露之边，遇火罗助，自能变化。冬令之木，斯时万物萧疏。如昼生与太阳交光，谓之日边红杏，布占先魁","y":["日"]},{"b":"古赋注（上册）","p":"146","t":"遇此造化岂不美哉。兼能有干，文才清高。如日生遇火罗，谓之寒谷回春，富贵双全。如无太阳火罗同宫到，生巳午未之时，借日光霁，冰霜冻解，犹可舒畅","y":["日"]},{"b":"古赋注（上册）","p":"146","t":"或木躔四火之度，又与太阳交辉，可作十全之福也。如遇夜生，木躔四土之度，又逢水孛冻折，穷之极矣","y":["日"]},{"b":"古赋注（上册）","p":"148","t":"所谓衡行炎阳之令，主成齐之权。春令之火，正二月之时，寒气未消，最喜火罗木气互度，见太阴夜生光彩，文武富贵","y":["月"]},{"b":"古赋注（上册）","p":"148","t":"夏末秋初之火，斯时秋阳杲杲，借水以济其盛，乃刚柔变化。最不宜与木气同照。火罗朝拱太阳，无水济润","y":["日"]},{"b":"古赋注（上册）","p":"150","t":"所谓绳，居五行之中，负载养育之权。春令之土，昼生与太阳交会，盖是阳和一点，天地皆春","y":["日"]},{"b":"古赋注（上册）","p":"150","t":"若有官令禄印爵魁佐之，主守成富贵。夜生最喜火照，土德朝拱太阳，盖火土俱名精彩，代日行权用事","y":["日"]},{"b":"古赋注（上册）","p":"150","t":"夏末初秋之土，不宜与罗火交会，谓之火燥土烈，无水孛济润，万物摧枯，一落千丈。昼生土与太阳交辉，亦为日烈土焦，如逢水孛，此谓上生下润","y":["日"]},{"b":"古赋注（上册）","p":"150","t":"土之精彩，万物秀丽，大降吉祥。冬令之土，最喜日温，自能变化。夜生木气，火罗佐助，土之精神光彩，朝拱太阳，皆主文武富贵","y":["日"]},{"b":"古赋注（上册）","p":"152","t":"金白水清，最喜秋生者，贵。若金水朝拱太阳，最为奇特。经云：金坚而无火锻炼，终见凶顽","y":["日"]},{"b":"古赋注（上册）","p":"154","t":"借木气火罗温之，自能变化，昼生水孛太阳同行，名曰光霁澄彻，谓之冰霜冻解，心宇清洁，作事整肃，政令威仪，当主台省扬名","y":["日"]},{"b":"古赋注（上册）","p":"154","t":"所忌金星交互。昼生为妙，夜生贫寒。二三月间天气畅和，遇水济润，发生万物，作事超群，但四五月间泛滥无定，必无福矣154九紫辰QQ：1900308216","y":["金"]},{"b":"古赋注（上册）","p":"155","t":"斯时点水成冰，冻结寒滞，不能变化，得火为上令，得土为次令，得太阳佐之，方可言令也","y":["日"]},{"b":"古赋注（上册）","p":"156","t":"当春最不宜云雨之星与日交会，枝叶繁茂，掩日光辉，不能变化。木火气罗交会，朝拱太阳，156九紫辰QQ：1900308216","y":["日"]},{"b":"古赋注（上册）","p":"157","t":"最怕木气火罗朝拱太阳，万物摧枯，一陷千丈。（孟夏之月，日在毕宿。曹植赋云：帝炎掌节，祝融司方，维扶桑之高燎，炽九日之重光","y":["日"]},{"b":"古赋注（上册）","p":"157","t":"限行遇之，为祸最重。若水日同行，得木飞来，泄水之气，遇火飞来合度，取火出色，乃太阳光霁，此谓雷下天时，人皆富贵","y":["日"]},{"b":"古赋注（上册）","p":"157","t":"九紫辰：太阳为万物主也。是以太阳之性，以光耀天下，仁温天下之。其用莫不欲太阳成其吉，吉则天下皆赖其康宁，成其仁君之势","y":["日"]},{"b":"古赋注（上册）","p":"157","t":"其凶，则天下为之肃杀，成其暴君之为。所谓上正而效之者。论之日，成其太阳之万物源可矣","y":["日"]},{"b":"古赋注（上册）","p":"157","t":"论月春天之月，照耀山林。虽花雨风流而晦月，亦当不美。最喜太阳逢时，阳辉明暖，丰盈财福","y":["日"]},{"b":"古赋注（上册）","p":"157","t":"斯时之月，不宜与土计交会，谓之云掩月华，不足论也。又不宜孛宠之星随月而行，掩太阴之光，为祸甚重","y":["月"]},{"b":"古赋注（上册）","p":"157","t":"水孛润之而不寒，火罗照之而不燥。斯时之月，喜木气以相扶，忌土计以掩蚀。金虽力薄，夜诞而喜月与同行，月本无光，昼假太阳而有辉","y":["日"]},{"b":"古赋注（上册）","p":"158","t":"最嫌者，土计关照。金星伴之无情，木气扶之安有益。生于昼者，借日光而布暖。诞子夜者，伏火罗以助辉","y":["金"]},{"b":"古赋注（中册）","p":"2","t":"喜太阳木土。计水孛于阳宫阳度。爱太阴火金罗于阴宫阴度。则福禄崇高。倘或昼曜反于夜","y":["日","月"]},{"b":"古赋注（中册）","p":"2","t":"月火金星为夜曜。日光晦昧克妻儿。论定好时节，则昼夜亦权，也相应的论定。这两个是相通的","y":["金"]},{"b":"古赋注（中册）","p":"2","t":"当然是太阳，月亮。是以在分定时令昼夜之后，就要先观看日月的状态。因就我们人类从地球肉眼观看来讲，太阳与月是最大的","y":["日"]},{"b":"古赋注（中册）","p":"2","t":"推迟留凡木火土金水。而有迟留伏逆之辨。以尊其太阳故也。盖太阳者君象也。五星者臣下也","y":["日"]},{"b":"古赋注（中册）","p":"2","t":"臣见君则让于礼。所以五星近太阳则迟。迟则行缓也。五星三方见太阳则留。留则不行也","y":["日"]},{"b":"古赋注（中册）","p":"2","t":"五星太阳同行。伏则不见也。五星对照见太阳则逆。逆则退行也。而顺行有气。五星遇日须当伏","y":["日"]},{"b":"古赋注（中册）","p":"2","t":"这时再细分，每个星星去分定，推其迟留伏逆。无非是再一步去细化。注意文中的歌诀。三方见太阳则留之类，会和现在的电脑软件排的多少有点不并完全相等","y":["日"]},{"b":"古赋注（中册）","p":"3","t":"伏逆君后反为迍。迟留伏逆，无不因太阳，是果老的用法。实际则是与大象有关。而果老之法，中心还是生克","y":["日"]},{"b":"古赋注（中册）","p":"3","t":"不可一见迟留伏逆而论其不吉。有逆而大吉者，又有逆而增凶者。从这几句可以看到，还是尊太阳之意","y":["日"]},{"b":"古赋注（中册）","p":"3","t":"紫气亦嫌鸡唱晓。孛逢戌土是三丘。罗喉酉亥君须忌。日月无光卯酉头。纵尔神仙并活佛","y":["罗","炁"]},{"b":"古赋注（中册）","p":"4","t":"太岁所在方诸神不敢犯也。神杀露假如命限是金。行逢火度火星。流水或三方对照。露杀交争气散倾","y":["火"]},{"b":"古赋注（中册）","p":"5","t":"星怒得时空有救。行逢怒杀岂为祥。值难枵值者。正二太阳之类也。八杀宫主也。天囚天耗也","y":["日"]},{"b":"古赋注（中册）","p":"6","t":"（中）6假如坐命斗木。限行亢金亦然。失次加流年金星。三合对照犯限决死。断之无差矣","y":["金"]},{"b":"古赋注（中册）","p":"6","t":"此句显得突兀。然细观上文，又非突兀。以前只讲了辨日月。而此句再提重其太阳之用。三灭关三关者","y":["日"]},{"b":"古赋注（中册）","p":"7","t":"寅宫：木计同寅、木罗会舍。卯宫：太阳逢兔、火明天市、日出扶桑。辰宫：金木逢龙、水润金明、金号太常、木躔角道、土归郑国、土罗相会","y":["日"]},{"b":"古赋注（中册）","p":"7","t":"巳宫：金水会蛇、日水乘旺、水临双女午宫：日帝居阳、水阳相会、水名荣显未宫：金躔鬼宿、木入秦川、太乙抱蟾、金星助月、月挂柳梢、星聚东井、火号文昌","y":["金"]},{"b":"古赋注（中册）","p":"8","t":"得令者，如春木、夏火、秋金、冬水昼太阳土木、夜太阴火罗金加为恩星得度，主大贵显也","y":["日","月"]},{"b":"古赋注（中册）","p":"10","t":"而此时最怕者，火又退行。令助身明火罗本恶，若夜生人，喜近太阴，而反得令，能助身主之辉，逢金水夹辅引从者，亦然得此，皆主聪明、富贵","y":["月"]},{"b":"古赋注（中册）","p":"11","t":"（中）11阳宅稽本阳乃父，居强位及有吉星夹辅引从，则崇父之基，如命坐酉，太阳又为田宅之主，日升殿，左右金水夹之，则可稽其父业，丰厚尊贵；","y":["日"]},{"b":"古赋注（中册）","p":"11","t":"若身命宫主引太阳居閑极，并入弱宫，父业必淡薄也。（閑极为兄弟之宫，虽有父业，兄弟分夺，则必淡薄","y":["日"]},{"b":"古赋注（中册）","p":"11","t":"）人最生后，于古代更是，父于业之重。当然现代则稍减其意。是以看其本，则直选太阳","y":["日"]},{"b":"古赋注（中册）","p":"12","t":"若贵人禄马文昌斗杓八杀卦气所临之宫，而身命主值此，亦为明宫也。（卯属火，戌亦属火，午乃太阳所居，亦火也，火为文明之象，故作高明之地","y":["日"]},{"b":"古赋注（中册）","p":"13","t":"（中）13亲驾须臣岁殿岁驾宫惟身命居之，此上又喜太阳临之，与我相亲，如君臣辅会于昭阳之象，岂非为我之荣，若升殿入庙居垣，皆宜满用辅会关係于命则贵","y":["日"]},{"b":"古赋注（中册）","p":"13","t":"（如一星得三用者，谓之满用，须要升殿入垣登驾临殿者贵。）指示殿驾之地之重。身空害卸太阴好静宜空，喜独行，或在六甲空，空则杀神不害","y":["月"]},{"b":"古赋注（中册）","p":"13","t":"经云：太阴空，而明万里。又曰：月居閑极反为祥。如坐命宫旺，不畏空。空意多有失用意","y":["月"]},{"b":"古赋注（中册）","p":"15","t":"月为后、为母，身命官福近太阳者贵；又日月夹身命及夹官福，皆为贵显。有近君也，若凶杀四余侵杂，如君侧之有恶人，虽贵而不久，亦不显矣，故身命主星向阳，则得父力，月明近命则得好母，若日月虽向，命或昼月夜日，或寒月孤居，父母虽好，终是相失反背之论也","y":["日"]},{"b":"古赋注（中册）","p":"15","t":"而有寿官星清，则为官有名、有誉。而尊显二星只要入庙归垣近太阳太阴，无凶煞沖制，方为发福","y":["日","月"]},{"b":"古赋注（中册）","p":"15","t":"）至用者官福，莫不欲其清健。身命为元命主即坐处二十八宿之属是也，身主即月是也，及太阴所躔之度亦是也","y":["月"]},{"b":"古赋注（中册）","p":"16","t":"子丑宫、土，寅亥宫、木，卯戌宫、火，辰酉宫、金，申巳宫、水，午宫、太阳，未宫太阴","y":["日","月"]},{"b":"古赋注（中册）","p":"17","t":"天雄遇官星，祿宮及月孛同躔，前後不驗。今將有準斷條并彷彿格局凡例，續附於左。鄭希誠者，豈非虛中，袁李琴堂苟判僧之下乎","y":["孛"]},{"b":"古赋注（中册）","p":"19","t":"此要原守星與流年，星度限度參詳有准。木有急速意。而木更为岁星。这句则有意思，郑自己举例，能看出一些技法来","y":["木"]},{"b":"古赋注（中册）","p":"20","t":"吉亦得力一、天元星最要緊，或守命得令相資，或是身命主聰明，加生旺貴祿為奇。天元者，如甲天元屬木，而木星守命，或命度純木尤奇","y":["木"]},{"b":"古赋注（中册）","p":"21","t":"一、四金泊命主起殺宮，蓋殺氣太重，命不長久，若福祿身好發用，只宜引陽貴。大抵看命要分寒暑，大寒不可背太陽火羅、近水月孛不利，大熱反是","y":["孛"]},{"b":"古赋注（中册）","p":"22","t":"但从这句看，加上吾之验盘，日月同宫确有其妙。吾思虽为晦，实则，太阳太阴，其星至大，虽晦之时，而不可谓其无光","y":["日","月"]},{"b":"古赋注（中册）","p":"22","t":"太阳转出命来为命源，太阴转动为身。为命身之起，不宜凶煞之星相随。其中又取日月为目意，以其光照也","y":["日","月"]},{"b":"古赋注（中册）","p":"23","t":"如白布政，己亥四月二十九日子時危十二度泊命，計羅辰戌漏一氣在斗木，到大梁月孛胃宿土同躔，諸星皆不可取，年少登科，吾想月為天元祿，主身度起高故也","y":["孛"]},{"b":"古赋注（中册）","p":"23","t":"有用星之独出，为权独之象。其中最不宜独出者为太阳，为孤君。一、太乙抱鬼之說，曾有秋殘夜半不可孤居之論，吾觀貴命多有月孛同行，或前或後，或沉或晦，亦在辰戌丑宮者不妨，此又不可一概而取","y":["日","孛"]},{"b":"古赋注（中册）","p":"24","t":"天也，命也，豈人事乎。此句举了个有趣的地方，以卯立命，太阳只日行一度有余。是以相差一二天，同命度者多矣，而只月不同","y":["日"]},{"b":"古赋注（中册）","p":"24","t":"是以看太阴要紧。决云：“唯看月”者也。其中一个是侍郎部官，则火命人而月在井木恩度上","y":["月"]},{"b":"古赋注（中册）","p":"24","t":"可惜者，因郑是想强调月之重，未例出当时木星在所。失了很多可能情况。又例，秋日之阳喜金水之润，而己亥生人，月与木在巳，巳为水地，而木能克土护水，辛丑月在辰金，无木护，至氐土晦了这孛日守","y":["木"]},{"b":"古赋注（中册）","p":"25","t":"假如戌亥安命，火守化為三元，或木為三元，三方宮度相資亦上格也。次则白虎持，再次则火星两月一宫，亦易成朝天","y":["火"]},{"b":"古赋注（中册）","p":"27","t":"戌為刃處安命，遇戌曰凶，大凡命坐日支為第一，坐年月時上次之。又如金星在已遇己巳日，又是巳上安命，文旺官高","y":["金"]},{"b":"古赋注（中册）","p":"27","t":"此句举示了用法。因之太阳日行一度，使之立命，必命同者多，而只月不同。此则再加分别之理","y":["日"]},{"b":"古赋注（中册）","p":"28","t":"其中母更带母象，而中有一语当注意，所谓月孛者，孛为水余，而月为水精，实为奴犯母象，是以曰：与孛同而妨母","y":["孛"]},{"b":"古赋注（中册）","p":"30","t":"使之如直用，则天下夭命者多矣。而其中举例则有趣理。以星决太阳日行一度，而至日之交时，太阳实或为过度，则命口决或在胃命，实在太阳己过，入昴矣","y":["日"]},{"b":"古赋注（中册）","p":"31","t":"有喜火者，同时之人，所在其太阳可爱，其妙乎。至于家教山川风情更是如此。君不见明初科考名归南方，而皇帝振怒乎","y":["日"]},{"b":"古赋注（中册）","p":"32","t":"则至酉时，月借日而明之象。也正是因这计晦之月，土在迁而本命限时，使之母子零伶。使之用日为元，日虽在卯，而正是夜生，而太阳无光，再加水寒，何以成？","y":["日"]},{"b":"古赋注（中册）","p":"33","t":"取太阴阴象。取罗计阴阳交晦象。取太阳等阳象。欲正得，怕反致。一、羅近太陽，父凶","y":["日","月"]},{"b":"古赋注（中册）","p":"33","t":"又有壽考者，謂首星捧日，夜生者吉，蓋夜日無光，喜羅火故也。火罗争光，太阳借火罗之谓","y":["日"]},{"b":"古赋注（中册）","p":"34","t":"一、水為孤劫，計為雄刃，夾日主胎中妨父，刃雄星與太陰合著度上，即妨母。太阳为火精","y":["日"]},{"b":"古赋注（中册）","p":"34","t":"太阴为水精。一、流年星如井木安命，木入亢婁火帶殺入命，宜謹身節用。此似指示，看流年时，本命星即可直接当用","y":["月"]},{"b":"古赋注（中册）","p":"35","t":"如甲生人，火羅晝生逢陽，乙生人，金星不宜輔陰陽，辛羅火，壬土計，丙戌、丁巳，陰陽為刃，如為宮度身主輔陽，自身榮貴，父母終是不順，依此論之","y":["金"]},{"b":"古赋注（中册）","p":"36","t":"欲其得吉，拱吉，夹吉。一、氣星守命，三方見木，若木星守命，三方見氣，或木守命，對宮見氣，其人多博學、有藝術，只恐妻子執拗，首尾有剋","y":["木"]},{"b":"古赋注（中册）","p":"36","t":"金木相战意一、木土相剋，辰戌丑月生，土星旺未發其惡，再行限木必死。36http://weibo.com/qq1900308216九紫辰QQ:1900308216","y":["土"]},{"b":"古赋注（中册）","p":"40","t":"太阳怕火争光，太阴怕土晦。而日月兼多意一、木巽於風，主倒限，謂之風搖葉落，行限木宮木度者是","y":["日","月"]},{"b":"古赋注（中册）","p":"41","t":"（中）41看星节要八十一条一看五星之法，先排定太阳，以生时加在太阳度上，逆数至卯，则知安命在何宿何度，方为端的","y":["日"]},{"b":"古赋注（中册）","p":"41","t":"须是以度主为要。盖宫主者，州郡也。度主者，县令也。由县而州，其宫主必要逢生得令，不要克制，不为太阳所伏，及三主四正无星相克方好，更看度主又坐高强，又坐禄马长生岁驾","y":["日"]},{"b":"古赋注（中册）","p":"41","t":"试看果老：“凡看五星之法，须是排定太阳以生时加在太阳度上，则知安命在何宫，方为端的，须是以度主为要，宫主次之","y":["日"]},{"b":"古赋注（中册）","p":"41","t":"经云：身好命不好，有福无寿；命好身不好，有寿无福。安命以太阳度为主，以生时加于上，顺数本人生时，逢卯止，即为命宫，是何宫主也","y":["日"]},{"b":"古赋注（中册）","p":"42","t":"一凡日生人以太阳为重，夜生人以太阴为主。如太阳逢恶曜昼生，如太阴遇凶星夜诞，合此者，无不贫夭","y":["日","月"]},{"b":"古赋注（中册）","p":"42","t":"才不会被表面文字所误。其实讲来讲去，无非就是昼里太阳权，昼星要得用，夜里太阴权，夜星要得用","y":["日","月"]},{"b":"古赋注（中册）","p":"43","t":"昼生不宜遇阴星，夜生不宜遇阳星。一昼生人则要太阳在寅卯辰巳午未上，方应朝阳向明之格，如昼生人太阳在申酉戌亥子丑上，皆非合格；","y":["日"]},{"b":"古赋注（中册）","p":"43","t":"夜生要太阴照命，行限亦要火罗月孛当限，方为得体。”是吧，要有这样的过渡，指示学者，看盘要这样，即看宫亦看主，宫与主相织，满盘活泼论之","y":["月","孛"]},{"b":"古赋注（中册）","p":"44","t":"此宫惟喜土星居之，则安稳丰腴。【论男女】水宫一数火、二木、三金、四土、五，加吉星则足，其数加凶星刑剋者必孤","y":["土"]},{"b":"古赋注（中册）","p":"44","t":"一夜生太阳独照男女宫，无星辅之，皆主无子；有星辅之，反有子；日生太阴独见男女宫，亦然，以其孤阳不生，孤阴不成故也","y":["日","月"]},{"b":"古赋注（中册）","p":"45","t":"会丧弔二符计都必剋妻，如妻主是杀星，坐强实殿驾，或守财帛田宅，主妻多做大模样，欺凌夫主也","y":["计"]},{"b":"古赋注（中册）","p":"45","t":"如妻星化值难值咸池的杀同宫，必多产厄而亡。如妻星是太阳或入未或在午或入兄弟，多主因亲致富，姨兄弟为之","y":["日"]},{"b":"古赋注（中册）","p":"46","t":"官星只宜文魁印星禄神守照，则为纯粹。一官禄不要杀星剋其宫，名曰：官鬼。如官禄在亥却不宜金星入，亦不宜三合四正宫值之，皆主其人健讼；","y":["金"]},{"b":"古赋注（中册）","p":"46","t":"福德一宫，人生赖之以安荣，苟有凶星杂之，以害人之福气，则一生衣禄已矣乎。【论相貌】金星独行，相貌清秀温润","y":["金"]},{"b":"古赋注（中册）","p":"46","t":"木星瘦长清爽。水星眼目俊丽。火星日生则面紫黑，夜生则红白。土星肥白长大，夜生矮黑，孛星额角骨露，日生长大好颜色，夜生额角露而细小，罗?头角阔大，骨格粗多鬚，计长面骨粗露，夜则身小眼露，气星好相貌多鬚，太阴温润白夜黑小","y":["月","水","火","木","土"]},{"b":"古赋注（中册）","p":"46","t":"太阳日黑色赤，夜生清白爽气。凡看相貌，如命裏有星，须看先入者断之，若命与相貌皆有星，亦依例断之，及三合对照推之","y":["日"]},{"b":"古赋注（中册）","p":"47","t":"何谓向明，夜生人见火金月当限，日生人见日木土水气当限。皆谓向明，发福可期。如日生人不曾见日木土星，又皆独见火金月照限，行限又经行的煞，劫煞，阳刃三煞空亡之上，未可以发迹许之","y":["土"]},{"b":"古赋注（中册）","p":"47","t":"若水星夜见以之事，其人必孤寒。大抵令星春时，必借土以为栽培宿。冬月火土自为相生相养，亦与水而濡沐者","y":["水"]},{"b":"古赋注（中册）","p":"48","t":"凶星不要逢时旺，自然之理。一金星若在太阳之宫，名曰：映进。若作命主，在太阳之前，为特进","y":["日","金"]},{"b":"古赋注（中册）","p":"48","t":"各名曰：金星映日，又曰：金星当权。太阳之前只喜身度主，命度主及金星在前者，皆作吉论","y":["日","金"]},{"b":"古赋注（中册）","p":"48","t":"若太阳之前，或是刑囚，暗耗，名曰：误进。命主及金星在太阳之后者，名曰：后进。金水不离太阳，而又分前后","y":["日","金"]},{"b":"古赋注（中册）","p":"48","t":"在前为引，在后为从。引从之间大有不同。因金不离太阳之性。喜其为吉为用。以尊太阳也","y":["日"]},{"b":"古赋注（中册）","p":"48","t":"如水星在前行，则不能克火。如火星在前，水在后，其煞逼身最为利害，不可不审。经云：煞前主后，当膺藩辅之权","y":["水","火"]},{"b":"古赋注（中册）","p":"49","t":"此煞星不进前而克其金，是退而有情。如或金星退而火顺行，是退而逢其煞也。五曜皆然，亦有退而升殿，退而入垣，退而逢，皆为有情，又作吉论","y":["金"]},{"b":"古赋注（中册）","p":"49","t":"伏则韬晦无光。如命午太阳，忌木气同躔。木前日后，退之为祸。日前木后，退之为福。留者，用星留于实在，为福久远，煞星留于实地，为祸不休","y":["日"]},{"b":"古赋注（中册）","p":"49","t":"最要此独星为好得用。一截断不要太阳跳出，太阳格在外名曰：孤君，孤遁。君而无辅极为不好","y":["日"]},{"b":"古赋注（中册）","p":"49","t":"盖太阳乃君之象，必诸星辅佐而行，或左右皆为吉论。若太阳孤立，主其人不得人之力，虽亲辅人，人多远之，平生劳苦","y":["日"]},{"b":"古赋注（中册）","p":"49","t":"但太阳不可，以太阳则君，不可孤君无辅49http://weibo.com/qq1900308216九紫辰QQ:1900308216","y":["日"]},{"b":"古赋注（中册）","p":"50","t":"是以，使其凶会命又不成，自为奴，使其命吉，又正是权劳之象。一太阳孤立照妻宫，皆主夫妻年纪不等，不然妨克重婚","y":["日"]},{"b":"古赋注（中册）","p":"50","t":"太阳为君不宜孤。这句没去多验盘。是以不注太多字。一夜生人，太阳独照男女宫，无星以辅之，其人主无子","y":["日"]},{"b":"古赋注（中册）","p":"50","t":"昼生而见太阴在男女宫，无星以辅之，亦无主。夜生人，惟有水辅日在男女宫，反主有子","y":["月"]},{"b":"古赋注（中册）","p":"50","t":"太阳不宜孤，又夜则更无矣。一妻宫不论妻妾宫主星，假如甲子年，丙寅月，寅亥木垣，木为兄弟，乙巳日，巳乃水垣，为妻妾","y":["日"]},{"b":"古赋注（中册）","p":"50","t":"水得地逢生坐实，则妻贤貌美，内助荣夫。或坐籍驾，禄马，贵人，则因妻致富。或水星坐空脱之地，逢煞星同行，皆不好妻或无妻","y":["水"]},{"b":"古赋注（中册）","p":"50","t":"琴堂发挥良多之法。以年为身驾，月为兄弟，日为夫妻，时为子。直取其宫而论六亲。试想，星除了太阴一日十三度有余，其它星都是走得慢的","y":["月"]},{"b":"古赋注（中册）","p":"50","t":"喜宫与主得吉。一男女宫不论男女宫主，只以时论之。如丙戌时卯戌火垣，火星逢生坐实，禄马贵人之地者","y":["火"]},{"b":"古赋注（中册）","p":"52","t":"一官禄不要星克其宫，名曰：官鬼。且如官禄在寅地，却不要金星入内，亦不三命，四正值之","y":["金"]},{"b":"古赋注（中册）","p":"53","t":"（中）53美莫美乎官福。更是人中年之限所经。一妇人不要太阳坐命及照命。如身弱，皆主欺夫夺权，性有男子志气","y":["日"]},{"b":"古赋注（中册）","p":"53","t":"而太阳阳星。不单太阳，如火亦是。无非就其意为，女需善柔之星，莫配刚暴和阳星。特别于现代社会，又是不同论了","y":["日"]},{"b":"古赋注（中册）","p":"53","t":"实在只要一星得用即妙。平淡中见其奇。阴阳之道也。一金星不要坐阳刃，劫，的煞之上","y":["金"]},{"b":"古赋注（中册）","p":"53","t":"盖金星主煞，遇则然气腾辉，为煞星重。一太乙抱蟾，常人若见月与孛同行，谓之太乙抱蟾","y":["金"]},{"b":"古赋注（中册）","p":"54","t":"只就大部分人来讲。何堪中年之伤。多许中年功为方好。一昼生人，则要太阳在卯辰巳午未上方","y":["日"]},{"b":"古赋注（中册）","p":"54","t":"应昼生为朝阳向明之格。如日生人太阳坐申酉戌亥子丑之上。夜生人则要太阴照命，行限亦要火罗月金54http://weibo.com/qq1900308216九紫辰QQ:1900308216","y":["日","月"]},{"b":"古赋注（中册）","p":"55","t":"（中）55孛当限，方为得体。昼则太阳，夜则太阴一余论五星，每每推究太阳躔度，次舍断祸福，吉凶，贫残，富贵","y":["日","月"]},{"b":"古赋注（中册）","p":"55","t":"盖人命以太阳为主，身宫以太阴为主。故凡日生人当推太阳，夜生人当推太阴。如日生太阳逢恶曜，夜生太阴逢凶曜","y":["日","月"]},{"b":"古赋注（中册）","p":"55","t":"太阳为诸命之源，诸星之源。为星之枢机所在。一木罗会舍在寅上，为吉会。盖木喜于寅，罗乐于寅","y":["日"]},{"b":"古赋注（中册）","p":"55","t":"论盘时常见。每有星盘原局有象，而断语不切者，皆由此。一日生人，自少至老，一见太阴在前，谓之阳极阴生，决主人死","y":["月"]},{"b":"古赋注（中册）","p":"55","t":"一夜生人，一生见行太阳，又行阴星之限至老，一见太阳在前，谓之阴极阳生，决主人亡","y":["日"]},{"b":"古赋注（中册）","p":"56","t":"（中）56阴生阳死，阳生阴死。一太阴逐月随日而右转，化金木水火土。太阴属水，则不喜土月同躔","y":["月"]},{"b":"古赋注（中册）","p":"56","t":"如太阴属木，则不喜金月同躔。皆主疾厄妨克。如更在亡劫刃空之乡，决主其人乱说言语不实","y":["月"]},{"b":"古赋注（中册）","p":"57","t":"若难俱受制全，主高寿。且如立命在辰，金星为主，火罗二星为难。火被水克，罗被孛制，各各受制，莫能为毒，的许高寿","y":["金"]},{"b":"古赋注（中册）","p":"58","t":"一妻妾有权者。如寅亥命，木为主。或水星化权。行限遇之，必有权之妻。孛为权星，主有权之妾","y":["水"]},{"b":"古赋注（中册）","p":"58","t":"如正为老，则偏为少。而土者慢老之象。是以组此断语。一立命安身在女，心，毕，柳及身命二主泊贵人，咸池，迁移，官宫又逢气孛土星","y":["土"]},{"b":"古赋注（中册）","p":"59","t":"谓之太乙抱蟾。未为月殿也，谓之蟾宮。凡人安命未宮者，逢此主大貴。诗曰：太阴在未号天圭，千载欣逢明圣時","y":["月"]},{"b":"古赋注（中册）","p":"59","t":"月孛更來同会照，蟾宮折取桂花枝。未分秦国，孛入秦逢，鬼宿是也。而月喜孛润---九紫辰金水会蛇巳宮属蛇，金与水同会于巳宮，在轸度则貴","y":["孛"]},{"b":"古赋注（中册）","p":"59","t":"巳宮属水，轸星属水，逢金而生水，所谓金水会蛇。凡人巳宮安命及身者，逢之為貴。诗曰：巳宮太白本長生，变曜名為天禄星","y":["金"]},{"b":"古赋注（中册）","p":"59","t":"今人不知安身之法，只以太阴為身主者，谬也。闲极宮者，兄弟宮也。乃命宮逆至第三宮也","y":["月"]},{"b":"古赋注（中册）","p":"60","t":"日月守照日乃太阳星也。月乃太阴星也。凡人身命二宮，或日月守之，或对宮照之，皆吉而貴也","y":["日","月"]},{"b":"古赋注（中册）","p":"60","t":"二曜朝阳二曜，火星也。水数一，火数二，故曰：二曜与太阳同居午位，谓之朝阳。身命二宮逢之，主貴","y":["日","火"]},{"b":"古赋注（中册）","p":"60","t":"更丰荣为官，当居显秩之职。最大者莫非太阳。其实无论水火，金土等皆喜朝阳。不喜者只余星","y":["日"]},{"b":"古赋注（中册）","p":"60","t":"其它之星随阳。然又要顾及时令。一星伴月一星者，水星也。水数一，故曰：一星。与太阴同宮，为一星伴月","y":["月","水"]},{"b":"古赋注（中册）","p":"60","t":"而月喜水润。只当顾及时节。火月同宵火者，火星也。月乃太阴星也。夜生人，立命在子丑二宮者，遇此二星，在命方是","y":["月","火"]},{"b":"古赋注（中册）","p":"61","t":"如甲生人，文在罗，魁在太阴，或子上安命，文魁在辰申是也。福祿夹身福星者，天福。星祿乃禄神也","y":["月"]},{"b":"古赋注（中册）","p":"61","t":"又如水在子亦含大格。如金在亥亦其义。日月趋朝日月為太阳太阴也。亥為帝阙之地，如日在子宮，月在丑宮，谓之日月趋朝","y":["日","月"]},{"b":"古赋注（中册）","p":"61","t":"若八杀朝天。背君朝主午者，太阳所主之宮。未者，太阴所主之宮。人命宮逢之，皆主大貴","y":["日","月"]},{"b":"古赋注（中册）","p":"61","t":"但忌木星作殃。连其宫而带深意。可通用于其它宫位及星。若木星在辰，虽不见金星，亦有词在","y":["金","木"]},{"b":"古赋注（中册）","p":"62","t":"借宫位象以言。使卯则有明堂。使辰则龙意。使巳则有顺意。廷尉辅阳廷尉者，水星也。如同一宮，又谓之水护陽光","y":["水"]},{"b":"古赋注（中册）","p":"62","t":"若同太阳在子宮行虛度，是谓廷尉辅陽。子命人遇之，大貴也。金水不离不太阳过远。而太阳光辉，喜水之或随或润","y":["日"]},{"b":"古赋注（中册）","p":"62","t":"明其太阳不欲孤君之无辅。而辅者，诸星之中，水最清。而又水有坎险之意。以国之安存，凭险而立","y":["日"]},{"b":"古赋注（中册）","p":"62","t":"或入垣用星对照用星者，主星所生之星也。如木星为命主，木生火，火星为用星也。与命对照，能克制难忌则大吉也","y":["火","木"]},{"b":"古赋注（中册）","p":"63","t":"更立命酉丑二宮，遇之，主富貴也。火土相生，配以宫位象木罗会舍木星与罗星同在戌宮，行奎宿度，謂之会舍","y":["木"]},{"b":"古赋注（中册）","p":"63","t":"金星同月居未，谓之金星助月。金与月同在巳宮，申宮，又谓之金助月华。身命更得此三宮，亦主大富貴也","y":["金"]},{"b":"古赋注（中册）","p":"63","t":"月喜金助，更得位得垣，则妙主星朝君主星，命主星也。君星者，太阳星也，为君，为父，为乾，为男，为陽，为刚","y":["日"]},{"b":"古赋注（中册）","p":"63","t":"凡人命主星近而傍之，謂之朝君。皆为近貴之命也。太阳者，君象。亦贵人之象。诸星之中，以太阳为大，莫不借日而明","y":["日"]},{"b":"古赋注（中册）","p":"63","t":"若得近太阳太阴之傍，是謂：依日月之光而得富貴也。63http://weibo.com/qq1900308216九紫辰QQ:1900308216","y":["日","月"]},{"b":"古赋注（中册）","p":"64","t":"此三句实少二句，白虎从驾，勾陈镇殿。其中，因之金水不离太阳。则玄武持旗与白虎从驾而易成","y":["日"]},{"b":"古赋注（中册）","p":"64","t":"木星一年一宫，而需每春天之会，则须木星在亥时，则此格较少。而土星同理。使此几格，如又再逢或甲乙","y":["木","土"]},{"b":"古赋注（中册）","p":"65","t":"皆为貴人之命也。以乾而言则亥，以日而则午，以岁而言则驾。金木水日会毕金星，木星，水星，与太阳星同至毕星度下，主人聪明而且富貴也","y":["日","水","金","木"]},{"b":"古赋注（中册）","p":"65","t":"以申为阴阳交关之所。而比雨会以善星加之太阳，则刚柔并至。五星并隨日月木火土金水，五星并与日月同一宮者，主大富貴也","y":["日"]},{"b":"古赋注（中册）","p":"66","t":"举一则知其他。月与水，而带加星性。以水星之纯情。使为印星更妙。而禄者，又带天支之用","y":["水"]},{"b":"古赋注（中册）","p":"66","t":"人命逢官星，更有福禄二星隨之，主富貴双全而无忌也。又兼神煞言。金水辅阴阴言太阴星也","y":["月"]},{"b":"古赋注（中册）","p":"66","t":"遇太阴而辅是也。太阴喜金水之润。当留意于时节昼夜。火金逢月火金二星与太阴星宮又同度，谓之火金逢月","y":["月"]},{"b":"古赋注（中册）","p":"66","t":"人命宮得太阴守命，又遇火金，此作貴推之也。太阴为身，喜金明而火照金土富豪金星若在財帛宮，土星在田宅宮，主人富豪","y":["月","金","土"]},{"b":"古赋注（中册）","p":"67","t":"假使太阴星在未宮，又值水星同宮，谓之水涵蟾魄，极其清徹。凡人命主及命宮逢此者，貴不可言","y":["月","水"]},{"b":"古赋注（中册）","p":"67","t":"明岁殿岁架之重。喜身命主入。喜官福二星之入。与帝座同宫，而年又重与座。火气官高气者，木气也，逢火星，木又生之，是为得助","y":["火"]},{"b":"古赋注（中册）","p":"67","t":"月挂柳梢月，太阴星也。如太阴行度在未宮躔柳度，谓之月掛柳梢是也。但人身命二主亦在未宮，或立命在未宮，方断有此貴也","y":["月"]},{"b":"古赋注（中册）","p":"67","t":"水星临之，名曰水清宝瓶。但凡人命立子宮者有之。若得金星助合，富貴荣华，土木加之，不吉","y":["水","金"]},{"b":"古赋注（中册）","p":"68","t":"如寅宮立命，又见火星入命者，谓之禄勋坐命。主食天子赐爵，其余依流年推之，取貴。甲火乙孛丙木丁金戊土己月庚水辛气壬计癸罗","y":["火"]},{"b":"古赋注（中册）","p":"68","t":"而天官多用。日帝居阳日者，太阳君主星也。正居午宮，诸星不敢犯之，惟忌木气掩之而已","y":["日"]},{"b":"古赋注（中册）","p":"69","t":"（中）69清台四十星格五星壁奥经----清台四十星格水星随日至天宫，锦绣文章达圣聪人以日为命，以月为身，日至午时为天中，日生人喜见之","y":["水"]},{"b":"古赋注（中册）","p":"69","t":"此命在午宫，日在午入庙，水星随之，无他星相杂，水为贵元，寅有罗星为火星。主九卿之位—朱太卿命九紫辰：金水环阳，而水有文墨意","y":["水","火"]},{"b":"古赋注（中册）","p":"69","t":"天宫，或午，或乾。而太阳为君。是以达圣聪。禄主秉文居马上，立朝蹇谔势豪雄。戊戌生人马在申，土星为禄，主文星","y":["日","土"]},{"b":"古赋注（中册）","p":"69","t":"其星居于马上，兼福星以助其福，命在巳宫，元有太阳，水星岂不为贵显者哉—中书之命禄马并会之意","y":["日","水"]},{"b":"古赋注（中册）","p":"69","t":"文中所解以十干化禄作解。可兼用禄勋。而马星者奔动。以无论升迁则动之意也。众星北拱来朝命，富贵双全难比并此为坎宫坐命，日在酉，火月在戌，土气在亥，水金孛在申，木罗在未，计都在丑","y":["计"]},{"b":"古赋注（中册）","p":"69","t":"古以君南面而治之谓。而北之为意。或指子，或指亥乾天宫。一水东流正度箕，侃侃忠诚宣圣政此以寅命而论，水正在寅，金星在辰，水星在寅尾上本不得地，惟至箕宿最为得力","y":["水","金"]},{"b":"古赋注（中册）","p":"69","t":"兼命坐寅，丁人以金为禄主，寅命以金为福主，福禄之位俱是金星。金入庙于辰，诚可谓富贵之美也","y":["金"]},{"b":"古赋注（中册）","p":"69","t":"金月同宫，为金星助月，火与气满用在卯，火为科甲，禄主太阳在亥，水星同日，水为寿元居福德之宫","y":["日","水","金"]},{"b":"古赋注（中册）","p":"70","t":"时值三台为限主，优渥殊恩迁弼辅此未宫立命，土星在酉为科甲，罗星在酉为魁星，三台者，日水金或月金水也","y":["土"]},{"b":"古赋注（中册）","p":"70","t":"中限命主得申上五星傍照满用，独土星为中限星为命星，又在福德强宫见之，是为九事全禾备，万中无一，岂不贵耶","y":["土"]},{"b":"古赋注（中册）","p":"70","t":"况又太阳金星同宫，岂不美哉。--姚解元命马星来朝命，马又归垣得用。是以有四海扬名之象","y":["日","金"]},{"b":"古赋注（中册）","p":"70","t":"福不离宫仍得用，诏书遥拜九重天此命在午宫，申为福德宫也，更日水在申，日为马元福元，水为禄元，谓之福不离宫，又兼水星满用同宫，为食禄之命","y":["水"]},{"b":"古赋注（中册）","p":"70","t":"岁星在外内荧惑，奕世缨无纪极此以丑上立命，与火星同宫，木在未为贵元荧惑火星也，岁星木星也","y":["火","木"]},{"b":"古赋注（中册）","p":"70","t":"木火相会，当审轻重。水来会火则为福，火去时会水则无力，此命宫在丑，火星坐命，对宫得木以生之，谓在火在内，木在外","y":["火"]},{"b":"古赋注（中册）","p":"70","t":"木罗会舍当观先后，若罗先入，木星后至，则不为福，惟此在午上安命，戌上得木先到宫，罗后入，木为主，罗为客","y":["木"]},{"b":"古赋注（中册）","p":"71","t":"未生人马在巳，未命人木星为寿元。木居巳而顾亥上本宫，亥上太阴为原守为福。命宫日水为吉，身命俱纯，安得不贵乎","y":["月","木"]},{"b":"古赋注（中册）","p":"71","t":"--朝官之命寿星马星等，照身有情，而月在闲宫。太乙抱蟾归福德，决非百里之才客此以巳宫立命，未宫太阴孛星同宫，此命二月酉时生","y":["月"]},{"b":"古赋注（中册）","p":"71","t":"命宫在巳，水为命主，未为福德宫，太阴为宫主，孛在未上入庙，为太乙抱蟾格，有此星辰，终非百里之才也","y":["月"]},{"b":"古赋注（中册）","p":"71","t":"-县尹之命福德宫成，而月又为身入福德。更在未而太乙抱蟾以成。金水拱身禄入命，铜臭官升俱难并此以卯宫立命，金星在辰，水星在寅，又兼太阳太阴在守命","y":["日","月","水","金"]},{"b":"古赋注（中册）","p":"71","t":"此命己生人，太阴为禄主，其星入命得地，前有金，后有水，谓之金水拱身格，主富贵双全","y":["月"]},{"b":"古赋注（中册）","p":"71","t":"申宫有月为文魁，金为福星，罗为魁星并照命。而福主又助太阴为福。夫有文而不可无福，有福而不可无文，文福皆齐，安得不贵乎","y":["月"]},{"b":"古赋注（中册）","p":"71","t":"而又当须有福而己。即喜吉物照命身。阳德运阴爱度天，萧曹鼎台冕旒前此以子上立命，太阳在巳，太阴在辰，日月以十二宫分为转运，然人命望日月，度天则为福，入地则为殃，此命安子，日月从辰巳以度天，其福岂浅浅也哉","y":["日","月"]},{"b":"古赋注（中册）","p":"71","t":"金星与月宜互垣，爵禄连绵不计年。此以命立午宫，金水在未，月木在辰。十二宫之宫主星自亥子至申卯，星辰皆不可交互","y":["金"]},{"b":"古赋注（中册）","p":"71","t":"惟金星与月，太阴与水，宜互恒局。此命金月互垣格，主福之绵远莫若于此。--太守之命太阴与金从不离","y":["月","金"]},{"b":"古赋注（中册）","p":"72","t":"而四之为字，多与四正相关。则不知此句之四角亦恐有四正之意。三方不背福弥深，出应治朝祥比凤此命立子宫，有太阳木星在午为马元，金星在辰为禄主，太阴在申为身，此命对宫傍照，俱得是得用吉星，又无火孛罗计杂之，其出而应世，比之祥凤岂不贵乎—谢尚书之命三方主不背而得用","y":["日","月","金","木"]},{"b":"古赋注（中册）","p":"72","t":"夜生延月至天门，驷马高车职任尊日生望日，夜生望月，皆得其贵，此命亥宫立命，亥为天门，太阴居之，正谓月到天门","y":["月"]},{"b":"古赋注（中册）","p":"72","t":"而月正为身。日诞望阳归地户，家徒四壁度朝昏此乃寅上安命。太阳在申，申为坤，坤为地，日到此将西沉矣，日生之人望日，日至中则富，日没而藏之，则望之失其所矣—贫穷之命文中举例确","y":["日"]},{"b":"古赋注（中册）","p":"72","t":"未必谓此，所谓四正无星，未为凶断。不堪水火逆阴阳，催促光阴不久长。此命立戌宫，日水守之，太阴在酉为身之主，火星守之，此谓太阳为命之主，而水星不得地以逆之","y":["日","月","水","火"]},{"b":"古赋注（中册）","p":"72","t":"太阴为身之主，而火星不得地以暴之。所以身命俱难。星辰暴逆，故不得长寿。72http://weibo.com/qq1900308216九紫辰QQ:1900308216","y":["月","火"]},{"b":"古赋注（中册）","p":"73","t":"（中）73太阳为命，太阴为身。而日月为重。水火为世间之大用。使逆乱其命身。则命无成而促寿","y":["日","月"]},{"b":"古赋注（中册）","p":"73","t":"而得用，则火孛有速意，则跃之一字。土罗得位实非殃，壁水进身清誉播此立命午宫，土罗相会，土星为地，罗本不喜同宫","y":["土"]},{"b":"古赋注（中册）","p":"73","t":"恶星加限入官宫，失禄诛身不善终此立命午，计孛在丑，火星在巳。此命虽贵，行官禄大限至酉三会，原有火孛计都，而流年又被火孛计都所加，所以为官未免恶死，且火星在巳化天刑，主凶","y":["火","计"]},{"b":"古赋注（中册）","p":"74","t":"此命宫在未，罗守之，计都对照，傍临俱是凶星，火星在戌，四正宫见之，此人若废疾，必遭恶死也","y":["火","计"]},{"b":"古赋注（中册）","p":"74","t":"--废疾之命命会极恶杀而凶。身得纯全青易拾，休声洋溢著儒林此命立在子，身在寅，遇紫气木星，又为福德宫分，所以取青之易也","y":["木","炁"]},{"b":"古赋注（中册）","p":"74","t":"刑囚两曜苟伤身，王法无情命辞世。六甲生人以计都为囚，以水星为刑。此命甲生人立命辰宫，计都守之变囚，水星在戌对宫变刑，二星皆不得地，且又化为刑囚，人逢此等之凶，岂不遭此难乎","y":["水","计"]},{"b":"古赋注（中册）","p":"75","t":"水星若旺桃花上，百婿千夫无定向寅午戌生人卯为桃花煞也。兼水星临之，水主淫荡而无定性也","y":["水"]},{"b":"古赋注（中册）","p":"75","t":"此女命立酉宫，身在卯宫，水星守之。况子午卯酉咸池互换之宫，岂不为淫娼之命乎。--娼妓之命以水之星性无定而荡，加配神煞而论","y":["水"]},{"b":"古赋注（中册）","p":"75","t":"金宿还居驿马中，逐人奔走身顠荡此女命乃子生人，马在寅，身居马上，与金星同之，正谓金骑人马，金主淫又躔其位，女人逢此马星在身，而金又主淫泆，岂不随人而奔走乎","y":["金"]},{"b":"古赋注（中册）","p":"75","t":"金生在巳，水又入垣，金又生水，亥宫木星入庙，水又生木，木又生火。谓之生生不绝。合此格者，岂不大贵，诗云:巳宫太白喜长生，便曜名为天禄，星与水同宫最奇特，高官厚禄佐王庭","y":["金","木"]},{"b":"古赋注（中册）","p":"75","t":"起处作命宫，太阳转出命来，而命宫为起处，命主为飞出，月为身。而命宫起处如逢恩，为起处逢生","y":["日"]},{"b":"古赋注（中册）","p":"76","t":"（中）76背中反望做朝官背水反旺格。此卯上立命木星守之，凡子上做命为背水，酉上被金，午上被火，卯上背木","y":["木"]},{"b":"古赋注（中册）","p":"76","t":"阴阳夹贵凶同断火孛惊天格。此亥宫立命为天门，坐命此有火孛守之，戌有太阳，子有太阴夹之，须见金水气土为贵火罗为凶所以有吉有凶断之","y":["日","月"]},{"b":"古赋注（中册）","p":"76","t":"巳酉丑安命，金为天元印，水为地元印，木为寿元印。若居四正高强，主大贵。此乃巳宫命水为命主水星，居巳居垣，名荣名星故贵","y":["水"]},{"b":"古赋注（中册）","p":"76","t":"诗曰:水来双女号荣名，乐旺之宫万事亨，若得金星同会此，黑头早驻翰林声。独高者，所谓一星得用","y":["金"]},{"b":"古赋注（中册）","p":"76","t":"此命午宫立命太阳守之未宫安身太阴守之却为阴阳入庙为贵也，却因孛星在午罗兴在未身命二宫俱犯凶神，故云嫌凶速诗云:日月周泰是本宫，怕逢罗孛却为凶，那堪身命还居此，富贵荣华总是空","y":["日","月"]},{"b":"古赋注（中册）","p":"76","t":"太阳转而命，太阳为命之源，怕带其凶。无论太阳本身之凶，或随从之凶。又特别分昼夜","y":["日"]},{"b":"古赋注（中册）","p":"76","t":"以日重太阳，夜重月。是以不欲其凶。罗计同宫遇食神罗计守身命。罗为天首星，计为天尾星，逆天而行逢日月则蚀，此命在丑立命，计都守之未上安身罗星守之，罗遇月谓之遇食神，必主横夭刑伤","y":["日","罗","计"]},{"b":"古赋注（中册）","p":"77","t":"孛本为水余，有流意。归而刑之，其远之意。炁星交限百年春主寿。此论未宫立命，戌为官禄宫，火为官禄主，火星入庙在戌，更交限有寿，夜生最吉，日生减半","y":["火"]},{"b":"古赋注（中册）","p":"77","t":"日伤火见阴阳位主目疾。此命未宫立命，日月二星同火星在申，申为阴阳也，又见火伤之，日月犹人之眼目也，火来伤之必主眼疾，诗曰阴阳本是目之精，二曜同宫怕忌星，或在逆流并伏晦，更居相貌盲双明","y":["火"]},{"b":"古赋注（中册）","p":"77","t":"奎垣言亥宫木星也，奎木狼木升殿也。此午上立命亥为疾厄宫，木为疾厄主，木在亥此火罗在午守命，午上火罗入庙，疾厄主星入垣，主ㄧ生少疾，壬癸生人得此格者富贵","y":["木"]},{"b":"古赋注（中册）","p":"77","t":"火建生在木奎。水命对交非学士主游荡。此申宫立命，水为命主，且命主在寅为对宫也，诗曰:无定星辰是水星，此星游荡最无情，命宫对照如逢此，空读诗书业不成","y":["水"]},{"b":"古赋注（中册）","p":"77","t":"此主为游说之客。无定星辰是水星。此星最流荡。得用其水，则清明以水墨之客。得其非，则动摇山河矣","y":["水"]},{"b":"古赋注（中册）","p":"77","t":"土居疾厄是闲人主残疾。此子上立命巳上安身，土星守之，此命身居疾厄之宫，又逢土居双女，非吉也","y":["土"]},{"b":"古赋注（中册）","p":"77","t":"土移木位还荣贵主荣贵。此命宫在亥宫，土星守之。身宫在丑，木垣居之，此身命主星互垣，于紫微局者，主大贵显也","y":["土"]},{"b":"古赋注（中册）","p":"78","t":"金于五星属财。兼其销镕之象。吉曜逢凶为陷害遇吉逢凶。此命午宫坐命，太阳为命主，今有木孛守之，是为吉而逢凶也，此命孛先守之，虽得木救助，然以先入为主，固凶也","y":["日"]},{"b":"古赋注（中册）","p":"78","t":"木星独贵解灾迍逢凶遇吉。木为岁德仁，而且慈能解灾害，此乃巳上立命，木星在亥，对照火星在酉，计星在丑，孛星在卯，三合皆凶，喜木德在亥入垣，救而解之","y":["火","木"]},{"b":"古赋注（中册）","p":"78","t":"诗曰:恶曜相刑十二宫，临宫晦气煞重重，幸逢一木星来照，独木非为解祸凶。诸星之中，以木为仁为德","y":["木"]},{"b":"古赋注（中册）","p":"78","t":"使其凶，则因事斗非。刑徒之象于此。五位归宫贵绝伦荣宠之命。此命亥上立命，木星守之，卯为迁移宫","y":["木"]},{"b":"古赋注（中册）","p":"78","t":"火星守之，丑为福德宫土星守之，皆得正垣，谓之五位归宫，诗曰:五星入庙各归宫，身命生来向此中，必是少年登上第荣膺，宠命至三公","y":["火","土"]},{"b":"古赋注（中册）","p":"78","t":"凡见恶星，计孛垂照，谓之垂针格。此命亥宫立命，罗喉守之，计孛垂照，更身命福禄宫主俱陷，主ㄧ生不达，六乙生人以孛为禄不在此论","y":["罗"]},{"b":"古赋注（中册）","p":"79","t":"迁者主迁动。使恶，则易流荡东西。出地入天朝上格富贵双全。此命亥宫坐命，太阳守之","y":["日"]},{"b":"古赋注（中册）","p":"79","t":"太阴在巳，对照谓之出地入天。诗曰:巽为地户，亥为天门，日月来朝，福气全，神煞若无相破害，双全富贵寿年延","y":["月"]},{"b":"古赋注（中册）","p":"79","t":"坐干就湿作穷民主水溺。此命子宫立命，太阳守之，太阴在午。太阳为身主，以身居午为干，以子为湿","y":["日","月"]},{"b":"古赋注（中册）","p":"79","t":"使之好为济。使之不好则凶。木罗会舍分强弱主寻常。此命丑宫立命，计星守之，罗星同木星在未，谓之木罗会舍","y":["木"]},{"b":"古赋注（中册）","p":"79","t":"若罗星先入为弱，木星先入为强，变刑囚则为害，变印官则为福。诗曰:木罗会舍细推详，祸福需分若与强","y":["木"]},{"b":"古赋注（中册）","p":"79","t":"此命卯上安命，乃甲乙生人属木，以木为主，此则卯命木星同金星守命，木旺于卯，却被金星同宫，为金居火位反为贱格，此为火克金，金克木所以为害也必矣","y":["金","木"]},{"b":"古赋注（中册）","p":"80","t":"（中）80凶中主吉。此巳宫立命，水星之居垣子午卯酉为煞地。诗曰:煞地偏防做禄星，禄星做煞晦天明，或然吉曜相生旺，官主归垣禄又成","y":["水"]},{"b":"古赋注（中册）","p":"80","t":"吉带煞，而又五行相配。阴阳拱命为真主荣华富贵。此子命太阳在卯，太阴在酉。诗曰:日月分明拱命身，此星夹辅最光明，更无凶宿来刑犯，福禄相扶福寿深","y":["日","月"]},{"b":"古赋注（中册）","p":"80","t":"日月拱照金主文章有声誉金水会蛇。此卯上立命，太阴在巳，金水会于身。诗曰:金星再得水星扶，二宿同宫福最殊，那更其宫于福德，声名远远冠皇都","y":["月","水","金"]},{"b":"古赋注（中册）","p":"80","t":"此句则难解。或指，命之破而身能成。三生得禄权兼贵以年日时为三生。此命立戌宫生月午，木星守之","y":["木"]},{"b":"古赋注（中册）","p":"80","t":"吾作解为兄弟得用。不与原文同。四正全无道与僧僧道之命。此命卯宫寺正吴星，惟紫炁居福德宫","y":["炁"]},{"b":"古赋注（中册）","p":"80","t":"此言午宫坐命，太阳度下又逢木星同宫，诗曰:日木同宫极于美，命宫得此时光明，兼于禄主还同位，五福具全福自深","y":["日","木"]},{"b":"古赋注（中册）","p":"80","t":"此午命酉为官禄宫，若金星为禄主同位更为大贵。身逢土孛必遭刑80http://weibo.com/qq1900308216九紫辰QQ:1900308216","y":["金"]},{"b":"古赋注（中册）","p":"81","t":"（中）81刑夭命。此言亥宫立命，身居巳宫，土孛在身。诗曰:土星怕与孛星行，身吉逢之祸不轻，那更八宫同位分，破伤夭折必遭刑","y":["土"]},{"b":"古赋注（中册）","p":"81","t":"子依母位娘先死主伤母。此言亥宫立命，水星在未为男女宫，守月在身为母，为子依母。诗曰:水为子兮，月为母，两星最怕相移处，或然互见在其宫，母不伤时须克子","y":["水"]},{"b":"古赋注（中册）","p":"81","t":"臣犯君宫父早倾主伤父。此言午宫立命，太阴在午，日在未，诗曰:两曜本宫居午位，日为君象，月为臣，莫教臣犯君宫分母，若存时失父身","y":["月"]},{"b":"古赋注（中册）","p":"81","t":"又以日为父四煞居阳徒配格徙流命。此言亥宫立命，火星守之，孛星在巳冲之，身在寅宫计星守之罗星守之，且寅申巳亥为阳宫，况四煞主之诗曰:寅申巳亥名四煞，计孛伙罗交互居，身位命宫双值此，刑囚不善损身躯","y":["火"]},{"b":"古赋注（中册）","p":"81","t":"四余更带凶煞随阳三空坐命道僧名主僧道命。此言酉宫命炁星在卯冲之，炁主孤，月在辰，金水在戌三合皆无星，诗曰:命宫三合无星照，紫炁孤神独对冲，纵有吉星俱陷落，断为僧道入元空","y":["炁"]},{"b":"古赋注（中册）","p":"81","t":"宁我犯余气，莫余气犯我日里怕逢荧惑照主做事无成。此言酉宫命火星守之，孛星冲之。诗曰:坐命嫌逢荧惑星，日生为忌最无成","y":["火"]},{"b":"古赋注（中册）","p":"82","t":"此言巳宫命身，与同宫土月相会局。诗曰:太阴怕与土同行，夜里生人却晦明，数算不离三主度，作为迍滞百无成","y":["月"]},{"b":"古赋注（中册）","p":"82","t":"辅身之贵四曜逄阴必路横主恶死。此言命在卯宫身在丑罗星守之，太阳在位火孛计同宫，四宫俱是阴宫，诗曰:火罗计孛号凶星，与日相逢日晦明，身命位宫三合照，决然路死见尸横","y":["日"]},{"b":"古赋注（中册）","p":"82","t":"为三方拱照之限主。两宫坐禄利名成主利名。此言辰命金星守之，本位身居未为官禄宫，身命俱得位","y":["金"]},{"b":"古赋注（中册）","p":"82","t":"孛乃奴星，女人属之。故云防妻之心恶。诗曰:月孛从来好恶星，主人凶暴性非轻，或然第七宫中见，安得妻无狠戾名","y":["孛"]},{"b":"古赋注（中册）","p":"83","t":"（中）83主巧艺。此言木上安命，水星守之。诗曰:水居巨蟹命相逢，身入高强总ㄧ途，禀性自然多敏捷，为人巧智比公输","y":["水"]},{"b":"古赋注（中册）","p":"83","t":"水主性巧土星照月百无成主拙愚。此言卯宫立命，酉宫为身，太阴度下，土星同照，诗曰:月矅偏嫌土宿联，忽然相会大留连，夜生遇此多沉滞，百事无能寿不延","y":["月","土"]},{"b":"古赋注（中册）","p":"83","t":"土主愚厚，使其成用，而诚。亦无非单以月星不喜土而言。忌星行限终沉滞主不建。此言行限最忌火土二星，诗曰:洞微最怕忌辰星，此矅临之极不清，昼是火星夜是土，限行值此事无成","y":["水","火"]},{"b":"古赋注（中册）","p":"83","t":"强宫要得力卯阳酉月为高贵主贵。夫卯为日出扶桑，酉为月到金牛，身命二宫正逢之，且木星在未，木入秦川占强宫，得此贵格岂不为尊贵之命耶","y":["木"]},{"b":"古赋注（中册）","p":"83","t":"卯为太阳之出所，为明堂。酉为太阴之出所。得其本位之言。福木官金至大官主高位。此言酉命，身在寅，金星居官禄，而木居福德入庙，子得金星及三合无刑耗驳杂，为大贵显之命，正行限官福二宫必贵","y":["日","月","金"]},{"b":"古赋注（中册）","p":"84","t":"（中）84主夭寿。此言申宫命日与孛星同居，诗曰:太阳元是火之精，最怕同宫见孛星，倘使更加刑战地，少年不死也加刑","y":["日"]},{"b":"古赋注（中册）","p":"84","t":"气星照命百年龄主长寿。此言子上立命，紫炁守之，金星在辰，得地为寿元，木星在辰为禄元，所以主寿也","y":["金","木","炁"]},{"b":"古赋注（中册）","p":"84","t":"诗曰:紫炁元为道德星，此星守命最康甯，寿元得地禄元壮，限数如松岁岁青。一星满用终须贵主贵","y":["炁"]},{"b":"古赋注（中册）","p":"84","t":"此言辛生人，金星在酉属金，辛禄在酉酉又属金，亥卯未做命，以金火月于三限主谓之，三满用也，其他并仿此而论","y":["金"]},{"b":"古赋注（中册）","p":"84","t":"此言亥命太阳在午，木在未，土在子，日木土于三限主，昼生人太阳在午，以日木土为三方之主，二主俱占高强，岂不为贵显而有权也","y":["日"]},{"b":"古赋注（中册）","p":"84","t":"况日月拱之主，有封爵禄之贵也。两宫作贵三朝禄大贵。此言命宫在申，水星居之，身宫在巳，亦水为主，庚生人，庚禄居申，申为水局，又木星在亥，入垣与身对照，主为大贵命也","y":["水","木"]},{"b":"古赋注（中册）","p":"85","t":"（中）85主富贵荣寿。此言命在卯，木星守之，月在酉照命，罗在亥，计在巳，日与水在午，金在未，气土孛在子，凡此五弱之宫，并无吉星，所以为贵","y":["木"]},{"b":"古赋注（中册）","p":"85","t":"强宫有曜必延年主长寿。此言戌宫立命，火星守之，太阳照之，月在未，正垣土在子，气在丑，孛在寅，罗在午，计在子，七强宫俱有矅居之，诗曰:强宫有矅最圆明，星入强宫倍有情，命若逢之为美备，官高福厚更丰荣","y":["日","火"]},{"b":"古赋注（中册）","p":"85","t":"以其离为思为火光照乎？木打宝瓶人必破主劳碌。此言身命在子宫又逢木星，谓之木打宝瓶","y":["木"]},{"b":"古赋注（中册）","p":"85","t":"诗曰:木星本是吉星辰，祇恐当来打宝瓶，身命更同宫内坐，ㄧ生作事时艰辛，此为五星贱格","y":["木"]},{"b":"古赋注（中册）","p":"85","t":"子为宝瓶金骑人马寿难坚主短寿。此言寅宫坐命，金星守之，为金骑人马，火在申冲克，斯为下格","y":["金"]},{"b":"古赋注（中册）","p":"86","t":"（中）86箕为水为雨。取其风雨伤人之象。水计相刑须恶死主恶刑伤。此言丑宫立命，水与计都在命，太阴与罗在未对照，盖水计最怕相会，此命戌生人见之又为丑戌相刑，必主刑害恶死","y":["月","计"]},{"b":"古赋注（中册）","p":"86","t":"水计相犯木罗同会益天年主益寿。此申宫立命，木星同罗，星在寅对照，且木罗最喜同宫，况居寅位于庙旺之地，主为五福具备，禄贵兼全之命","y":["木"]},{"b":"古赋注（中册）","p":"86","t":"火移妻位必重婚主防妻。此言亥宫命，以巳为妻妾宫也。今土宿火星居之，必为妻妾之害，诗曰:夜忌土星昼忌火，更在奴宫必于祸，若是移来妻妾宫，更须再娶方安妥","y":["火","土"]},{"b":"古赋注（中册）","p":"86","t":"又金为情为妻。月居闲极须增福主有福。身命二宫祸福一同，自命宫至第三宫为闲极，兄弟宫也，若太阴居之必须增福","y":["月"]},{"b":"古赋注（中册）","p":"86","t":"此言酉宫立命太阴在未而论之也。而月入反增吉象。亦无非得用不得用。日背阳生最可怜主不遂","y":["月"]},{"b":"古赋注（中册）","p":"86","t":"此言日木二宿在子，火星在酉皆相违背。诗曰:昼生最喜日中天，若背阳生实，可怜身命主星如落陷贫穷，防更夭天年","y":["火"]},{"b":"古赋注（中册）","p":"87","t":"（中）87日生人太阳权，不欲背阳。而太阳则或父或贵人。财上添财难聚绩主财漂荡。此言命在子宫，水星在亥为财帛星，诗曰:财帛宫中爱吉星，水星来耗事无成，主财一似汤烧雪转，见艰难过此生","y":["日","水"]},{"b":"古赋注（中册）","p":"87","t":"此言戌宫命以卯为疾厄宫。土星居卯为忌星又化为囚星。诗曰:第八宫为疾厄宫。此宫变矅细推穷若为囚忌来居此","y":["土"]},{"b":"古赋注（中册）","p":"87","t":"疾厄流连主血凶。疾再逢凶福星居福为朝士主为朝列。此言酉命月在亥，亥为福德宫，太阴到此为月，到天门正渭福星而居福也，得此贵格当列朝班而富贵双全者是也","y":["月"]},{"b":"古赋注（中册）","p":"87","t":"福主得禄主居窠至大官主执政。此言亥宫立命，以寅宫为官禄主，且辛生人以紫炁为禄主，况此命紫炁在寅为官禄主，归窠如无刑破官至卿相也","y":["炁"]},{"b":"古赋注（中册）","p":"87","t":"伤残刑害非为利，人倘风之奈若合。火罗之凶吉星钓出清闲富主富贵清闲。此言戌宫命，太阴在辰，木金同宫，太阴最爱金木相遇","y":["月"]},{"b":"古赋注（中册）","p":"87","t":"吉星即出而又得用。恶曜逢阳反覆间主人淹滞。此言申宫立命，日与土孛辰宫同位，然太阳人君之象，最怕与恶星同宫，此命遇土孛太阳相会，傍临命限主，ㄧ生多反覆，不然则夭折，夜生忌土","y":["日"]},{"b":"古赋注（中册）","p":"88","t":"诗曰:气阳金水是良星。命若逢之福最明，唯恐便于刑暗耗，改祥为祸百无成。命在寅宫逢金星，谓之金嫌人马，斯为下格也","y":["金"]},{"b":"古赋注（中册）","p":"89","t":"（中）89莫不以克为凶。土在女宫防夭折下格命夭折。命在巳宫，土星守巳，为双女为土入奴，女贱命也","y":["土"]},{"b":"古赋注（中册）","p":"89","t":"且水星在戌，戌属火而水居之，且克其火亦为贱格。诗曰:五星最喜顺流行，怒气相逢横祸生，夜忌土埋双女位，命逢年少定亡倾","y":["水"]},{"b":"古赋注（中册）","p":"89","t":"金居亢位足官荣主食禄。此言辰宫立命，太阴居酉，辰有属金，金星入垣，金号太常，斯为贵命","y":["月","金"]},{"b":"古赋注（中册）","p":"89","t":"诗曰:金星好乐入辰宫，庙处相逢最有功，若变权星并福禄，少年食爵至三公。身宫清吉休愁命反凶为吉","y":["金"]},{"b":"古赋注（中册）","p":"89","t":"福过于官，则尚于福。臣答君言天福等主福寿。此言命在午宫，日守之，太阴在子照之，日者君之，象月者臣之象命宫，太阳归垣局名曰日强天中，又得太阴子上主福寿双全而且贵也","y":["日","月"]},{"b":"古赋注（中册）","p":"89","t":"金乘火位定孤单主孤苦。此言卯宫立命，火为命主，且金在卯，谓金乘火位，酉为身星本属金，火星居之为火入金乡，彼此授克安得不孤寒哉","y":["火"]},{"b":"古赋注（中册）","p":"90","t":"（中）90主大贵。此言命立午宫，太阳守命，月在未为身，身命皆得令，所以为大贵。诗曰：五星所重在阴阳，倘若归宫最耀光，身命更来相竝立，一生清贵福非常","y":["日"]},{"b":"古赋注（中册）","p":"90","t":"天德相逢为将相主文武全才。此言亥宫命木与土星守之，甲生人以木为天元星，亥卯未安命，木是天元及兼为福德之主又为紫微格局，主出将入相之能，文武兼备","y":["土"]},{"b":"古赋注（中册）","p":"90","t":"印官聚会作公卿主台辅。此言辰宫安命，水星太阴守之。申子辰立命，水为天元印官，官禄宫在未，太阴为宫主二星，会于辰宫在命，主为三台八座之贵也","y":["月","水"]},{"b":"古赋注（中册）","p":"90","t":"辰属金水入辰水润金明。官印相会得用。女人怕带男人曜主刑客。此言子宫命，计孛在命，罗星在午冲之，火星在辰合命","y":["火"]},{"b":"古赋注（中册）","p":"90","t":"罗曜偏宜居午位主为勇毅之臣。此言午宫命罗星守之，诗曰：罗喉顺土入离宫，庙旺安身喜庆隆，若变福全兼禄主，不愁爵位不荣丰，午乃入庙","y":["罗"]},{"b":"古赋注（中册）","p":"91","t":"孛喜居亥火居坤地灾销烁。此命申宫火星守之，诗曰：福星须要细推穷，躔度元分十二宫，睢有火星坤土上位，却临凶处不为凶","y":["火"]},{"b":"古赋注（中册）","p":"91","t":"火在申地虽凶不凶之谓。木入秦州富井吞。此言未宫命，木星守之为木入秦州主贵。诗曰：木星偏喜入秦州，，强弱须当仔细求，还是权魁并福禄，一生富贵尽优游","y":["木"]},{"b":"古赋注（下册）","p":"2","t":"本者，命也。末者，限也。若以體為本，用為末，何患命不真哉。以之太阳为君而分配诸星","y":["日"]},{"b":"古赋注（下册）","p":"2","t":"当首观太阳在何，何宫何度。太阳转出命来，而太阳为命源，太阴转出身来，而太阴为身，是日赋尔命，月躔尔身者","y":["日","月"]},{"b":"古赋注（下册）","p":"2","t":"由是体用得现，使之太阳一差，则体差有别，而又何及用字？是太阳者，命之始也。是以由阴阳五星而周天分配，首步当推其命源，加配它星之进步，而体用得分","y":["日"]},{"b":"古赋注（下册）","p":"2","t":"由卯而立，卯之所在为东升命出。而对宫酉则西没。又为太阴之升，是为若为太阳又为父，则太阴为母，而为娘之源","y":["日","月"]},{"b":"古赋注（下册）","p":"3","t":"（下）3写到此，不得不再发一语，以明何以望斗要在太阳之后，首分此语，因其重也。关乎立命，若现代，关乎不为西法所乱","y":["日"]},{"b":"古赋注（下册）","p":"3","t":"时加太阳，转至卯，为七政之立命所在，而非西法之太阳弧，每见现之有学，常不思，盘之一出，不观何以立命即论，常心叹","y":["日"]},{"b":"古赋注（下册）","p":"3","t":"又如何有古决谓。罗在官而好斗，以罗在静盘之宫正午太阳所在，而争光也。等等不一而举","y":["日"]},{"b":"古赋注（下册）","p":"3","t":"西之源于白羊，而政则源于卯，不可混而同也。立命则更是，西之以太阳之升而黄赤交必在白羊零，而政之起，此“卯”非只是时间，亦是地东方，亦是命所在，是天地人三位一体立命也","y":["日"]},{"b":"古赋注（下册）","p":"3","t":"卯则太阳所起，酉则太阴所起，阴阳交合而成人命，午则中天，太阳所在，君父所在，而人之生，人之成，仰以立","y":["日","月"]},{"b":"古赋注（下册）","p":"3","t":"天地并详，而五行其中，天一生水，西北属金，而乾布之。此乾非天之乾，地之乾也。天之乾在午而太阳，始而周流","y":["日"]},{"b":"古赋注（下册）","p":"4","t":"詩曰：甲火乙孛丙柴頭，丁是金星戊土求。巳是太陰庚是水，辛煞壬計癸羅喉。爵星例，詩曰：子未元求土，豬猴火裡生","y":["金"]},{"b":"古赋注（下册）","p":"5","t":"庚豬辛戌壬逢虎，癸人見兔上雲梯。科名例，詩曰：甲乙生人木向榮，丙丁火宿實亨通。戊己土星魁眾彥，庚辛太白定科名","y":["金","土"]},{"b":"古赋注（下册）","p":"5","t":"壬癸水星真可貴，必作金魁榜上人。貴人者，玉堂天乙也。甲戊庚，牛羊之類是也。包含萬象身居楚，智過千夫命守豳","y":["水"]},{"b":"古赋注（下册）","p":"6","t":"身星长成而吉，则一表人才。非诗礼之家养成乎。太阳父星而成，则父必荣。亦人事之当然","y":["日"]},{"b":"古赋注（下册）","p":"6","t":"侍者，奉事也。棄者，逐也。福權刑囚暗耗者，皆化星，又文星也。印乃印星也。文星例，詩曰：甲羅乙討丙戊金，丁火己煞庚木星","y":["木"]},{"b":"古赋注（下册）","p":"6","t":"辛人見土壬逢日，癸人見月定昌榮。印星例，詩曰：甲木乙日丙火星，丁月戊土己羅神。庚金辛計壬逢水，癸人見孛定科名","y":["火"]},{"b":"古赋注（下册）","p":"6","t":"吉星佐阴阳。太阳有父意，太阴有母意。同理金有妻意。父南子北，四餘忌掩雙晴。兄楚弟秦，三宿刑傷一主","y":["日","月"]},{"b":"古赋注（下册）","p":"9","t":"傷子死而哭。五位者，男女宮也。熒星，火星也。但火星入此宮忌見水孛交戰，故難免子夏之傷","y":["火"]},{"b":"古赋注（下册）","p":"10","t":"（下）10莊子喪妻，七宮太白見凶神。莊子名周，性好散逸，講老子之學。喪妻不哭，作鼓盆之歌以自解","y":["金"]},{"b":"古赋注（下册）","p":"10","t":"七宮者，妻妾宮也。太白，金星也。如金星臨妻妾之宮，又遇火羅所傷，故有此事。以金为妻星","y":["金"]},{"b":"古赋注（下册）","p":"11","t":"（下）11命會欃槍，造扮嬌瑶之女。攙搶者，孛星也。經云：金水如逢月孛，為色招凶女人，身命遇之，更逢陰錯陽差，主嬌瑶","y":["孛"]},{"b":"古赋注（下册）","p":"11","t":"身逢天尾，慳貪節儉之人。天尾者，計都星也。如身命逢此，外主倜儻，內主一毫不拔之人","y":["计"]},{"b":"古赋注（下册）","p":"12","t":"況身命二主同躔共度。斷云：男如崔子，女似真妃。水木星者，本是風流倜儻之星也。況身命二主與之同度，斷曰管絃樓上醉春風，花柳叢中為活計","y":["木"]},{"b":"古赋注（下册）","p":"12","t":"假如木生在亥，以亥為生，列逢羅絕中生者是絕處逢長生也。假如金星在寅甲，子金為絕處逢生，其餘皆倣此推","y":["金"]},{"b":"古赋注（下册）","p":"14","t":"金星者，妻星也。孛星者，妾星也。金強孛弱，妻主能為，孛強金弱，妾奪妻權。若遇火羅眾星夾煞者，必主傍人夫主也","y":["金"]},{"b":"古赋注（下册）","p":"14","t":"火金星者，乃是夫妻星也。經云：男女以火金為夫婦是也。十干化曜中，以權刑為男子星宿，女人帶此主是正女，丈夫之根基也","y":["金"]},{"b":"古赋注（下册）","p":"14","t":"咸池者，四敗宮也。本是桃花殺名男女身命怕臨之，況又逢月孛占咸池，才子佳人，事事宜期我桑中清夜約，免教鑽穴隙相窺","y":["孛"]},{"b":"古赋注（下册）","p":"15","t":"（下）15太白秋生，何患當年之火。火若冬生，難制春天之金。柳鬼度者，咸池沐浴。虛危度者，孤煞度中","y":["金"]},{"b":"古赋注（下册）","p":"15","t":"太乙者，月孛星也。水金者，婦人星也。或人身命遇鳳眼者，鼠眸者，更兼月孛一星，必主淫蕩之性","y":["孛"]},{"b":"古赋注（下册）","p":"15","t":"經曰：桃花沐浴亂人倫，叔伯姑姨也合婚。忽然刑煞同宮度，官法因奸不赦君。如逢月孛水金會者，又經云：朝雲暮雨千萬般，瞞人作樂夕陽曉","y":["孛"]},{"b":"古赋注（下册）","p":"16","t":"太陰在此者，名曰升殿。主為人清秀，胸中錦繡，詩書通曉，更出入主人所欽多智多能。經云：惟有太陽臨位而榮貴無災，月曜入宮而清慈獲福","y":["月"]},{"b":"古赋注（下册）","p":"16","t":"水宿歸經，處世身居翰苑，木星度駕，半生足履王庭。水木二星者，乃是清閑多學識之星也","y":["木"]},{"b":"古赋注（下册）","p":"17","t":"精奇術藝，天乙當權。學堂者，乃是玉堂位兼長生臨官位，太陰水木星是也。若遇得地得時，自長生臨官，太陰須度分上下弦，水木得局歸垣，管主文章冠世","y":["木"]},{"b":"古赋注（下册）","p":"18","t":"又曰：第五土星無忌夜，且說生時臨命下。少年刑剋性昏蒙，黑色短肥言語寡。縱然廟旺居強位，計喜同宮尤可怕","y":["土"]},{"b":"古赋注（下册）","p":"18","t":"丙丁火星，仁元是也。有氣或入垣局，或入廟，得地得時。又逢生旺，皆主功名早達。若逢晝生巳午二時，又在空亡陷弱之地","y":["火"]},{"b":"古赋注（下册）","p":"18","t":"詩曰：第四火星兼在晝，且看命宮之所守。少年孤苦老無兒，百歲何曾得開口。第五宮中難哭兒，第七宮中隨喪偶","y":["火"]},{"b":"古赋注（下册）","p":"18","t":"忽然火星在其上，福祿虧兮人損壽。又曰：假令晝生火在巳，午未寅申并空亡。三十六七為盡處，不是破祖死他鄉","y":["火"]},{"b":"古赋注（下册）","p":"19","t":"若不剋六親，亦主出祖離宗。忌囚者，忌囚星也。殺難者，直難凶星也。如人身命遇正二太陽三四太陰，五六火星類","y":["火"]},{"b":"古赋注（下册）","p":"19","t":"又遇晝火夜土，四餘相攻，必主重拜之雙親決矣。首尾者，乃羅計也。名曰天關地軸。廉貞魁，木星也","y":["木"]},{"b":"古赋注（下册）","p":"20","t":"金星秋生入垣局，入廟得地。又有為用之星，入旺廟田財之位。諸吉星相生，必主千斯倉，萬斯箱","y":["金"]},{"b":"古赋注（下册）","p":"21","t":"若逢此四宮主星辰，又兼月孛金水之星也，或四主星互換，加以刑囚拱夾。若不為娶妻妾而遭官災，亦主其妻有私通之禍也","y":["孛"]},{"b":"古赋注（下册）","p":"21","t":"逞扮者身臨四敗。眾憎者命會孤刑。雲水之徒羅遇气，風塵之女孛逢金。賤垣者，月孛金水會也","y":["孛"]},{"b":"古赋注（下册）","p":"22","t":"又如金星乃妻星也，而化為權在夫妻宮，又得令，又得地，位兼有吉星相扶，管主其人娶妻美貌賢能，有權如水上鴛鴦，豈不美哉","y":["金"]},{"b":"古赋注（下册）","p":"23","t":"又再取化曜。权印者正为印比劫者所化太白逢兇妻魍魎，火羅欺嗣子螟蛉。金火是夫妻星也","y":["金"]},{"b":"古赋注（下册）","p":"23","t":"三方四正之威風高者，歲星入楚。刑流者，辰曜歸揚。楚乃荊楚之地，揚乃揚州之地。歲星，木星也","y":["木"]},{"b":"古赋注（下册）","p":"23","t":"辰曜，水星也。楚巳宮也，屬巽，為風弱。木遇巽風，決主風高http://blog.sina.com.cn/qq190030821623九紫辰QQ:1900308216","y":["水"]},{"b":"古赋注（下册）","p":"26","t":"太白當秋欺病火，清辰旺月不愁鎮。木到春榮金退志，水源夏絕火呈輝。火入金鄉，須明次度","y":["金"]},{"b":"古赋注（下册）","p":"27","t":"值之，必遭官刑。經云：常聞火星與羅計孛重疊，到限不可遠行，不遭溺水，必遭毒藥。火则春进气而夏当旺","y":["火"]},{"b":"古赋注（下册）","p":"27","t":"土水则秋得实而冬得旺。言土之气，当细观五行大义等。熒星近土，終作無成之子。太白逢辰，永為破落之徒","y":["金"]},{"b":"古赋注（下册）","p":"28","t":"長庚，金星也。經云：長庚伴月，須論到敗之時。亥獨與燕，俱是雲漢之位。而福直取福意","y":["金"]},{"b":"古赋注（下册）","p":"28","t":"财为养命之源，使飞就于我，不求之断亦其理。而计孛凶星，庚则金星，身者直取。何以有童意，以余星之带速","y":["金"]},{"b":"古赋注（下册）","p":"29","t":"若遇凶星反背，必主相離別也。东西者，太阳为乾男，太阴为坤妇。对面者，夫妻宫。妻變仇凶，六七年中亦別","y":["日","月"]},{"b":"古赋注（下册）","p":"30","t":"长大奴所侵。是以有父母不妙之断。又何以执以奴。以戌火争太阳之光也。至如生克一句","y":["日"]},{"b":"古赋注（下册）","p":"31","t":"官宫者中天，太阳所在。享福優游，身安福德。多災坎坷，主怕官宮。貪濁無厭財命絕，清輝徹底命財留","y":["日"]},{"b":"古赋注（下册）","p":"32","t":"若金星生於秋令，或在強宮得地歸垣局，管得持家能幹之妻，而琴瑟和鳴。倘若金星落陷弱之地，必主妾奪妻權","y":["金"]},{"b":"古赋注（下册）","p":"32","t":"計乃奴星也。火星，男以火為兒子，星如遇火，星生得時得地，相生相順，必主士子聰明俊偉","y":["火"]},{"b":"古赋注（下册）","p":"32","t":"倘若火星在於弱宮，失時失序，退躔退度，又加刑計凶神相攻，必主絕嗣以息，為兒或螟蛉之子而送老矣","y":["火"]},{"b":"古赋注（下册）","p":"32","t":"是以以兄弟语断。计罗者蚀星也。而太阳为父。水金合會，咸池和花為債主。孛金如逢，沐浴與酒作冤家","y":["日"]},{"b":"古赋注（下册）","p":"38","t":"盖母与馀奴方争权未息，纵能爱子，亦无力矣。母受余犯，生情不专太阳当空，祥曜潜伏","y":["日"]},{"b":"古赋注（下册）","p":"38","t":"太阳者，君也。如七八月巳午时，生安命在卯，如躔房宿火为主，将後行巳午。限见日如或金水木土与日同宫为科名，科甲官魁福禄遇太阳必伏诸星必无炎也","y":["日"]},{"b":"古赋注（下册）","p":"38","t":"太阳能伏制诸凶。月兔无光，晦朔倚日。人命生於晦朔，命在月，度此时月与日同会。若日月前後有吉星，必吉，凶星，必凶","y":["日"]},{"b":"古赋注（下册）","p":"40","t":"（下）40宜观太阳，过度二盘克合子午卯酉之正，各於上下二盘写一星，然後以一星加合，则上盘下局之星加合，了然可见，生我在与不在，合与不合详之","y":["日"]},{"b":"古赋注（下册）","p":"40","t":"与上一句并为一句。二母争权，姑恤太过。如木星见水，孛或临本宫，三合独见，方为福","y":["木"]},{"b":"古赋注（下册）","p":"40","t":"若同见，二母争权反为祸也。其馀例此而推。一星得地，初无二用。或土宫立命，或命主星，或别处，三合见火星，本吉","y":["火"]},{"b":"古赋注（下册）","p":"41","t":"或戌立命，主火星在子，金木同宫辰上，虽有熹亦难制水克火之虚，况子宫水旺之地，其火受克不浅","y":["火"]},{"b":"古赋注（下册）","p":"42","t":"（下）42矣。恶再党势，则乱。而有制得恶不行。独阳不产，孤阴不生。若男人命遇太阳，居四正，为得地，左右无吉星，三合又无，为独阳，不生","y":["日"]},{"b":"古赋注（下册）","p":"42","t":"女命遇太阴，居七强，亦得经入庙，三合皆无吉助为独阴不生。为事多克，战无成。男命看四正，女命看七强","y":["月"]},{"b":"古赋注（下册）","p":"42","t":"日月为星之至重至权物，而此至权中，又太阳最是。为诸天之源。使居权要之宫，最怕西沉之时","y":["日"]},{"b":"古赋注（下册）","p":"44","t":"元守推详，流年尤急。经曰：元守虽然无咎，流年尢怕为灾。此二句不可忽之。且如火为命主，行年火星，到命限焉","y":["火"]},{"b":"古赋注（下册）","p":"45","t":"何如用人以金为官星，金星受制于火，虽是官，我未免蹭蹬无成。若使官星高强，爵星印星弱陷，是为人真闲悖耳","y":["金"]},{"b":"古赋注（下册）","p":"46","t":"空则难用亦自然。太阳则伏诸凶。生克星辰固易言，若言制化诚难取。申命不怕土居酉，酉命何怕子上火","y":["日"]},{"b":"古赋注（下册）","p":"46","t":"只初学不懂耳。酉宫有土土生金，子宫有火火生土。纵不为福亦无凶，十二宫中皆仿此。春月生人，命限连有土孛金水，太阴罗计，谓之云雨不解淋漓花果，触月愁景，主退败可畏","y":["月"]},{"b":"古赋注（下册）","p":"46","t":"是以行两限俱是火日，亦曰久晴不雨，万物烁落。如忽行一星如罗计孛金水太阴气星则云兴雨降物苗勃然，发达可知","y":["月"]},{"b":"古赋注（下册）","p":"46","t":"凡太阳坐命极，主劳碌不闲。一云慷慨，盖日运行不息故也。冬月，水罗会，谓之和风解冻，寒林生春","y":["日"]},{"b":"古赋注（下册）","p":"46","t":"凡缹入申，为入猴山不过，作事混沌。凡木缹为祸不过，冷落是非，留连不宁。所以木星为祸，迟淹延不安","y":["木"]},{"b":"古赋注（下册）","p":"47","t":"木为命库在辰，最怕凶神破库，又怕金星泄库。所怕者，金煞也。金宿侵库者，紫煞也。有此星辰在宫，生平不聚财，惟守耗财而已","y":["金"]},{"b":"古赋注（下册）","p":"47","t":"为各各分别对待。无不含理也。十二宫中何所忌，加临元宿更推求。宝瓶最怕飞来木，紫气临之必不忧","y":["炁"]},{"b":"古赋注（下册）","p":"47","t":"寅上火罗箕不怕，罗睺能煮双鱼腹。更嫌土计两强梁，设若侵垣多不足。二宫属有所喜者，水孛","y":["罗"]},{"b":"古赋注（下册）","p":"48","t":"而戌则不同，纯其火意，罗则余犯。自如木，为喜则自然，水孛相克亦自然。辰酉二宫从太白，却于取用有差别","y":["金"]},{"b":"古赋注（下册）","p":"48","t":"实则加以五星变化。每宫就用之变其更多。文中举其纲耳。狮子之宫号太阳，明知金水必为祥","y":["日"]},{"b":"古赋注（下册）","p":"48","t":"太阳之位，不怕火罗计孛。最忌者，木也。木乃八煞之主，能蔽日光。秋冬则枝枯叶落，春夏则叶茂枝繁，却能遮蔽日光","y":["日"]},{"b":"古赋注（下册）","p":"48","t":"紫气乃木之余宿，在天无象焉，能为害，多有癸丑气，在申遇此限，亦有发者。虽不发者，然亦无大祸矣","y":["炁"]},{"b":"古赋注（下册）","p":"48","t":"未上分明是巨蟹，独以太阴为主宰。喜逢木气火罗金，土计却能为蚀晦。躔在心张危毕地，夜里生人尤可爱","y":["月"]},{"b":"古赋注（下册）","p":"48","t":"土星若健木星弱，生平反覆多成败。未上月为主，怕土计。若木气强，何忧乎土计。木气弱，土计强，未免成败","y":["木","土"]},{"b":"古赋注（下册）","p":"48","t":"若躔于四月之地，其福于人可知矣。而其中诸宫之中，午者太阳。两星最不同用。又非简单五行与局气与位","y":["日"]},{"b":"古赋注（下册）","p":"48","t":"是以当在巍巍处着手。当在生旺其它引申意着手。岁星最是分凶吉，却把令星明得失。令星若陷岁星强，创业为难却富室","y":["木"]},{"b":"古赋注（下册）","p":"49","t":"（下）49乃是人间之上寿命。若岁星强，令星柔软，终能致富，难享现成。令星强，岁星弱，成败进退人也","y":["木"]},{"b":"古赋注（下册）","p":"49","t":"若有长生多智识，若居死绝岂能安。譬如木气临身命，便作巫医格局观。孛星主巧，土星主多能","y":["土"]},{"b":"古赋注（下册）","p":"49","t":"反是当以金水星为淫星，金水分明，非娼则婢，如近君，岁驾则不然。以此用之，无失矣","y":["水"]},{"b":"古赋注（下册）","p":"49","t":"特别指出金水之情。其即可爱又可恨者。多是女人为水性，水从上下多淫佞。罗睺相向逆而行，血经来往为无定","y":["罗"]},{"b":"古赋注（下册）","p":"49","t":"罗若逆行，自辰至巳，必是月经不定。设若水顺流而行，为人必主淫荡。火星，孛星致多灾，只为入宫见火，此一句专主妇人论断","y":["火"]},{"b":"古赋注（下册）","p":"50","t":"亥之为命，木为主宰星也。最怕者，金也。如有金星在命，或三方照，或行限临之，却有紫缹合之加临，乃木之余气抗金之敌，木之本立却无伤也","y":["金"]},{"b":"古赋注（下册）","p":"50","t":"如更木星入库旺，必能转祸而为福。自古男儿志四方，主星不喜库中藏。主如入库为人晦，纵有文星也不光","y":["木"]},{"b":"古赋注（下册）","p":"52","t":"身星最紧命次之，恩福要相宜。五星以太阴为身主，盖太阴为母象。凡人之血肉筋骸，则母之所遗，故以月为身也","y":["月"]},{"b":"古赋注（下册）","p":"53","t":"然其次第不可失。勿失琴堂老者之心。鲁邦立业水同镇，官福俱伤尽。戌属鲁分镇，即土星","y":["土"]},{"b":"古赋注（下册）","p":"53","t":"无非一句：“若论五星无多决，先从命主无多说。”秦晋楚宫关土计，真是太阴忌。此三宫安命，以月水孛为命主，并用土计为难星，太阴又为三宫之身主，又以为忌关者，难星也","y":["月"]},{"b":"古赋注（下册）","p":"53","t":"月水怕土晦。周邑立命木气逢，此乃太阳凶。周邑，午宫也。若午宫安命，以太阳为主，太阳象君诸星不敢犯之，惟木能掩其光，故为凶也","y":["日"]},{"b":"古赋注（下册）","p":"53","t":"醉醒云：只怕成林木作殃。太阳怕木障http://blog.sina.com.cn/qq190030821653九紫辰QQ:1900308216","y":["日"]},{"b":"古赋注（下册）","p":"54","t":"水孛性最迟，过了方发，亦难退。木气土计性颇迟，却耐久。惟金星日月自始至终。火头孛尾最为利害","y":["金"]},{"b":"古赋注（下册）","p":"55","t":"岁驾上最喜日月居之，不论有用无用，皆能为福。盖太阳象君父，太阴象后母，岁驾乃至尊之位","y":["日","月"]},{"b":"古赋注（下册）","p":"55","t":"月建支上，最喜太阴居之，不问强弱，皆吉。盖太阴为身星，即月也。以月居月生，非得所而从其类乎","y":["月"]},{"b":"古赋注（下册）","p":"56","t":"恩星坐驾少年荣，时逢末主兴。驾乃年之支辰。如生于子年，卯宫安命，木星飞入子宫是也","y":["木"]},{"b":"古赋注（下册）","p":"56","t":"日即值日之宿，月即流年太岁也。太阴为身行度甚速，故日月之灾福系焉。且如命坐己，未，申三宫，以月为主，喜金，水，月，木畏火，罗，土计，看流月值何宿遇亢牛娄鬼，乃生命之宿，则迁官进爵，近贵得财","y":["月"]},{"b":"古赋注（下册）","p":"59","t":"如木星则应亥卯未寅年月日时，金星应巳酉丑申年月日时，水星应申子辰年月日时，火星应寅午戌，土星应辰戌丑未，其为福之星","y":["水","金","火","木","土"]},{"b":"古赋注（下册）","p":"59","t":"此不以十二宫主为例，但取四柱支辰而论之。如庚申年即以水为本身，岁驾便看水星在何宫","y":["水"]},{"b":"古赋注（下册）","p":"59","t":"戊寅月则木为兄弟，即观木在何宫。丁卯日，火为夫妻，审火在何宫。丙午时，太阳为子息，看所守何宫","y":["日"]},{"b":"古赋注（下册）","p":"59","t":"己巳为胎元，则取为父母，审水星何在。其名星逢生坐实，及遇杀星逢空则吉。或逢克坐实，及遇吉逢空则凶","y":["水"]},{"b":"古赋注（下册）","p":"59","t":"五十年后属身主所管，如身在寅则以木为主，喜水孛，忌金星。流年逢水孛则福，见金星则灾","y":["金"]},{"b":"古赋注（下册）","p":"60","t":"遇太岁冲起，必发福。若日月身命夹的杀劫刃阴煞者凶。太岁冲动，必破败。假如庚午生人，申宫立命，福德官禄马在申，太阳在酉，太阴在未，及身命前后夹之，若限行其宫，则必富贵","y":["日","月"]},{"b":"古赋注（下册）","p":"60","t":"地尾者，计都也。天锋者，阳刃也。壬癸生人，以子为天锋，若身命在未，计在午，左右夹之，虽荣恶亡","y":["计"]},{"b":"古赋注（下册）","p":"61","t":"且如庚午生，立命子宫，太阴居卯，或金，或木，或寅，或水，或气，在辰左右夹之，必主自幼难养，多生疾病","y":["月"]},{"b":"古赋注（下册）","p":"61","t":"或曰取太阳前三十六度为是。民俗有小儿三朝之说。而左右者夹，而月居中，则为杀的夹逼","y":["日"]},{"b":"古赋注（下册）","p":"64","t":"但得金在于寅，则能制其恶，而又且为吉福之限矣。若使寅宫得其水星，则为党也。助其凶杀且为祸甚远也","y":["水"]},{"b":"古赋注（下册）","p":"64","t":"更重得火星为化难，其祸则又轻矣。余宫遇有此等，仿此推之，不可拘泥于一端而无通变也","y":["火"]},{"b":"古赋注（下册）","p":"66","t":"俱吉则全吉，自然一品，使失其。六曹五品四品宣，身禄近君前。六曹，六部也。凡仕进在京职位近清光者，必身命官禄岁驾，随太阳而亲近君位也","y":["日"]},{"b":"古赋注（下册）","p":"67","t":"然品位虽高而不立于朝廷之上者，乃太阳殿驾之侧，恩星所不到而身不临。使吉而不近阳","y":["日"]},{"b":"古赋注（下册）","p":"69","t":"假如六辛生人，午寅二宫为玉堂，太阳为贵主，若身命立于丑巳二宫，谓之傍玉堂。若与太阳同宫，谓之倚贵人","y":["日"]},{"b":"古赋注（下册）","p":"69","t":"若身星与紫气同宫，居华盖之上，亦然。仍宜看虚实以断之也。任你天高地厚也。而主仍为仍","y":["炁"]},{"b":"古赋注（下册）","p":"71","t":"五行配宫取意金星与木主同宫，风斤月斧工。身命主同入田财宫，必操绳墨弄斧斤之人。坐实得地，亦能因之富贵","y":["金"]},{"b":"古赋注（下册）","p":"71","t":"陷弱空亡，则奔波劳碌者矣。直取五行意水德若同身命陷，音乐井渔染。水星同身命本为吉用，今乃落陷失据，则不能为用矣","y":["水"]},{"b":"古赋注（下册）","p":"71","t":"非作乐音技之徒，即渔夫染匠之辈。直取五行性意生逢太白入天财，绫罗惯剪裁。金星入财帛，身命官福失陷，必裁剪之人，亦能富也","y":["金"]},{"b":"古赋注（下册）","p":"72","t":"（下）72木星为主而落陷弱之宫，又逢金火二星同守命，或入田财宫，若非攻于金铁，是必治玉石之人也","y":["木"]},{"b":"古赋注（下册）","p":"72","t":"大凡妇人喜太阳守命，若夫星陷弱，必夺夫权，心性悍暴，为女中之豪。伯夫宫即男命之妻妾宫也","y":["日"]},{"b":"古赋注（下册）","p":"72","t":"如福德不起本垣，太阴居财帛，逢生坐实，必富贵光于闾里者矣。使福不德也。身星守贵坐禄强，荣富足衣粮","y":["月"]},{"b":"古赋注（下册）","p":"73","t":"咸池桃花更会马咸池星守驿马宫，女淫生产凶。咸池即桃花杀也，如寅，午，戌，卯宫。火星乃咸池也","y":["火"]},{"b":"古赋注（下册）","p":"73","t":"若寅宫安命，火星居申，却是咸池守驿马，必主奔之贱，而有产厄之凶矣。余皆仿此推之","y":["火"]},{"b":"古赋注（下册）","p":"73","t":"桃花再守驿马星若守在咸池，酒色性无期。如申子辰生人，马在寅，用寅木星是也。若亥宫命，木星在酉，必好色贪淫，性情无定","y":["木"]},{"b":"古赋注（下册）","p":"73","t":"紫气一星赶月明，妻克子螟蛉。气星独随月而行，克妻害子，虽螟蛉亦难招也。实则应，虚则否也","y":["炁"]},{"b":"古赋注（下册）","p":"74","t":"凡妻妾星飞出与难星同宫者，或难飞入妻妾宫而遇直头之星，必主克妻有两三重矣。鱼女之宫太白来，珠蚌毓双胎","y":["金"]},{"b":"古赋注（下册）","p":"74","t":"亥为双鱼，己为双女，二宫皆含双意，必产双胎之子。如辰酉时生人，柱中时管男女，辰酉二宫属金，若金星居于己或亥，以此论之","y":["金"]},{"b":"古赋注（下册）","p":"75","t":"如午宫安命，木气为难为凶，被金克之。如罗星为难被水星克之。是以用也，而当细观其制化","y":["水"]},{"b":"古赋注（下册）","p":"79","t":"官禄夹贯太阳富贵，恩用二星守照官禄宫，尤贵显。如官与太阳同宫同度，当此为例，恩星用星居官亦如是","y":["日"]},{"b":"古赋注（下册）","p":"79","t":"恩无余气，借用星而解仇。用若当头，尽难星而作崇。巳命金为恩，无余气借木气二星则富贵，更若太阴守命，虽限逢凶难，不为害","y":["月"]},{"b":"古赋注（下册）","p":"80","t":"儿女主是恩宿，逢生旺反主刑伤。如酉命土为儿女，火星同行，虽相生终为难星，主刑伤也","y":["火"]},{"b":"古赋注（下册）","p":"80","t":"命立土宫，诸宿喜躔火度。限行木局，三方忌见金星。木气高强，祸来无地，火罗坐命，福必滔天","y":["金"]},{"b":"古赋注（下册）","p":"80","t":"此有更有妙理在。以土为命，火当为喜，而木不克难，何以反忌见金星？以战也，乱世之下，何人得幸","y":["金"]},{"b":"古赋注（下册）","p":"81","t":"身命躔难度难宫，须至老亦主艰辛命本得吉，只待时耳。辰酉立命，土会太阴，须当获福二宫安命，太阴会土计乃恩星也","y":["月"]},{"b":"古赋注（下册）","p":"81","t":"反言富贵，不可以土计犯太阴论。金即为命，土即为恩。寅亥立命，金气临身，将何以为","y":["月"]},{"b":"古赋注（下册）","p":"81","t":"二宫立命，太阴会金气，谓之安身傍鬼，非金助月华。木即为命，金即为杀。又何谓火罗土计为凶星，金木水气为吉星乎？","y":["月"]},{"b":"星经杂注","p":"2","t":"万还加了一个陈都宪十二宫安命论。还是用着这个方法去试图再细化。如子宫来讲，女二度到虚日六土会是帝旺之土，然后，危一至危五，是海涯之土，危六至十二，如是夜生，以太阴论，为海滨初出之月.将两种结合起来又再细分………这里","y":["月"]},{"b":"星经杂注","p":"4","t":"太阳金木水火土行，曰四令环阳格。罗计子午得用者，曰跳关，曰首尾分天格。罗计各分星辰两处，众星在巳午未曰戴天格，在亥子丑曰履地格","y":["日"]},{"b":"星经杂注","p":"5","t":"日月并照，祸福谁期。若刃星为煞，又作直难者，死不可逃。此限若太阳同行，断其丧父，或父有疾，与太阴同行，断其丧母有疾，自身亦主灾犯","y":["日","月"]},{"b":"星经杂注","p":"6","t":"荣枯得失，各应非迟。如煞是木星，又生春令，则煞旺而害人，非遇火金不能制化，生于秋令则减半矣","y":["木"]},{"b":"星经杂注","p":"6","t":"火旺夏，金旺秋，水旺冬，土旺辰戌丑未，宜心会之。为何上面要刃煞与直难累变一起呢.那就要去看直难是怎么来的.正二太阳也.正二者.月.明得了这个.就能明白.也能会引申.无非.计于”四时”而己.无非考其”衰旺”而己.使如煞盛势大.则日月并照亦无救,反失父母之为.冲驾蓦驾，离祖独居","y":["日"]},{"b":"星经杂注","p":"6","t":"二限推迁，死生特达。如用土星，水木气孛同行对照，乃助煞有害。如木火气罗同行，乃化煞致吉","y":["土"]},{"b":"星经杂注","p":"7","t":"太阳一殿，例于聚论中取之。四殿拱夹之命妙秘，亦考聚论。四善之重.胜于强宫.而注中更是再一次的总结了.这四善怎么去用.而且很显然.还有妙秘所在.但是徐又不说了.只言多考聚论.但是这里.注中这首和次的问题.要多去理解.会和指金暗示会不同.即.年为首等强调的是强吉的概念.自然岁驾为重.如是对人命讲.自然帝籍最要顾之.身宫命宫，的池忌逢","y":["日"]},{"b":"星经杂注","p":"7","t":"池者，咸池也。如寅午戌人，卯是咸池煞，又逢水孛，为花酒淫荡。这句就关键了.开篇是由身命而四善跳出.现在是说完四善.又言身命.注文中.己经讲出.二者是作用关系了.无非.四善于命身相承相接相交关.如果理解了这一点.很多东西才会跳出来.才能明白指金又来一句”虚实一般般”上更灵妙的用法.才能明白后句”轮运非轻”的用法.太阳杂处，幼鬼定理","y":["日"]},{"b":"星经杂注","p":"7","t":"恩煞随阳.太阳者,诸星之尊.使其吉.则喜而非常.使其凶.则怒而无比.自然之理.只因太阳更是为父.是以更有其重之处.失枯之伤何其重.太阴独明，轮运非轻","y":["日","月"]},{"b":"星经杂注","p":"7","t":"口诀详于聚论中，晓然如镜。漏关乃罗计截断太阴于外，或有吉星出于外，亦是也。太阴则喜独明.而太阳则喜辅阳.是以上则言杂处.此则言独明.然而太阴之又为身也.其非轻.使其有情为妙.这里其实还藏下了一大诀.”轮运非轻”而且.他还通过注,透出来这个用法了.”相管http://blog.sina.com.cn/qq19003082167九紫辰qq1900308216","y":["日","月"]},{"b":"星经杂注","p":"8","t":"摄也”.但藏了就是藏了.所谓聚论中口决,会晓然如镜.仍要读者能悟.其实不用这么转折.直接字面意即可明此决.相反.此决.指金藏得更深.是分开几句杂着来写.当然这种杂着来写.其实讲得更明用法.但要综合在一起.为之不易.要由”次推太阴在何宫,方可论穷通””身星最紧命次之””行限看西东”结合了在一起,就是这句”轮运非轻”的分开写法.岁星守岁，逢顺无配","y":["月","木"]},{"b":"星经杂注","p":"8","t":"又作吉神，立登科第。如甲寅生人，木为岁星。乙卯生人，火为岁星。若木在寅，火在卯，曰岁星守岁，其余仿此","y":["木"]},{"b":"星经杂注","p":"8","t":"又逢生星，限元又顺，其福无比，立登科甲。逢凶曰岁星化凶德，深为不吉之地。岁星守岁.岁驾吉地.天子所居.天子居之.为得位.其权态为万分.是以岁星守岁.逢顺无配.那反着来呢?则会有一句”飞星破驾,终必无成”.由此一句.只举一句.则上面所说的各有详诀.出来一诀.但要多会去引申.月居月位，各从其类","y":["木"]},{"b":"星经杂注","p":"8","t":"若值亡神，其祸无避。如寅月生人，太阴守寅之类，最宜独明独行，值吉倍吉，忌凶星恶煞重逢","y":["月"]},{"b":"星经杂注","p":"8","t":"夜诞逢煞，刑害缠绵。如甲子日生人，太阳在子，寅日生人，太阳在寅之类。谓之日守日垣","y":["日"]},{"b":"星经杂注","p":"13","t":"实际此句.如能上下文相交相看.会还有更深的理致在.莫被注文引入了.而失了大理.因现在一直在言四殿.现又突兀的来一句.日月交辉.所以.指金会通过这样一语来透其法”大凡驾上喜日月,诸煞分优劣””身命日月要入垣,失宫福不全”.这时你再回到十六两金.岁星居岁,月占月支.日归日垣.这一句时.就能明白.此处何以突然出来个日月交辉.喜日月之居四殿也.喜四殿之拱夹日月也.四善拱煞四善即四殿也","y":["木"]},{"b":"星经杂注","p":"17","t":"当各论其迁变，必论阴阳也。贵人有携升之意.可从这去读.与文中注并存.禄神协吉禄神者，甲木孛兮，乙水星，丙计丁罗是也","y":["水"]},{"b":"星经杂注","p":"17","t":"作生星则吉，作克星则凶，用之终不吉也。旧本云：催官协吉。禄神有协吉之为.”协”字用得无限妙.如何去协吉.则如注文.各论其迁变.如何去迁变,则如注文.协何者.协何吉,协何凶.生气宜身太阴居于生气上者，主一生无险难事","y":["月"]},{"b":"星经杂注","p":"17","t":"其例有二，月后第三位也。考通书合乃生月后，此法可用于小儿。这句和接下一句.会很怪.等于是提示.月日神其例.亦当用之.如是这样.就复杂了.月后三位.即开日.为生气.为时阳.如寅月则子,卯月是丑.生气者,极福之神.为月中阳神,大抵,月之后三为生气.与年神通例.年则为太阴岁后之象与吊客并.金匮宜室子午日子，丑未日寅，寅申日辰，卯酉日午，辰戌日申，巳亥日戌","y":["月"]},{"b":"星经杂注","p":"20","t":"注中会是一解.从上面一句.借宫则论煞,并着这句排句来看.这里提供另一解:余气则当论绝.正星无为方论余之谓.如是借宫,不可随意乱借,当就其煞而借之.如是余气,更不能乱借,乱论,当是绝而无为时.方借之.宵中火金凡夜生人，火星看坐何宫，论空实则大验","y":["火"]},{"b":"星经杂注","p":"20","t":"自未至子为阴，自丑至午为阳。夜则火金昼逢太阳同上，丑至午为阳。此二章论其空实之理也","y":["日"]},{"b":"星经杂注","p":"20","t":"昼则太阳.但这里.注文更透出的东西.会更多.为空有空之妙意的用法.但如是想透出此法.吾思当不注在此好.因为从上下赋文来看.赋更想表达是各星权重意.只注者,想透出空有空之妙意之法而己.以日月当空则明,火空则发,金空则呜.二德相拱天德月德三方拱者至吉，纵然凶终有解，无大害","y":["日"]},{"b":"星经杂注","p":"20","t":"二德之吉.使其扶权吉之星,更妙.岁在箕度冬至日，太阳在箕七八九度，便作下年例之","y":["日"]},{"b":"星经杂注","p":"21","t":"或直接解之岁星.以木星直属.或喜箕寅.即是岁,又占岁始.其吉其吉.则上句.二德相拱.亦可取起.则由火金而夜,日阳以昼,而喜金水二德相辅.再下则言月.唯土则五行配位.无在,而无不在.七政并起.各论其权重.身值独处太阴只要独行，最忌刑冲，则吉凶在目前，淫乐亡败有之","y":["月","木"]},{"b":"星经杂注","p":"21","t":"阳则昼生,而君阳喜辅.太阴则否.月喜独明.用在七强用者限元也。起处要临七强宫，方为得地，随其制化仍是老问题.从赋文意来讲.用非专指”限元”.而琴堂后人注说.多偏向限元去注解.所以要注意.可以多去概指.凡吉用之物.喜居七强之宫.冲处不起四殿拱处伏了，诸星皆实行，则祸神福于此最要紧，可贵可富，可贫可贱","y":["月"]},{"b":"星经杂注","p":"21","t":"指金会这样用词:”推算必须求命主,得失须看取.次推太阴在何宫,方可论穷通”四正与三方切应之分.大抵论三方当论三方.论四正当论四正.祸福先后，岁籍晦明命之死生，或说前或应后三年者，直年太岁与人之生时关系，或因冲战，或三方吊起，以论吉凶","y":["月"]},{"b":"星经杂注","p":"26","t":"直解.阴忌计土，不分南北。巳午未申，限元无力。若居酉辰，如虎而翼。太阴若在土计同宫，惟辰酉二宫相生，他宫同处皆不为美限","y":["月"]},{"b":"星经杂注","p":"26","t":"若巳午未申之地不空，其凶不可言。直解.然而此几句.其实就是十六两金.所谓的详诀.”太阳杂处.幼鬼定理,随命制化,喜怒无比.太阴独明,轮运非轻.漏关跳关,昼夜有情”大格五经大格者，大全格也","y":["日","月"]},{"b":"星经杂注","p":"27","t":"穷其本源，胎元尤显。察乎德籍，究乎四善。知富知贵，知贫知贱。德者岁星，籍者生时","y":["木"]},{"b":"星经杂注","p":"28","t":"天驿正巳二申之类，六合子与丑合之类。如子上有凶吉，丑上亦有半凶，贵人能化凶也。金匮,生气.直难.太岁.关.驿.贵人.太阳正宫，不易天地","y":["日"]},{"b":"星经杂注","p":"28","t":"太阳偏处，前后三四。吉殿凶宫，凶先吉位。扣其的时，祸福极大。流曜流魁，宜当审秘","y":["日"]},{"b":"星经杂注","p":"28","t":"如太阳在正宫之中，则天地不易，安处正中。如太阳方过交位之地，则安命不可移易。如浅则有伤天地造化正气，如深则易四时之位，如交宫浅则易三岁之位，须当论其浅深","y":["日"]},{"b":"星经杂注","p":"29","t":"生克既己明，三方并吊起。先看命宫，受生受克。命主起去如何，次看太阴落于何处，在强在弱，然后看三方对照","y":["月"]},{"b":"星经杂注","p":"30","t":"且如金克木，如木在前，金在后是也。若遇火罗三方对照金星，则为制煞。若遇水孛则为化煞，为遇水孛则为化煞，为祸稍轻，反能致吉","y":["金"]},{"b":"星经杂注","p":"36","t":"此二星太恶，为十分凶。平常亦不吉。解一行赋”难直””天妖”句.此两星的起法.从一行赋注.认为是丁甲金之类.又未全起诀.查之古语.孛星有妖星之句.计都有毛头之称.未知是否指此.存疑之.子丑立命，土为主星，寅亥相见，为殃岂轻","y":["计"]},{"b":"星经杂注","p":"36","t":"辰酉宫中，太白所止，卯戌飞来，无救则死。巳申之属，土属辰宿，子丑为殃，非亡则哭","y":["金"]},{"b":"星经杂注","p":"38","t":"水为貌主，岂宜逢土。金作福神，火来凄楚。荧惑为官，水见跋扈。若遇镇阳，破祖荣祖","y":["火"]},{"b":"星经杂注","p":"39","t":"是以，明得这些，才能真明白，为什么这句要这样写，以日为尊，诸星皆赖阳。而实则指命即“太阳”，身即“月”也","y":["日"]},{"b":"星经杂注","p":"39","t":"“若论五星无多诀，端的从命无多说。”太阳转动，以父阳之精成命，太阴转动，以母月之身而来","y":["日","月"]},{"b":"星经杂注","p":"39","t":"借日月以成喻也。下面还会有更多这样的。即直读又借喻的。太阳正照，诸星罢争战之锋","y":["日"]},{"b":"星经杂注","p":"40","t":"是以南罗而北计。是以记得，当初明末清初争制时，西洋人士，为了让中国和“国际”接轨，强行将南交罗变成计都，计都变成罗，民间根本不鸟","y":["计"]},{"b":"星经杂注","p":"41","t":"余再作凶限主化官会金水，名遂功成。限作吉意火暗忌昼犯于太阳，土刑嫌夜截于孤月。火能争光，计土晦月罗刑寅位，有打虎之能","y":["日"]},{"b":"星经杂注","p":"41","t":"木金化暗人四宫，必伤祖业。指田宅祖意。兼作凶交战。太阳带禄居七位，定得妻财。指夫妻宫意","y":["日"]},{"b":"星经杂注","p":"41","t":"身在刃乡，而火罗坐于相貌，自缢自刑。金星守命，好色欲而假清高。兼起星性，宫意。木德临垣，怀慈心而负刚毅","y":["金"]},{"b":"星经杂注","p":"44","t":"太阳照煞地，能散诸凶。太阳之吉也。煞星坐限宫，妄为作福。煞星不宜作党，宫主须忌失躔","y":["日"]},{"b":"星经杂注","p":"48","t":"用也.体用之妙,可夺神功.体者何,命身也.用者何.诸所讲也.女人最紧身与福德五八更好子贵无厄水星不清血气不调居奸娼妓咸池水孛相貌必好夫宫必离身星陷弱子曜居高乃生贵子因有称呼夫坐三六淫贱暌孤寅亥金水旺夫荣夫刚严贞固土罗计都言女命之要点.古人,女命以夫子为重.五星六曜四时一体三春之木自金亦美各有善恶要知其类用识其源土能生水仰观俯察应如符契吉凶亦然或贫或富随其后先以时正命毋以貌取颠倒之颠玄中之玄非人勿语得人而传","y":["水","计"]},{"b":"星经杂注","p":"55","t":"先贤怕后学还不悟.则又举再以例.使如甲午之岁.则必是辰巳而空.使如命离.则午宫立命.而水居巽地.辰巳者.巽地.则水落空亡.太阳喜金水之相护.而吉水落空.则吉而落空.非凶之凶.反而凶为已甚.甲戌旬，火罗申酉，子丑命逢申酉太岁，则福起","y":["日"]},{"b":"星经杂注","p":"60","t":"月火同宫，此命平生多坎坷。金水同宫吉，月火同主平生坎坷。都例经云：就中火星火灾障，相对在强并在月，中年困多苦歇来灭","y":["火"]},{"b":"星经杂注","p":"60","t":"使有善曜.而无高格以存.则曰未必为奇.明其次第.使而怒凶,曰费力.实则要连起来.即打乱他去读.即善吉而又格局见则为奇.次之,善而无格局.只未奇.使恶凶而有格,徒然之而能纵文学.使恶凶而无格.无纵更费力.庸人之命，亦多木德金星","y":["金"]},{"b":"星经杂注","p":"60","t":"君子命中，岂少罗侯月孛。庸人亦有金木星，君子命中，亦犯罗计土孛借用子平语.小人命中亦有官印贵人.君子命中亦有七杀伤官.星命本一家也.先贫后富，想初限伏逆陷宫","y":["木","孛"]},{"b":"星经杂注","p":"62","t":"吉喜高强飞起逢囚，此等遇如不遇。飞起何宫分，善星躔忌逢囚，纵有如无。吉喜失势木星紫气，见太阳必作高僧","y":["日","木","炁"]},{"b":"星经杂注","p":"62","t":"木星乃僧道之星也。日月之尊.以日为命.而气紫孤星随之.日月分明是贵人也.荧惑镇星，值月孛必为曹吏","y":["火","木","土","孛"]},{"b":"星经杂注","p":"62","t":"有用星怕弱逆行，顺段限逢之方吉。限与命同.喜顺吉.木虽难而遇火，祸反为祥。命宫虽有木星为忌，见火星化祥","y":["火","木"]},{"b":"星经杂注","p":"62","t":"火能化木.孛独行无金，安能为害。月孛星要独行，大忌金星相对。无生势弱.要多会引申.多去反读.学堂陷却，才高而不解成名","y":["金","孛"]},{"b":"星经杂注","p":"63","t":"身宫主星陷，则成名晚。直解.身宫主为学堂也.天首独行，庸辈而须还享福。罗星大喜，日在六阳宫","y":["罗"]},{"b":"星经杂注","p":"63","t":"罗星独行之吉.实藏下四余之法.妻星逢于忌怒，婚合难终。妻星金星也，逢忌怒，必主克妻","y":["金"]},{"b":"星经杂注","p":"63","t":"注直解水星逢孛，为色招凶。水星忌与孛同，多主因色丧身。孛之星性.借以言余凶金德入兑，因妻致富","y":["水"]},{"b":"星经杂注","p":"63","t":"金星喜酉，必主阴贵成身，或妻家富。借金以言妻.言得垣之吉五星伏逆，逢吉曜以难荣","y":["金"]},{"b":"星经杂注","p":"63","t":"言命身喜高强.而不欲空.实分之.尚有多般变化.火孛金星同位，累冒宪章火忌孛，孛忌金，金忌火，三星相会主凶","y":["金"]},{"b":"星经杂注","p":"64","t":"仕宦之人，限逢计都，多退职。计都者，为尾，黑道之宿也。解以计星天尾.公吏如遇三刑，因权退职","y":["计"]},{"b":"星经杂注","p":"64","t":"科名，乃甲乙木星之类也。若陷无救，主不进。反读之.言科名之贵吉.魁星弱而有囚，多图不实","y":["木"]},{"b":"星经杂注","p":"65","t":"借男女以言星用.紫气星为晦气，男孤而女子无夫。东方木曰吉神，纵破也还他复位。木星者，东方甲乙生，主散灾","y":["木","炁"]},{"b":"星经杂注","p":"66","t":"太乙孛星，若同罗计必克妻子。气为孤星.不利亲.失业亡家，荧惑与刑囚共位。火星怕与刑星囚星共位，主灾借亡家以言火凶.尚有:”流年九位逢罗火,家遭回禄灾”驼腰跛足，囚星火土同行","y":["火"]},{"b":"星经杂注","p":"67","t":"绶星之正.马贵与寿星之吉.选禄朝元，喜紫金星居禁阙。时星入乐,忌刑晦度入封疆分野","y":["金"]},{"b":"星经杂注","p":"68","t":"官临边守，太白资首尾之威。火金又配以贵人官星之断.鸾坡节制，科名与科甲同宫。雁塞征强，走曜逐黄幡入限","y":["金"]},{"b":"星经杂注","p":"68","t":"仍上句语金星辅日，临文还取高科。武曜佐权，选授必居躐等。http://blog.sina.com.cn/qq190030821668九紫辰qq1900308216","y":["金"]},{"b":"星经杂注","p":"69","t":"印星拱日，定膺府寺之荣。科目同宫，兼领外台之贵。命分十曜，贵飞拱于太阳。日月分明是贵人.皆从阳之吉.限会三星，必依光于帝座","y":["日"]},{"b":"星经杂注","p":"72","t":"金入火乡，金受制。火居水位，火神无气。木入金宫，木星有亏。水化伏尸，遇太阳岂为恶曜","y":["日","木"]},{"b":"星经杂注","p":"72","t":"木逢地劫，逢罗睺变作吉星。土埋双女，见气非凶。金骑人马，遇土则吉。有救皆善，无助则凶","y":["罗"]},{"b":"星经杂注","p":"72","t":"然必无救解者，乃为凶论。有救解者，反是。水居戌宫，化为伏尸，本怒也。遇太阳之尊，水喜依辅，火不敢争，所以不为忌","y":["日"]},{"b":"星经杂注","p":"72","t":"木逢子位，名为地劫，本凶也。遇罗睺之火，水生火，火转生土，所以不为伤也。土埋双女，土克水也","y":["罗"]},{"b":"星经杂注","p":"73","t":"水逢月孛，非夭则刑。金遇罗睺，匪伤则折。此木岂宜同舍，水火不可同居。若匪伤身，亦须破病","y":["罗","孛"]},{"b":"星经杂注","p":"97","t":"孛星迟，过后方见。水火之性.火则急切,水则流过方润.土计临照太阳，喜尤胜于金水","y":["日"]},{"b":"星经杂注","p":"97","t":"计土照临太阴，虐更甚于火罗。吉凶变化无常.且相貌宫主两伤，必逢恶死。兼迁移宫主受克，当没殊方","y":["月"]},{"b":"星经杂注","p":"98","t":"四柱灵机.吉则欲实,凶则欲空.今年明年之推迁，故于小限以详也。逐月逐日之祸福，宜于太阴而取之","y":["月"]},{"b":"星经杂注","p":"98","t":"推一年之限,则小限以转.推一月一日之限,则太阴以转.恶星登驾，若临身命必倾危。吉曜守籍，当主儿孙以荣贵","y":["月"]},{"b":"星经杂注","p":"99","t":"各宫所主.大限为主，小限受难，可稍有乘除。当生为重，流年逢克，亦不过损益。所谓根本也.命,所谓用者,限流.而由命至限,由限至流.层层推进.不可失其大而专指其小.后则,原星为重,而流星亦切.古经己定其调.金宿与太阳临地，难曰空亡","y":["日"]},{"b":"星经杂注","p":"100","t":"无非吉凶也.身主命主值太阳，遇吉则贵。限主宫主遇生宿，陷则无妨。太阳之吉也.逢生则助也.也无非吉凶,而开始引申生旺庙垣他来刑我，他居陷弱则反佳","y":["日"]},{"b":"星经杂注","p":"101","t":"星夹太阳，权匪常伦。合不如照之功，拱岂胜夹之理。星躔退度，善恶分别有情。宿值空亡，生克总成颠倒","y":["日"]},{"b":"星经杂注","p":"101","t":".是以..读之一二句,己经知其所摘者了.因为是摘抄,是以这些东西放在一起.还是能慢慢体会作者想表达的.虽说没有上面几篇直达其要,但将这些放在一起,尚有一翻助益处.再次之,时而温之以经赋,也是后学必需的.名题雁塔，天首周邦","y":["罗"]},{"b":"星经杂注","p":"101","t":"足蹑云霄，太阳鲁分。http://blog.sina.com.cn/qq1900308216101九紫辰qq1900308216","y":["日"]},{"b":"星经杂注","p":"102","t":"罗入午,太阳入戌.不说罗吧,说这个太阳,一个月都会在戌吧.是以所有都一样.要明其理.如上句,则明其入垣之好就成了.这句明其庙旺之好就成了.不要去套.水日妙星张之位，孛罗同箕尾之乡","y":["日"]},{"b":"星经杂注","p":"103","t":"掠他人之物以为己有，盖缘水会计都。损之自己财物以济他人，必是木同紫气。计狡水险气木仁.气月为人之华盖，金孛乃命之咸池","y":["计","炁"]},{"b":"星经杂注","p":"103","t":"顺则成,使孛之流余,亦能作宰,只一则侯,一则宰.罗断计谋，孛尚权勇。火星赤黑，暴燥难瞒","y":["火"]},{"b":"星经杂注","p":"105","t":"要简要容易。其实一个字就成：“用”。日背太阳难得力，夜生月皎正光妍。官高官必居台位，寿显年庚比泰山","y":["日"]},{"b":"星经杂注","p":"105","t":"实则呢，会是指意命身官福。太阳高照君恩吉，月为身皎当空照。不欲背君，官易显高，要欲身明，月福光妍方洁安","y":["日"]},{"b":"星经杂注","p":"106","t":"实推之，语平而理深。恶曜偏宜居死绝，吉星最喜带生成。木星独贵诸凶散，孛彗当凶吉宿沉","y":["木"]},{"b":"星经杂注","p":"107","t":"而凶再作煞最伤刑，则各赋常指示。强调太阳伏煞之功，指示月身洁明之喜。土气夹罗多险厄，气阳金计主孤单","y":["日"]},{"b":"星经杂注","p":"107","t":"会能在快速定盘中，不至无所执着。孛入财宫财自散，火居子位子难延。火星拱斗人膺禄，诸曜朝天福最绵","y":["火"]},{"b":"星经杂注","p":"107","t":"是以，这些句放在一起，也不是无的确放矢的。特别是这个火星拱斗一句。承接而下，古贤表而不显的东西，会很明显的出来","y":["火"]},{"b":"星经杂注","p":"108","t":"这样就失了注赋的乐趣了，也容易引偏重点。星辰祸福断歌水星随日至天中，锦绣文章达圣聪","y":["水"]},{"b":"星经杂注","p":"108","t":"火入金宫兄弟丧，金寻火位丧双亲。举火之凶，只何以论金宫金星。以金为义，又天一以生水，金水同根","y":["金"]},{"b":"星经杂注","p":"109","t":"举以阳君伏煞之能，举以木清吉之为。水火失躔多厄难，木星失度主伤残。举以水火交厄之性，提示，星度之重","y":["木"]},{"b":"星经杂注","p":"109","t":"日卯月酉命坐卯，火星居午妙非常。日酉月卯相违背，人生值此有乖张。阐以垣旺之妙。太乙抱蟾宜未亥，夜生富贵足衣粮","y":["火"]},{"b":"星经杂注","p":"110","t":"阐出孛于六亲之刑用。实示其孛即金余之法。日月分明共金水，此星高照位三公。水星伴月终须贵，火曜朝阳福最隆","y":["水"]},{"b":"星经杂注","p":"112","t":"寅为喉舌之所。恶犯星辰，主有是疾患。午为头脸，为太阳目精处。寅为口舌亦多取。鼻头带赤，火孛守申宫","y":["日"]},{"b":"星经杂注","p":"118","t":"却喜金星同木行，金木临之多富足。身命怕见孛火土，产难胎亡主凶祸。罗孛行限极不宜，恶宿迁移多殃否","y":["金"]},{"b":"星经杂注","p":"118","t":"女人碎金月孛入夫带咸池，先奸后娶水来污。水孛同行照身命，为人不足心色粗。古代择妇标准，女命最不要孛淫","y":["孛"]},{"b":"星经杂注","p":"119","t":"更不要多情。又要求人长得好。主人迁移皆不正，计都不语却非愚。见土持重真堪羡，囚忌临身破相躯","y":["计"]},{"b":"星经杂注","p":"119","t":"火孛水星如相会，夫婿生情意外思。重婚再嫁多离别，侥侥内乱作麻丝。孛罗火日如相会，若不伤夫有几夫","y":["水"]},{"b":"星经杂注","p":"120","t":"妇人造化在身上，千古朝昏看太阴。若遇火罗相对照，强豪过似丈夫身。还要严整助家。命主寅申巳亥宫，少年嫁取主重重","y":["月"]},{"b":"星经杂注","p":"120","t":"要长得好，嫁得好。若是限行逢紫气，克夫害子定无疑。女人安命若坐马，东驴西骛常奔走","y":["炁"]},{"b":"星经杂注","p":"121","t":"妻星论七宫之星在何宫，身星妻位须赘。妻星入命最高门，金星妻曜临强位。我去就妻，在古代是入赘象，妻来就我如又强，是得高户象","y":["金"]},{"b":"星经杂注","p":"121","t":"男儿当把金为妇，女子元来火为夫。注意咸池等煞。注意夫妇相通之意。夫星得位夫无厄，火星失位两三重","y":["火"]},{"b":"星经杂注","p":"121","t":"水星若在桃花上，百嫁千夫无定向。气星若或在夫宫，孤眠独枕谁与共。http://blog.sina.com.cn/qq1900308216121九紫辰qq1900308216","y":["水"]},{"b":"星经杂注","p":"122","t":"太阳落限人终贱，身主遭刑处世难。强吉随日月最妙。仇星不可例言囚，若居垣局反自由","y":["日"]},{"b":"星经杂注","p":"123","t":"若战而不休，不管强弱，直言其凶。命看妻妾薄姻缘，只因命里见罗睺。独居午上当离地，反主齐眉到白头","y":["罗"]},{"b":"星经杂注","p":"125","t":"强调古代女命当闲清有福之谓。恶曜如逢犯太阴，也应宿疾便来侵。不然母道相刑克，更恐琴弦调失音","y":["月"]},{"b":"星经杂注","p":"125","t":"太阴为身，亦母，亦阴阳者。妻宫若见月华明，定主其妻貌相清。不但夫家得其力，定知财物亦丰盈","y":["月"]},{"b":"星经杂注","p":"126","t":"若太阴赶禄拦马，必是朝相。更命母居生旺，富贵双全。自然看贵，则寻官局。仍一样，要吉到，要吉拱","y":["月"]},{"b":"星经杂注","p":"127","t":"太阴若躔四煞度，处世多迍无所遇。何期短夭寿命危，煞克身命须畏惧。主星为奴星所泄，更居福德，加太岁命主皆居恶弱，乃奴隶附近贵人求温饱而己","y":["月"]},{"b":"星经杂注","p":"127","t":"若太阴居四煞度，平生遇贵不过财，更煞星近身命，必不长年也。余奴之凶，煞克之凶。局主官星居煞宫，孤寒门户岂亨通","y":["月"]},{"b":"星经杂注","p":"127","t":"太阴若更居三煞，命犯亡神主困穷。财星纵显应无力，田力须强亦不中。日月命身居死绝，空亡之地岂丰隆","y":["月"]},{"b":"星经杂注","p":"127","t":"局主，三限主也。官星，官禄主也。局主官星坐劫煞宫，乃孤寒之人。太阴最怕守三煞，命犯亡神，必主穷困","y":["月"]},{"b":"星经杂注","p":"127","t":"纵田财高强，若日月守死绝空亡，亦主生受。局起，三煞，亡神，生绝，实空。太阴元主平生福，昼夜须当细品量","y":["月"]},{"b":"星经杂注","p":"128","t":"人命太阴为主，上弦至十五六，夜生必为重福。若逢罗计，必生平成败，克害父母。纵罗计不亏命母，为官亦不安静","y":["月"]},{"b":"星经杂注","p":"128","t":"太阴月身之重。先看命主次看度，主度二星为体用。主星若更坐高强，度主受刑为祸重。主若强时度更强，更逢生旺福而昌","y":["月"]},{"b":"星经杂注","p":"128","t":"午安命，不以此论。午阳，未太阴。罗计蚀阳晦阴。而午未配以人首。申巳二宫为肩背，孛罗土计忌相逢","y":["月"]},{"b":"星经杂注","p":"128","t":"肩斜背曲皆为尔，两耳须防病更聋。若是太阴同到此，为人夭折寿难终。若躔觜翼尤为忌，若在张毕不相同","y":["月"]},{"b":"星经杂注","p":"128","t":"申巳为肩背，若孛罗土计同到，必肩斜背曲，耳更常聋。太阴亦到此宫，寿非可http://blog.sina.com.cn/qq1900308216128九紫辰qq1900308216","y":["月"]},{"b":"星经杂注","p":"129","t":"命在胃氐并柳女，若逢土计亦如然。若为夜忌居辰戌，身在其中福亦偏。火星忌土计相攻，为人蹇吃语滞","y":["火"]},{"b":"星经杂注","p":"129","t":"若胃氐柳女安命，更土逆在辰戌，太阴同到，必是哑人，为福亦浅。土为暗晦，火为离言","y":["月"]},{"b":"星经杂注","p":"130","t":"太阴受此恶星制，处世艰难贫又贫。更值行年恶星犯，其人必定入泉扃。水命人逢煞火相会，主有吐红翻胃之疾","y":["月"]},{"b":"星经杂注","p":"130","t":"更孛计会太阴，必主贫贱。若行年恶星犯，其人必死。水为血，火为血光，火红。金命尤防罗火逢，气瘤之疾必伤人","y":["月"]},{"b":"星经杂注","p":"130","t":"火为毒，火毒。肠风虚胆常惊畏，土命怕逢孛与计。更逢木气两相侵，若是马元手足坠。太阴孛计若同宫，女人值之诚不利","y":["月"]},{"b":"星经杂注","p":"130","t":"太阴计孛同宫，女人值之，产厄损抬。在八煞，主腋气，男女同断。土为坤，为腹。木土相攻，又常有扑祸之断","y":["月"]},{"b":"星经杂注","p":"131","t":"若是木星相会遇，转为吉兆福来临。命宫再见荧罗会，害子妨夫不可禁。http://blog.sina.com.cn/qq1900308216131九紫辰qq1900308216","y":["木"]},{"b":"星经杂注","p":"132","t":"摘金语句临行诀，漏泄天机奇更奇。立命星辰分母贼，太阴一诀在详推。解曰：五行要诀，端有玄微，不可模仿忖度，非明师亲付，何从得之","y":["月"]},{"b":"星经杂注","p":"132","t":"首先是太阴一诀，己详在广寒赋。分其母贼这一句，解曰者，也未解出。下有赋文昼夜一词，赋文倒是藏显出之","y":["月"]},{"b":"星经杂注","p":"133","t":"命还次之，身当重。以太阴即是身，果老云：月躔尔身。己经直道其法，只后期，后学不能理出月身之法","y":["月"]},{"b":"星经杂注","p":"133","t":"出来许多推月之法。所谓不执泥者。以月常变也。命在子丑月是土，命居寅亥配成木。命火还从火星推，命居辰酉从金取","y":["火"]},{"b":"星经杂注","p":"133","t":"命在巳申以水论，命居太阳从日程。惟有未垣并金鬼，宿身顺背看阴阳。土星嫌木最嫌气，木怕金星与火罗","y":["日","金","土"]},{"b":"星经杂注","p":"133","t":"火宿从来嫌水孛，金星荧惑莫相过。巳申之水最怕土，计孛两曜不谐和。午日木气为掩祸，太阴土计福消磨","y":["月","金","火"]},{"b":"星经杂注","p":"133","t":"火垣木曜喜相逢，金垣土宿真贵路。水逢金德占巍魁，太阳金水分明美。月见金高见火罗，十二宫中忌奴气","y":["日"]},{"b":"星经杂注","p":"134","t":"惟有土命为鬼局，太阴在上恐难行。火宫取位为母位，太阴同火见光明。限行取舍判于此，凶吉犹如谷里声","y":["月"]},{"b":"星经杂注","p":"134","t":"若生当春月，有煞合太阴居之，无阴注阳受陷祸必死。亥卯未则木局。巳宫金气初舒处，酉位横锋逞刃芒","y":["月"]},{"b":"星经杂注","p":"134","t":"丑则成形归库实，三宫秋月最难当。若是木星为命主，申限一见便刑伤。http://blog.sina.com.cn/qq1900308216134九紫辰qq1900308216","y":["木"]},{"b":"星经杂注","p":"135","t":"惟喜水人居正局，太阴符合获祯祥。解曰：巳酉丑金局也，木命忌之。若见土计，身在其上，便是党恶","y":["月"]},{"b":"星经杂注","p":"135","t":"巳酉丑则金局。人马之宫火始生，才临南午势炎炎。白羊入墓成局势，辰酉安命最为嫌。若是木星当夏月，太阴限路祸相兼","y":["月","木"]},{"b":"星经杂注","p":"138","t":"于之盘，则命身，于之星，则吉凶。歌命度，真要诀，先看太阳何度入。命宫三十六有奇，阔狭浅深随度立","y":["日"]},{"b":"星经杂注","p":"139","t":"一盘在手，不再迷思。则当细细考量十一曜。尔莫忘，原星为重，流星亦切。金居辰酉为入垣，浑入火星必焚灭","y":["火"]},{"b":"星经杂注","p":"139","t":"火星最怕水同行，喜躔室觜兼尾翼。水又最怕土同行，最喜参箕与轸壁。木星亥寅好斗奎，若遇金星必摧折","y":["金","火","木"]},{"b":"星经杂注","p":"139","t":"土得辰戌丑未宫，木星若见难培植。太阳朔日怕罗眼，不惟人祸日犹蚀。月望逢计又可知，独爱酉张心危毕","y":["日","木"]},{"b":"（全）","p":"6","t":"日即太阳，月即太阴，金星即太白，木星即岁星，水星即辰星，火星即荧惑，土星即镇星","y":["日","月","水","金","火","木","土"]},{"b":"（全）","p":"7","t":"紫气月于是白道上离黄道最远的两个点．一个在黄道之南．一个在黄道之北。罗喉，计都．是白道与黄道上的升交点与降交点（春分）与（秋分）","y":["罗","计","炁"]},{"b":"（全）","p":"7","t":"古人谓：紫气为木余．月于为水余、罗喉为火氣计都土余。（三）三王四星：天王星，海王见冥王星，婚星，谷见智星，灶星，是近代发现的行星、对人生也有很大的影响","y":["罗","计","炁"]},{"b":"（全）","p":"7","t":"（四).黄道：(1).在宇宙中．太阳系的行星包括地球是沿黄道面绕行太阳的。但论命是计算各星球对人所在地的影响．所以以地球为观察天文的坐标中心．故论说太阳及行星是绕地球运行","y":["日"]},{"b":"（全）","p":"7","t":"(2).黄道是地球绕太阳公转的轨道．它与赤道相交于两点．上交点为春分点（罗喉）下交点为秋分（计都）·相距90度在赤道以北的为夏至点．以南的为冬至点","y":["日","罗","计"]},{"b":"（全）","p":"7","t":"(3).黄道吉目：@·黄道分十二宫：山地球反观．太阳沿着黄道以每天大约一度进行．每月一一年之后再回到出发点","y":["日"]},{"b":"（全）","p":"7","t":"七政星盘就是以春分点为始，沿着黄道面每隔三十度切分、共分十二等份．每一等份为一（五）·七政命盘：太阳在宇宙中沿着一定的轨道运行","y":["日"]},{"b":"（全）","p":"7","t":"太阳经过的轨道就称做「黄道」，太阳沿着黄道，以每天大约一度行进，每月一一年之后再回到出发点","y":["日"]},{"b":"（全）","p":"7","t":"七政星盘就是以太阳的出发点为春分点，以春分点为始，沿着黄道每隔三十度切分，共分为十二等分","y":["日"]},{"b":"（全）","p":"8","t":"（八）·安命宫：古法一般安命宫．以生时加在太阳所在之宫．顺数至卯．即是命宫","y":["日"]},{"b":"（全）","p":"9","t":"但因地而异．凡近赤道者太阳皆出于卯．乃遇卯安命，有生于不同时、季、不同经纬度者．因星球位置的移动，得看当地囗出何时，也有辰时、寅时、安命者，皆要以星历为准","y":["日"]},{"b":"（全）","p":"13","t":"如火曜化甲干，是为曜化干。（十九）．七政恩用仇难及躔次得失：水星喜金，金星喜上，上星喜火，火星喜木，木星喜水","y":["水","金","火","木"]},{"b":"（全）","p":"13","t":"日喜金水辅从，月喜火罗侍卫，以所喜者为恩。金星怕火，火星怕水，水星怕上，土星怕木，木星怕金，囗怕木，月怕土计，以所怕者为难","y":["水","金","火","木","土"]},{"b":"（全）","p":"19","t":"二十八二十八宿分布在天球赤道和黄道带一周，是我国古代恒星分群系统。在曼无边际的空间，就好像太阳、太阴「月亮」的宿舍","y":["日","月"]},{"b":"（全）","p":"21","t":"五星连海王星0很多小说神话中都堤到：「五星连珠必有大劫」。其实五星是指土星、又称镇星或填星，火星、又叫荧惑，木星、又命岁星，金星、或凵太白、长庚，水星、古i胃辰星","y":["水","金","火","木","土"]},{"b":"（全）","p":"22","t":"（三十一），安身宫：月为身宫。即太阴所躔之宫，为身宫。宫主星即为身主星。（三十三）·同干支或双胞胎同命运吗？","y":["月"]},{"b":"（全）","p":"27","t":"乃太阳光霁。此谓雷下天时。谓之久雨逢晴。又有先行火日。此谓之久晴逢雨。论月：春天之月","y":["日"]},{"b":"（全）","p":"27","t":"虽花雨风流。而晦月亦当不美。最喜太阳逢时。则万木清清。为火月交辉。如夜月见木。更带桃花之星","y":["日"]},{"b":"（全）","p":"28","t":"水孛润之而不寒。罗火照之而不燥。喜木气以相扶。忌土计以掩蚀。夜诞而喜月同行。昼假太阳而有辉","y":["日"]},{"b":"（全）","p":"28","t":"金星伴之以无情。木抉之安有益。借日光而布暖。仗火罗以助辉。论木：夫木者。东方青帝之神","y":["金"]},{"b":"（全）","p":"28","t":"则木无盘屈之拘。当有舒泰之美。如木与太阳同宫。名为向阳花木。必然早占鳌头。富贵之人也","y":["日"]},{"b":"（全）","p":"28","t":"昼生忌躔四火之度。又不宜与太阳交互。盖是日烈木焦。昼生木躔四水之度。而与太阳交光","y":["日"]},{"b":"（全）","p":"28","t":"此是上下济润。不可以木焦日烈而论。乃水之秀丽。九月寒露之边。斯时万物萧疏。如昼生与太阳交光","y":["日"]},{"b":"（全）","p":"28","t":"谓之日边红杏。布占先魁遇此造化。如日生遇火罗。谓之寒谷回春。如无太阳火罗同宫。得生巳午未之时","y":["日"]},{"b":"（全）","p":"28","t":"或木躔四火之度。又与太阳交辉。可作十个之福也。木躔四土之度。又逢水孛冻折","y":["日"]},{"b":"（全）","p":"29","t":"见太阴夜生光彩。春末夏初之际。名为桃花滚浪火暖花红。但火不宜与水孛同行。能破水孛之气","y":["月"]},{"b":"（全）","p":"29","t":"乃刚柔变化。最不宜与木同！怊火罗朝拱。太阳无水济润。如有一水贯日。为之淋漓普济苍生","y":["日"]},{"b":"（全）","p":"29","t":"论土：夫土者。中央黄帝之神。轩辕氏执绳司事。所谓绳居五行之中。负载养育之权。昼生与太阳交会","y":["日"]},{"b":"（全）","p":"29","t":"盖是阳和一点。若有官令禄印爵魁佐之。主守成富贵。夜生最喜火照。土德朝拱太阳。盖火土俱名精彩","y":["日"]},{"b":"（全）","p":"29","t":"为之火燥土烈。无水孛济润。昼生土与太阳交辉。亦为囗烈土焦。此谓上生下润。夜生木火罗","y":["日"]},{"b":"（全）","p":"30","t":"主利名显达。乃白帝司权。不怕火罗而克。不喜土计而生。最喜秋生者贵。若金水朝拱太阳","y":["日"]},{"b":"（全）","p":"30","t":"当主台省扬名。所忌金星交互。但四五月间。及洪水滔天。水盛而无土堤防。不以为倒限论","y":["金"]},{"b":"（全）","p":"31","t":"斯时点水成冰。得火为上令。得土为次令。得太阳佐之。方可言令也。盖土多则水暖而清","y":["日"]},{"b":"（全）","p":"32","t":"囗与木星：会合、三合或六合时：在此三年期间中，其人能得亲友资助，贵人提携，无论投机或投资，均可获利，在思想上亦见进步，能以稳健之行动，促成事业之扩展，此角度，乃方位中之最佳者，如再有其它良佳角度扶助，福力史大，此外又可能结婚或生佳丿L","y":["木"]},{"b":"（全）","p":"33","t":"囗与火星：构成三合或六合时，诞生者在此期内，主有勇气作为，其所接近者，多为活跃朋友，因此对于事业之发展，具有冒险进取之开括，成就非凡","y":["火"]},{"b":"（全）","p":"33","t":"日与金星：会合，三合或六合时，为幸运之方位，可得有权位者之支持，对于财帛社交事业，婚姻，生子，均有美满的结果，并可实现其心愿，此时应以其本人之才干，尽量利用之","y":["金"]},{"b":"（全）","p":"33","t":"日与水星：会合，三合或六合时，则诞生者之性灵，囗见活泼，此时利于转新环境，对于律师，文艺界，运输与交通有关事宜，均可获利","y":["水"]},{"b":"（全）","p":"35","t":"之一星，为祸与木星同，虽好恶如此，然亦须看守宫者何星，所用者何星，混杂者何星，党与者何星，又不可一概论也","y":["木"]},{"b":"（全）","p":"35","t":"如福禄权财，混之以值难，则塞翁得马，未必为福也。木星固知为害，若混之以火、罗，则反为吉，以木能生火，恩有益于我也","y":["木"]},{"b":"（全）","p":"35","t":"十二宫之最切者，莫若福德、官禄、八煞也。福宫属木，设有木星居之，不可为福德主，谓之害曜入垣，若有太阴在巳申之宫，谓之「四正逢刑怕见身」，盖寅刑巳，巳刑申，其不吉可知矣","y":["月","木"]},{"b":"（全）","p":"35","t":"其寅中有一火星，谓之一官星得局亠，又能为福，更得土星在寅巳，是寅加巳，巳君申，虽口相刑，是刑而生我，非刑而克我，更加命主有情，禄马在命，合此格者，寅限可得名利无疑矣","y":["火","土"]},{"b":"（全）","p":"35","t":"卯为官禄宫，设有火星居之，谓之[官星入垣」，或三合见火皆吉。若无火而有木，更加木在亥卯未，即为一上命人得木，合此格者，多主天折，若加以难值，尤凶，必死丁非命，万不失一也","y":["火"]},{"b":"（全）","p":"35","t":"巳为疾厄宫，水星居之，为难星入垣，难星，疾厄主是也。更六壬生人，生丁七、八月，多主恶死，轻则破相压身之疾，水星若有金助之，为害尤甚，孛水居强，或居官禄、迁移，亦凶","y":["水"]},{"b":"（全）","p":"36","t":"四破局者，四位俱不禄，惟会刑星、害曜、难值等星，如太阴星命主在寅、申、戌、未者，是未中有戌，戌中有丑，不然只在丑戌二宫者，亦戌中有丑，丑中有戊，加之四位中有煞星守之，故为四破局","y":["月"]},{"b":"（全）","p":"36","t":"大概先看局之重轻，然后参以加盘而明祸福。如火星在卯，祸福山此血分，四正局见之，则卯加子，火来生土，必然为福：返吟局见之，是卯加酉，火来克金，必然为祸","y":["火"]},{"b":"（全）","p":"36","t":"午为八煞，太阳在上，谓之「难星入垣」，惟火居之，或三合见上，一则土命人得火局，二则福星入垣局，三则八煞有星，更有禄马加临，少年功名可许","y":["日"]},{"b":"（全）","p":"36","t":"辰为官禄，金星在上，谓之「官星入垣」，又为「金星入庙」，月在上，谓之「身入官乡」，俱为吉利：惟木居之，一则木入水局，二则害曜破官，三则辰午为煞，十二宫主，惟相貌闲极乃缓中之急，若命主二星在上，或有火、罗合之，多是卿相造化","y":["金"]},{"b":"（全）","p":"36","t":"如郑敬斋壬辰十一月十九囗辰时，安命在丑，土星在亥，系闲极宫，官至公相。若此显达者，不可枚举，虽上在亥，本为士逢木局，而未官有火，却成木生火，火生土，况命坐崇勋，而见火加入命，此其所以为佳也，须知此格方妙","y":["土"]},{"b":"（全）","p":"37","t":"又如巳宫虽曰迁移，实为切要，若有金星在上，一则照命，二则照禄，三则官星入局，值此者多是晚年显达，切不可以弱宫论也！","y":["金"]},{"b":"（全）","p":"37","t":"间有救处，亦是贫天之命。又其次要观当生之时，若攀殿驾，登禄马，亦是贵命。在十二宫，皆要太阴居闲极，独此丑宫与亥宫，最怕太阴在闲极，盖丑，上也：亥，木也，月临之，谓之「安身傍鬼」又成木局，主一生逇蹇，重则夭折","y":["月"]},{"b":"（全）","p":"38","t":"又如己生人，以金化因为忌；辛生人，以太阴化因为忌，固为害矣。若春生金混之以水，得水以泄金，太阴水精以生孛，反为有福，不可概论也，当市轻重断之","y":["月"]},{"b":"（全）","p":"38","t":"巳为官禄，所属者水，水星居之，谓之「官星入垣」；太阴居之，谓之「身入官禄」：木星居之，谓之「木入水位」：命主有气，谓之「命主坐官」，或丙戊生人，谓之「禄居官禄」，俱是富贵之命","y":["月","水","木"]},{"b":"（全）","p":"38","t":"若金星居之，谓之「害曜破官」，午有水星，破祸成福，有火居之，亦能为福。若辰酉有金，破福成祸","y":["水","金"]},{"b":"（全）","p":"38","t":"辰为福德属金，若金星居之，不为福星入垣，即为害曜入垣：太阴居之，不为身居福德，即为安身傍鬼，又为难星党害曜：木星居之，不为命主坐福德，却为木困金乡，是贫薄命也","y":["月","金","木"]},{"b":"（全）","p":"38","t":"若金居之，混之以水，破祸成福：木星居之，若申子辰有水星，即为木入水局；太阴居之，若六乙生人，卯上有禄，即为身命夹禄，好恶之辩，可细推也","y":["月","水","木"]},{"b":"（全）","p":"38","t":"八煞未宫，太阴居之，谓之「难星入垣」，若三四月生人，月为值星，主生疾病。六辛生人，月化因星，多有官灾","y":["月"]},{"b":"（全）","p":"39","t":"有吉星临之，未必为福，是申为胎元，午为三囗，前扶后引，惟命主木星居之，一则入局，二则入秦，三则八煞有星，不为主居疾厄也","y":["木"]},{"b":"（全）","p":"40","t":"使有一水星在亢初度，水能克火，是祸起萧墙：使有一木星在尾初度，木能生火，是福生有基","y":["水","木"]},{"b":"（全）","p":"40","t":"未为迁移，申为八煞，申、未通关，难星居之，俱为不足。月临之，亦未为善。更火星临之，却不为「火临坤地灾消烁」，而为灾愈甚，人多不知其然也","y":["火"]},{"b":"（全）","p":"40","t":"若有水星在辰，是辰金生水，为灾愈甚：十六岁至二十一岁，是辰加辰：二十二岁至二十六岁，是辰加巳，巳上加见辰水，谓之「害星入垣」，能制其火：二十七岁至三十四岁，是巳加巳：三十四岁至四十二岁，是巳加午；","y":["水"]},{"b":"（全）","p":"41","t":"卯为财帛，火星居之，不为财元入庙，乃是刑曜入垣。酉为八煞，金星临之，不为难星人垣，乃是八煞有星，合此恪者，无有不好","y":["金","火"]},{"b":"（全）","p":"41","t":"若科名科甲拱夹，愈加其妙。若金星在午福德之位，日为福主在巳，月为官禄主在未，谓之「囗月夹主」，又为「官福夹主」，则为福不浅矣","y":["金"]},{"b":"（全）","p":"42","t":"凶星临之，则为六害局，其为祸可知。或者不识飞宫变局，可以互加，举一隅则三隅反。又如火星在午，是财星逢旺，亦是刑星逢旺，既为财元坐禄，又为刑星破福，既看财元不当以刑星论，盖火为财兀，逢旺，若是丁巳生人，禄居午位，乃是财元坐福坐禄，加以上、计二星为禄主权星，在寅戌二宫，或在巳未二位，大约三十六岁行午限，得」．、、计为福禄临之，必大发福也","y":["火"]},{"b":"（全）","p":"42","t":"水星在午卯二位，尽是陷弱，为福必难，安和水在午，午加申，皆是水位，水在卯，卯加巳，水星入垣，亦为水临室女，若癸酉、癸丑之人，带此多发达","y":["水"]},{"b":"（全）","p":"42","t":"六丁生人得之，是身犯因星，若混之以上计、四星、值难，又是横天之命矣。酉为迁移之宫，水居之，乃水命金局，金星在申，谓之金水互垣，官星命主有气，六辛生人，禄在迁移，丙丁生人，贵在迁移，若有木星在丑酉亥宫照命，多是文章显达之人，否则离祖荣身也","y":["金","木"]},{"b":"（全）","p":"42","t":"戌为八煞之宫，水星临之，为主居疾厄，火入命宫，为难星与命主互垣，水火互换，未免抱病压身，更加士计在寅午拱主，又是庚申生人，为害不小，若木在卯","y":["水"]},{"b":"（全）","p":"43","t":"子为奴仆之宫，水星在上，谓之「主入旺乡」，又是主居陷弱，善恶难辨。若与金星同居，更于冬月水神用事，谓之「逢旺得局」，若与火土同居，更生于夏月，火土用事，我命水，未免有伤，不可一概而论，若太阴居之，主是偏生庶出，若癸生人，孛、罗为福禄夹拱，偏官右选造化","y":["月","水","金"]},{"b":"（全）","p":"43","t":"盖巳宫所喜者，金星、母星也，财帛官主也；所忌者，火星、八煞嚮主也，士计也，煞星也","y":["金","火"]},{"b":"（全）","p":"43","t":"土星在巳，谓之「上埋室女」。火星在巳，谓之「难星入命」。火土在巳，为「刑难作党」","y":["火","土"]},{"b":"（全）","p":"43","t":"有火为难星，守辰宫临驾，是为「客曜临朝」4水与太阳同宫，坐氵日没煞，则主多磨障","y":["日"]},{"b":"（全）","p":"44","t":"且如虞学士乙未四月二十九囗午时生，午上安命，日为命主在酉，以酉加午，谓之升殿，金为官星化福，日为命主，三元上下，二盘皆入庙旺，月与火同宫在戊，以戊加未，又是月居月位，日月升殿，况未生人未为殿驾，月为岁星，火为岁德，戌未相加，二星临驾朝垣，是谓「岁德朝垣，火月升殿」，合此格者，少年及第，名冠天下，此酉戊二位与午未本无相涉，而大有相关，以日在酉，月在戊，人皆以为反背晦明矣，然焉知午加酉，未加戌，皆是日月升殿，此乃加盘之妙也","y":["木"]},{"b":"（全）","p":"44","t":"巳为财帛之宫，水在巳为财元入庙，土星临之，害我财帛。水在申为福星入垣，土在申破我福德","y":["土"]},{"b":"（全）","p":"44","t":"若生当冬月之时，水神得地，及与水同居，六戊生人，以木为因，又见水星得时，而长木之因恶，更加身命主星，坐煞逢伤，必死于牢狱，或伤残手足眼目，而为废人方免！","y":["水"]},{"b":"（全）","p":"45","t":"健，木被金伤，木自谋己不暇伤人，则木不能为害也。若火与木同宫，乃是旺在卯，虽入命宫，如六甲生，以火星为禄，木星为福，禄兀马元，遇五六月生人，火星当权，是木难化为福，以生权星禄主之人，反能为福也","y":["火","木"]},{"b":"（全）","p":"45","t":"午为财帛宫，太阴在午，谓之「身居财帛」。太阳在未，谓之「财元入命」，亦谓「财命互垣」，亦是「身主入命，命主入身」，此为内外台格，切不可谓阴阳反背！","y":["日","月"]},{"b":"（全）","p":"45","t":"如戊限加合，皆是刑因破败伤残，甚至死丁非命。如恪局布定，一星稍异，珂皆不同。巳为兄弟之宫，太阴在上，谓之「身居闲极」","y":["月"]},{"b":"（全）","p":"46","t":"若刑因夹命，或拱夹值难，便是贫贱之格。如蔡枢密己丑十二月二十七日申时生，太阳在子，太阴在寅，岁驾在丑，金为福星在寅，火为官星在丑，日月夹官星，日月夹岁驾，金在寅，木星怒宫，金为福星加入官宫，火为官星加入福宫，谓之「官福互垣」，月居官福，日月拱夹，岂不为大贵之命","y":["日","月","木"]},{"b":"（全）","p":"46","t":"若身命皆坐煞，会刑因值难，官、福、禄、权俱陷，必主剥杂无成。如太阴在辰，土、计在寅、午二宫，大约三十七岁入戌限，寅加午，午加戌，戌加寅，皆犯上、计，必以刑天断之","y":["月"]},{"b":"（全）","p":"46","t":"丑为疾厄之宫，若水在丑，本为失位，以丑加申，亦是水入水宫，命主人垣，或命主水星飞起，登殿、临驾、人局、坐贵、禄马互换有情，与宫神太岁賠加关摄，则为富贵之命","y":["水"]},{"b":"（全）","p":"46","t":"若命主水星飞入煞宫，会刑、因、值难，互换无情，将重易轻，无有关摄，则为贫贱之命","y":["水"]},{"b":"（全）","p":"47","t":"或水星在巳居田宅，亦谓之「水星入垣」，或金星在巳，乃是「金水会蛇」。命主逢生，或金、水、日、月居午位，不可为「身命主居闲极」，是「子母日月同宫」，此金、月虽化为刑因，无害：若化为福、禄尤佳","y":["水","金"]},{"b":"（全）","p":"47","t":"如行限逢金、月，六丁生人，必大发福，更加禄马、官魁、科名、科甲则富贵自来逼人。如命上水星在巳，或与日月同宫，或日月拱夹，或官福入垣得局，或官入官宫，福居福位，或官福互垣，或身坐禄，或登殿，或守时籍，或会科名、科甲、魁星，则当期以大贵","y":["水"]},{"b":"（全）","p":"47","t":"辰为男女之宫，金星在巳，水星逢金生，又来同宫，谓之「母附子、子顾母」格。子母相生有情，极为奇特","y":["水","金"]},{"b":"（全）","p":"47","t":"若月在亥，日水在巳，又为锦上添花，那更火星在未，木在卯，官福俱入明地，福居库位，是官福拱身命","y":["火"]},{"b":"（全）","p":"47","t":"如水星在戊，不为水泛白羊，是主居福德。若火星入命，又为福主与命主互垣，或天马不背，职兀、局主高强，或临身命，则主功名富贵矣","y":["水","火"]},{"b":"（全）","p":"47","t":"迁移子宫上位，为水旺之所，水星在上，逢生旺则吉，受克制则凶。或生于冬月，水神得地，是为水星逢旺，或壬辰、癸巳、丙子、丁丑生人，水旺在子，子为帝座之宫，丙子带之尤妙，乃为命主临帝座之宫，又得日月左右夹之，可以为三台八座格局，不谓之主星受伤","y":["水"]},{"b":"（全）","p":"48","t":"更看所守者何星：若金与火罗同宫，必为祸；若金与土计同宫，必为福。如命主在辰，辰乃奴仆之宫，金居金位，命主入垣，金星得地，不以为弱","y":["金"]},{"b":"（全）","p":"48","t":"火星在戌，辰加戊，戌加辰，俱是刑星。若水在辰，金反生水，水能克火，是生子御寇。若金在午，土在子，午加子，子加午，土能生金，金主失位逢生，互换往来，皆见官禄","y":["火"]},{"b":"（全）","p":"48","t":"日月升宫，乃百官之领袖」。岂不为御史乎！此乃加合隐中之妙。若月在丑，日在子，若己酉、己卯、丁酉生人，禄在日正，命临岁驾，日月拱之，或命主更乘天马、地驿、职元、局主亦佳，若六己生人，太阳为禄主，加在午，月为禄主在子，上为官星在酉，木为福星在卯，卯加酉互加，皆见官福照命：子加午，官禄加禄，官星坐禄，午加子，崇勋、官禄官主入垣，此乃宰相公卿地位","y":["日"]},{"b":"（全）","p":"49","t":"如或刑因拱命，难值夹身，或刑因拱身夹命，或客曜临朝，飞星守驾，则为凶恶命也。申为财帛之宫，水星居之，是财元入庙，月居之，是身居财帛，若六己生人，月为禄位，又为禄主临财","y":["水"]},{"b":"（全）","p":"49","t":"寅为疾厄之宫，木星居之，为难星入垣；月居之为身居八煞。若九月十月生人，木为值星，必多疾病，那更火在申，申加寅，寅申，加入八煞，所以寅申之宫相关也","y":["木"]},{"b":"（全）","p":"49","t":"然戌上虽属火，而巳上又属水，此两处不相入，或曰火星在巳为「火居火位」，又曰「火入水宫」，此戌巳二宫加合之难辨也，如巳宫有福禄、贵人、驿马、岁驾居之，必能化为福，或有的、劫、岁煞、七煞居其上，必能变为灾，不可概论也","y":["火"]},{"b":"（全）","p":"50","t":"木在卯，木为科名，火为命主，木来生火有情，至十六岁行限在亥宫，见禄驾。辰为夫妻之宫，辰与酉合，火星在上，火入妻宫，加入财帛，酉、辰二宫属金，皆为得地，倘水星同在上，水为刑星，终是受伤，若是六害三刑对照，又有月孛居之，愈重其恶，孛乃水余，以水加孛，煞气增盛，刑害可知，甚至恶死","y":["水","火","孛"]},{"b":"（全）","p":"50","t":"若火星在辰，土在酉守财帛，土为官，是福主临财，辰与酉合，命主入财后'入处有情，乃为贵也","y":["火"]},{"b":"（全）","p":"50","t":"未为田宅，本宫月居之，谓之「月居月位」，身坐田宅，甲生人身又坐贵，木星居之，为木入秦州，亦谓「身会福主」，此为福也","y":["木"]},{"b":"（全）","p":"50","t":"孛星临之，不为「太乙抱蟾」，乃是「身犯煞曜」。水星居之，不为「水涵月魄」，乃是「身犯难星」，若以未加子，子力卩未，皆是六害为刑星，为祸尤甚","y":["水"]},{"b":"（全）","p":"50","t":"申为闲极之宫，火在上，绝处受伤，若火躔井木犴，又得木星，火绝处逢生。水在命宫，躔奎木狼，则水只在木，木泄水之气，则水为害小，或丑上，卯上有水，丑加申，卯加戌，又得木、以助火，则水虽为祸亦轻矣！","y":["木"]},{"b":"（全）","p":"51","t":"若五六月生人，火为值星，火神用事，命木逢之，为害不小，所以忌也。丑为福德之宫，木星在寅，官入官宫，又为命主坐禄，木星在丑，命坐福德，若丁丑生人，命主在丑为岁驾，亥为贵人，命主登驾，命坐贵宫，此为佳也","y":["木"]},{"b":"（全）","p":"51","t":"癸丑生人，虽是为驾，其如阳刃、的煞何？所以减力，不甚为佳。如太阳在巳，太阴在酉，谓之拱驾朝主，又是六己生人，太阳为禄元，太阴为禄主，又谓福德受日月合拱，巳酉丑三位加合，往来俱见禄元、禄主、福星，必为宰辅","y":["日","月"]},{"b":"（全）","p":"51","t":"木星虽满用，须入垣、登驾、坐禄为佳。如木在戌乃木居财帛，是命临财，若火星在午，火旺在午，谓之「财元逢旺」，若三十六岁行寅限，金在戌，财兀在午，只欠寅一字辏成财元局","y":["火","木"]},{"b":"（全）","p":"51","t":"若辛生人，混之以，则富拟陶朱。木星在申，坐田宅，木居水位","y":["木"]},{"b":"（全）","p":"52","t":"若水星在子，水为田宅主，乘旺复生命主之木。若六庚生人，以水为禄主，有甚不好？但上在辰、申二位，混之以木，又为因星克禄主，何益于我？","y":["水"]},{"b":"（全）","p":"52","t":"若水不在子，为祸不小！若水在子，此是福星生因星，因星生命母，命母生命主，相生不己，此其为佳，乃水星之力","y":["水"]},{"b":"（全）","p":"52","t":"如木星在酉，谓之「木困金乡」。土星在丑，木为官星，土为福星，又为官福漏关。土在丑，混之以金，又是六己、六辛生人，以金为刑、因，是福星党刑因而克命主之木，更当秋冬，金神用事之时，木神无气，我必受伤","y":["木","土"]},{"b":"（全）","p":"52","t":"若罗在卯，孛在未，六癸人，罗为禄主，孛为福权，又为福禄拱命。太阴在官禄、福德之宫，又是上贵之命，不可以孛、罗为恶曜论也","y":["月"]},{"b":"（全）","p":"52","t":"十二宫论凶吉：命宫：天命为最，己身欲强，值吉星以守照，获厚福以无弭，倘入庙以清奇，更须高位，若陷凶而喜旺，又且何妨，太阳临位而荣贵无灾，月后入宫，而清慈有福，美容貌而且秀，处人事而最足，切防忌宿照临，而减算除年，大紧凶星对照，而兴灾失禄，金洁体而立性多刚，水鼠眸而为人不一，非言辞之无准，惟处事之多失，木须清秀，体长而好学文章，心必宽慈，经史而博览广识，或云孤宿，亦刂官星，云寡宿者，为僧为道，云官星者，有职有权，孛星身瘦小，而人前好说家","y":["日"]},{"b":"（全）","p":"53","t":"风，罗计粗雄而胆大，性多鄙吝，喜独居于一位，忌相会于诸星，恶曜而多自不安，凶星而遂成殃衅，火星赤黑，烦操暴以难瞒，土星矮肥，最多言而多虑，各分昼夜，切论晨昏，若为忌宿之临，深作殃为之急","y":["火","土"]},{"b":"（全）","p":"53","t":"金星守命夜生吉、白日生人减半力：木星照命有多般、白囗逢之必作官：夜生若有暗曜杂、反为凶祸主忧煎；","y":["金","木"]},{"b":"（全）","p":"53","t":"水星在命合入庙、夜里生人太阴．或居双女与阴阳、决定少年居显要：火星入命不堪详、白日生人主祸灾：更被孛罗三合照、定知哑吃与人伤：患劳枉死人孤寡、夜生又宜怯无妨：土星入命主顽钝、夜里生人不可论；","y":["月","水","火","土"]},{"b":"（全）","p":"53","t":"水命定知须哑吃、黄肿气疾命难存；太阳坐命如逢火、罗星同宫须食禄：火星不照定封侯、月孛临之患心腹：太阴在命生逢夜、水宿同宫为仆体：士星入命孛星来、有禄定知非久谢；","y":["日","月","火","孛"]},{"b":"（全）","p":"53","t":"紫气印星号天乙、凡在命宫皆有益：午时不被恶星临、善宿合兮多子息；木月见而入夜宫、夜里生人为辅弼；","y":["炁"]},{"b":"（全）","p":"53","t":"若是土星三合照、虽则高强终是疾；罗喉入命计谋多、木日同宫主豪富：金木太阳三合照、此人慷慨更英豪：女命夜生罗照着、自缢劳刑贫又薄：如木水计入命时、此人定作般般恶：计都入命忧火命、此则十杀恶无定；","y":["日","土","罗","计"]},{"b":"（全）","p":"53","t":"贵人遇者以权贵、白日生人宜修进；木星紫气如临照、主命居强为福庆；孛星入命人廉洁、目快心清为性别；","y":["木","炁"]},{"b":"（全）","p":"54","t":"太阳居此足钱财、质库常开待物来；月居财帛多财出、只怕土星三合克。土入二宫亦忌之、遇日木扶还又得：罗计孛入损资财、终身不得资财力","y":["日","土"]},{"b":"（全）","p":"54","t":"木金兄弟主英雄、水星和乐旺门风；火在此宫定孤寡、夜生不与孤寡同；土临兄弟终难和、囗居未可同言语：生时父母决相背、木计入","y":["水"]},{"b":"（全）","p":"54","t":"主贫0丿上．1太阴若得主星来、辅弼荣华山此胎；孤临第三兄弟少、计星遇此渐生荧；月孛来时损兄弟、古人传说难躲避","y":["月","孛"]},{"b":"（全）","p":"55","t":"火星临此不堪说、土星躔入有房廊、白日生人为最吉、夜生父母早年亡；囗居田宅足田园、木到双亲福寿个、火孛不照多产业、水金合会常堪怜；","y":["火","土"]},{"b":"（全）","p":"55","t":"木星入位必有官、水月合兮居颢位、罗居田宅不堪猜、十般死恶反破财；计都侵之忧父母、田庄牛马化成灰、月于居安亦如之、夜生亦可臧毫厘；","y":["木","计"]},{"b":"（全）","p":"55","t":"月临虽称旺田宅、白日生人反作累、紫气居之多壮丽、父母一时居0贵；金居田宅父母宫、白日生人主困穷、如逢夜里最为吉、产业自荣迈祖宗；","y":["炁"]},{"b":"（全）","p":"56","t":"多出在外，虽有若无。夜生太阳独照男女宫，无星辅之，皆主无子，有星辅之，反有子，日生太阴独见男女宫然，以其孤阳不生，孤阴不成故也，犹有主星飞在强弱宫分轻重论之，如主星飞在强实位，只主损头胎，终还有子，先女后男之类，如主星落陷弱之地，则主多生多克，如白虎六害华盖临之，流年旬中又窄，则可知其无子矣","y":["日","月"]},{"b":"（全）","p":"56","t":"金星若在男女宫、四男聪俊各英雄、火在此宫不得地、遇着来时定主穷；土临第五迟迟有、夜生决定主孤踪、太阳若照男女宫、必主贵子显门风；","y":["日","金"]},{"b":"（全）","p":"56","t":"太阴到此亦如之、三男富贵夜为功、紫气当生照男女、不被恶星井火上；三合水月同聪俊、男女荣华定文武、罗照男女主天亡、计都临照亦荧昔：孛星倘若居此宫、十生九死空费乳、为人性狠恶心肠、此乃依经与君语","y":["月","计","炁"]},{"b":"（全）","p":"56","t":"金木星枯足奴仆、上若加之夜为毒、火在此宫必少力、太阴值此多悲哭：非惟辛苦有多般、决定生时非正屋、月居此位被日土、一世多更贫","y":["月","木"]},{"b":"（全）","p":"57","t":"夫妻宫妻宫，是禄贵长生帝旺之地，皆主好妻美貌多能，如是死绝的杀劫杀之宫，皆不得好妻更会孤寡恶甯，必主无妻，术家云，鼓盆星五行绝处是也，会丧吊一符计都，必克妻，如妻主是杀星坐强实殿驾，或守财帛田宅，主妻多做大模样，欺凌夫主也","y":["计"]},{"b":"（全）","p":"57","t":"如妻宫主落陷，居空弱地，有的杀六害白虎，加其宫分，及临其主所守之地者，必多克害如妻星化值难，值咸池的杀同宫必多产厄而亡，如妻星是太阳，或入未或在午，或入兄弟，多主因亲致富，姨兄弟为之，或妻星单在华盖，及阳刃，我命坐白虎，则多与妻不和，隔角之类尤如妻星落陷，又得金气有力，必有小妻谐老，又如妻星坐咸池，与兄弟主仆主同宫，又有的杀驿马夹之者，则主其妻与外人及奴仆通情者极验，不可不察","y":["日"]},{"b":"（全）","p":"57","t":"金在妻宫妻妾好、木星昼会喜相逢、其妻非但能廉洁、貌白容妍世孰同；水在妻宫多妖冶、火则伤残莫论容、夜生尤自主分离、何况生逢在日中：土入妻宫无貌娘、妻妾命如日里霜、太阳美貌火孛丑、太阴见水美容妆：紫气木星太阴吉、罗喉自缢检尸伤、计入妻宫劳患死、不然毒药溺江亡：妻妾宫中见孛星、计都水火自相刑、兼主蛇伤并自吊、不然产难堕胎生；","y":["日","月","木","罗","计","炁"]},{"b":"（全）","p":"58","t":"金临疾厄永无疾、木居富贵常安逸、水在此宫遇孛计、必定腰驼并背曲：白目生人火曜冲、必定风痰吐血终、荧惑疾厄须惊悸、土临八位主瘟凶；","y":["火"]},{"b":"（全）","p":"58","t":"太阳遇计火土于、风劳血病不久殁、如见木月独照之、一世优游无消歇；此宫若见紫气临、定是女荣居要津、罗照此宫应笃疾、计会孛来定凶侵；","y":["日","炁"]},{"b":"（全）","p":"58","t":"木金之宿入迁移、定主迁移福禄齐；水星却主远行吉、金木合照封侯印；土星阻滞难远行、太阳昼生反为益：金水会月夜生奇、命度相逢喜见之：此宫见日主为官、太阴合照为瑞端：罗在游行必见别、家中当见检尸灵：","y":["日","月","水","土"]},{"b":"（全）","p":"59","t":"计都若会孛星入、决定蛇伤并虎擒：切闻月孛入迁移、损田损宅损妻丿L：官禄宫：官禄宫，不宜财星生旺守照，及犯天雄阳刃诸杀，主人贪财坏名，亦不宜官星克命，经云，官禄克命，以名立身，以名败身，更不宜主宫逢罗主人粗豪健讼","y":["计","孛"]},{"b":"（全）","p":"59","t":"官禄不要杀星克其宫，名曰官鬼，如官禄在亥，却不宜金星入，亦不宜三合四正宫值之，皆主其人健讼，不然遭官破家，亦主无官食禄之分，诸宫皆仿此","y":["金"]},{"b":"（全）","p":"59","t":"太白木星入官禄、一世为官居显轴、天上之官会水星、太阳合照作公卿；水居好乐合丁月、官居位颢职非轻、火在十宫夜入庙、朝端定列仍年少：罗星计孛本为凶、官禄之宫不可容、彐、星尊重多丰禄、紫气添成衣食足：只宜兴旺不宜裒、为人慷慨多荣富","y":["日","水","金","木","炁"]},{"b":"（全）","p":"60","t":"福德宫中或见金、夜生一世福神饮、木会太阳居十一、禄厚福优居显秩；水会月吉火浅薄、金土同照主食邑、十一宫中罗最吉、太阴日木三合值；","y":["日","月"]},{"b":"（全）","p":"60","t":"土星相貌却乌黄、木宿元来瘦且长、金白不惟多嗜欲、水星行动受趋跄：罗喉艺薄随身有、月孛为人带黑丑、荧惑一星多性恶、水星最是双眉好；","y":["水","火","土","罗","孛"]},{"b":"（全）","p":"60","t":"计都巧计爱谈论、罗火东西打杀人、水火相随多杂艺、太阴为性却逡巡；月于一生多嘴舌、水星伶俐木都美、土星顽钝言语涩、罗火为人贫可鄙","y":["月","水","土","计"]},{"b":"（全）","p":"108","t":"红鸾天喜：主婚喜事。天哭：主哭泣。披头：主孝服。看各星在十二二十八宿所造成的影响：论日：太阳乃火之精","y":["日"]},{"b":"（全）","p":"108","t":"为人君之象。行度有盈缩。故明历者以七十余年。立岁差之法。以追日度之真。太阳过宫不同","y":["日"]},{"b":"（全）","p":"108","t":"或与水木相会合。文章卓荦动乾坤。金星同位好婚姻。财家财物送来频。夜见土星昼见火","y":["金","土"]},{"b":"（全）","p":"108","t":"须防病患及尊亲。首尾更来须恶死。紫气缁流及道门。忽有孛星相邂逅。疗痨说出病根源","y":["炁"]},{"b":"（全）","p":"109","t":"木度：主贵达，平生多福，合仕本乡官，多见金帛，晚年主富日木同宫贵显臣、半生多福少灾祸、木星是主兼乘旺、必作当朝上贵人火度：主作事清直，有福，性直不顾危亡，多历四处游荡","y":["木"]},{"b":"（全）","p":"110","t":"日水相逢庆瑞盈、欣逢水日贺升平、人生值此人中瑞、问世奇材播大名。度：太阳紫气喜相逢、润泽生民稼桩丰、百六会时祥瑞应、人生会此必三公","y":["日","炁"]},{"b":"（全）","p":"110","t":"孛度：目孛同宫最不佳、只宜为族不为家、生逢白昼多灾疾、夜则康宁无叹喳。罗度：太阳正照被罗侵、火暴他乡丿L没亲、先代家财多破尽、奔波衣食不顺心","y":["日"]},{"b":"（全）","p":"113","t":"与星宿：三方主曜旺高强，富贵荣华声赫赫。与张宿：庆。与翼宿：若得木星同此位，定应官识守清口躔星宿号流泽，卿相当朝须得力，口躔张宿号天正，才智聪明文武并，口躔翼宿号大娄，贤德文才出智谋，官星得力善星居，禄贵兼个增吉与轸宿：目躔轸宿号天？","y":["木"]},{"b":"（全）","p":"113","t":"，年少功名自鼎来，端洁为人须大量，定须九棘与三槐。日入本命宫：太阳临命性融和、衣禄贏余祸散磨、东出寿长西没减、半生劳碌少年过","y":["日"]},{"b":"（全）","p":"113","t":"太阳在命九品迁、小人富贵足田庄、三合近强看紫气、陷没沉居事不个。太阳原是火之精、躔度偏宜金水星、若在命宫官禄上、平生天下有才名","y":["日","水","炁"]},{"b":"（全）","p":"113","t":"日居财帛要阳宫、画生为福夜为凶、只忧计都来相克、财帛尤闲寿贝才，0吕'：不中。兄弟宫：弟兄有若雁同行、岂使三宫陷太阳、虽是同胞如手足、分张名目置田庄","y":["日","计"]},{"b":"（全）","p":"113","t":"田宅宫：田宅宫中有太阳、须知安位最高强、膏腴万顷连阡陌、荣祖荣宗福祢吕。男女宫：太阳独行了难当、破损头男儿受殃、若有吉星来辅佐、二男异囗贵奴仆宫：奴仆之宫号陷方、照临君父岂为良、纵饶父体常清健、亦恐身年寿早伤","y":["日"]},{"b":"（全）","p":"113","t":"妻妾宫：太阳临照在妻宫、在望尊严德贵崇、莫使忌星兴悖逆、婚姻皇族也平中。疾厄宫：太阳来到八宫停、身体康荣福自生、设使忌星多犯克、反伤眠目不光明","y":["日"]},{"b":"（全）","p":"114","t":"迁移宫：第九宫中遇太阳、更无凶曜在其傍、好将平日胸中学、对策天庭谒帝王。官禄宫：太阳若在十宫居、抱负宏才仰大儒、或有水金相辅佐、官高职重掌机枢","y":["日"]},{"b":"（全）","p":"114","t":"福德宫：太阳临福遇吉星、更添命主必官清、若有吉星来辅卫、必然享福寿遐龄。相貌宫：相貌宫中名恶弱、吉星拱临合虚着、惟怕罗计月孛星、喜与太阳相倚约","y":["日","孛"]},{"b":"（全）","p":"114","t":"日入子宫：天官本是太阳星、遇夜生人却有情、若在口生光太味、禄高到底总无太阳本是日华星、昼夜循环不暂停、若是日生多福禄、夜生终不免灾厄","y":["日"]},{"b":"（全）","p":"114","t":"入丑宫：太阳居丑号天幽、此位原来属斗牛、若是照临官禄地、管教一世尽优游。太阳年有三百六、催促光阴如迅速、晦朔惟忌计罗侵、夜生之人须减福","y":["日"]},{"b":"（全）","p":"114","t":"入寅宫：日居人马刂天桑、光照东升遍万方、禄厚福高名必显、也应补衮坐朝堂太阳始出拂扶桑、身命加临近帝王、福禄官宫居极品、若临五弱亦寻常入卯宫：太阳出卯曰天乌、禀性明英大丈夫、多艺多才非俗士、一生荣显禄盈余","y":["日"]},{"b":"（全）","p":"115","t":"腾光离位号朱明、囗出乾坤万象清、此是太阳真庙旺、七强宫内保光亨。入未宫：太阳临未刂天辉、日月交光世所希、设若太阴无落陷、君臣庆会管枢机","y":["日","月"]},{"b":"（全）","p":"115","t":"曜灵侵入太阴宫、错乱阴阳理不同、性硬气刚须怕妇、妻强夫弱挫英雄。入申宫：天賠元来属在申、太阳到此晦光明、若还诞昼逢此曜、作事须教百不成太阳五月至于申、位属三阴一气阳、此是东君为失位、七强宫得也为殃","y":["日","月"]},{"b":"（全）","p":"115","t":"入酉宫：阳到金牛号九空、夜生虽大却亨通、日生用事俱无力、若变刑因不善终：太阳东出没于西、喜逢吉曜会咸池、岁星若得来临照、福寿荣华晚更宜","y":["日","木"]},{"b":"（全）","p":"115","t":"入戍宫：目临戍位口天枢、此地元来是旺居、更得太阴相会照、一生荣贵福盈余。太阳戍地日归藏、入庙君臣佐玉堂、四正宫中并八煞、一生富贵寿延长","y":["日","月"]},{"b":"（全）","p":"115","t":"入亥宫：太阳光照烁天门、玉玺为名象属君、倘若化为官禄曜、少年平步立功勋。亥上朝天诸位拱、六阴之位来相并、玉玺为名象属君、子孝臣忠福禄盛","y":["日"]},{"b":"（全）","p":"115","t":"论月：太阴乃水精。为人臣之象。行度有平迟疾。自娄宿八度。至十三度为正庙。有一家以毕初度至九度为正庙","y":["月"]},{"b":"（全）","p":"115","t":"自胃宿七度至十三度为次旺。躔危心张毕四宿。巨蟹为本宫。如会金木水星。临于身命二宫","y":["水"]},{"b":"（全）","p":"115","t":"或为堂禄星。更在庙旺宫主贵。忌火土罗计同宫。囗生人为背宿。夜生人为向明。太阴乃是水之精","y":["月"]},{"b":"（全）","p":"115","t":"计罗眼目史无品。金好色妻必淫。不贤内正非礼迎。太乙若逢须庶出。紫气阿母会通僧。居财帛阴贵成","y":["炁"]},{"b":"（全）","p":"118","t":"与胃宿：月躔胃宿号天印，十度之中贵无并，卩口。但得对宫逢吉曜，文章得地应儒君子逢之须得禄，小人遇此走西性直温良少苦辛，纔过中年便安文章冠世早登荣，迁官必定居廊衣食丰盈仓库实，声名闾里自揄为人玷污多巧计，图画机关行不更得木星同位立，直须秦对近天若遇蚀神兼月孛，主须生长在寒要得吉得居十位，定应台辅佐君君子迁官居禄显，小人衣食旺庄更兼金木又同行，金榜题名官一","y":["木","孛"]},{"b":"（全）","p":"119","t":"聪明才貌超今古，异口须为给谏更得金星来照助，少年及第占魁贤淑生来形貌美，此身自在不胜富足慈仁心好善，贵人和色对天爱说是非心不定，文章必定是虚得力相生官位吉，公卿要路上金聪俊文词人最重，声名扬赫帝王贪悭财物行无良，性急多嗔有灾形貌端方荣贵早，晚年又见福坚骨肉分离难保守，又知寿天是元少年辛出老丰隆，赫奕声名传万","y":["金"]},{"b":"（全）","p":"120","t":"照命分明有太阴、生来财禄不劳寻、凶神若也来相犯、到老无成枉用心。财帛宫：月居财帛福为深、更加庙旺足珠金、食神若也相兼照、纵有家赀祸更侵","y":["月"]},{"b":"（全）","p":"120","t":"兄弟宫：兄弟亲善如手足、若值太阴大为福、只恐女多并异胞、南北分居难并屋。田宅宫：太阴田宅若相逢、自立荣华万事通、阴贵又增招满益、迁移三处振家风","y":["月"]},{"b":"（全）","p":"120","t":"妻妾宫：太阴西没最为佳、明静之宫无点瑕、史若尊星相对望、必生贵子佐皇家。疾厄宫：太阴临照八宫存、毕世灾危杳不闻、忌曜莫交同此位、双眸浑似月遮云","y":["月"]},{"b":"（全）","p":"120","t":"迁移宫：太阴得在九宫中、三合力卩临照命同、偏利迁移商贾客、必因阴贵得财丰。官禄宫：太阴官禄作身宫、朗朗光华福倍隆、更在庙方功愈重、贵因皇戚得侯封","y":["月"]},{"b":"（全）","p":"120","t":"福德宫：阴耦来临福德宫、雍容道德贵尊崇、更有吉星来本位、为官须坐玉堂中。相貌宫：相貌宫中有太阴、命中吉曜喜相侵、忽然忌曜来相犯、甘旨空持养母心","y":["月"]},{"b":"（全）","p":"121","t":"太阴子上为天后、女贵男荣尽主权、多缺多盈逢望晦、三宫得此母长年。入丑宫：太阴居丑曰天机、挂影扶权耀素辉、巳癸出人如得此、官高禄厚更荣阊","y":["月"]},{"b":"（全）","p":"121","t":"太阴元来水之母、丑是瑶池佐君父，遇望英明至下弦、女则金冠男台辅。入寅宫：太阴寅上名天味、迫日生人光太晦、在望如逢计火侵、为人秽浊还多退","y":["月"]},{"b":"（全）","p":"121","t":"阳明寅上晓星临、日出扶桑溺太阴、遇夜生人尤减福、日生漉漉乏资金。入卯宫：月临卯上号天琮、与日相逢最吉通、嫌怕计都同此地、夜生反吉变为凶","y":["月","计"]},{"b":"（全）","p":"121","t":"月宫杜影仰扶疏、对照西华毕月乌、二十八宿皆仰月、周回万里没差殊。入辰宫：太阴辰位口天璇、金若同宫瑞自然、更得孛星相会照、为官为福又长年","y":["月"]},{"b":"（全）","p":"121","t":"辰中始晦月无光、对望宫中怕太阳、火上计罗临照视、英雄难保少年郎。入巳宫：数当阳极渐阴生、玉鹿天星月化成、珠玉不特多积蓄、更兼宫显有声名","y":["日"]},{"b":"（全）","p":"121","t":"阳每极时阴未至、月临双女荡非常、女逢忌曜多淫荡、男是贪花卧酒乡。入午宫：离宫逢月另天衣、此位朝居倍有辉、设若太阳同此位、身荣衣锦故乡归","y":["日"]},{"b":"（全）","p":"121","t":"月内金乌躔柳宿、正临离位失其明、夜生朝北身荣贵、身近加王雨露恩。入未宫：太阴在未号天圭、千载欣逢明圣时、月孛史来同会照、蟾宫折取最高枝","y":["月","孛"]},{"b":"（全）","p":"121","t":"井鬼宫中月喜躔、未中玉魄寿长延、女人吧号身长贵、四正宫逢禄位迁。入申宫：太阴普分曰天潢、与水同居福禄吕、纵有孛星相照破、必须荣贵福而康","y":["月"]},{"b":"（全）","p":"121","t":"宫属阴阳遇太阴、不宜觜宿只宜参、参是水猿猿笑月、一生才学贵人饮","y":["月"]},{"b":"（全）","p":"122","t":"入酉宫：天柱之星属太阴、喜居酉位福原深、夜生管取多祥泰、一世优游祸不侵。月到金牛号玉枢、少年必定饱诗书、三方尽在高强位、一世优游在帝都","y":["月"]},{"b":"（全）","p":"122","t":"入戊宫：月临戊上名天辅、喜到奎娄为妙度、玉兔扬辉倍有情、禹门快跃朝天步。太阴元后戊归期、总领群星上玉霄、只怕日生逢首尾、为官晚景却蕖条","y":["月"]},{"b":"（全）","p":"122","t":"入亥宫：天晔变化太阴星、散彩中宵分外明、吉宿同宫宜贵显、少年及第播清名。双鱼执玺太阴星、月到中天分外明、忌曜不侵须富贵、水金相照有佳声","y":["月"]},{"b":"（全）","p":"122","t":"论木星：木星东方岁星。行度有晨夕伏退留顺迟疾。自井二十九。至三十度为向旺。自鬼初至三度为正旺","y":["木"]},{"b":"（全）","p":"122","t":"六戊人为因星。然其星性本善。不可便以因论。六丙人为禄主星。木星守命好容貌。眉目分明世所希","y":["木"]},{"b":"（全）","p":"122","t":"紫气同宫笔吏司。三合遇之为福厚。对宫犹是好基。太阳会合文章贵。女后同宫贵位推。更逢土宿主旌旗","y":["日","炁"]},{"b":"（全）","p":"122","t":"忌星若来须减力。金同文武佐明时。惟有水星科甲贵。性慵太乙懒施为。孛同何以独居之","y":["水"]},{"b":"（全）","p":"122","t":"十二位中为相貌。岁星躔此貌偏奇。前言叙尽神仙术。后学尤宜仔细推","y":["木"]},{"b":"（全）","p":"125","t":"逢危自脱灾、声名终有遇、衣禄晚年来。木星入命最为奇、间世文章众所知、三主官星俱不背、他时身到风凰池","y":["木"]},{"b":"（全）","p":"125","t":"财帛宫：木星好庙更临财、一世荣华少有灾、更得善星居上下、虽然运蹇福还来。兄弟宫：兄弟宫中木照时、吉星遇着甚相宜、假饶雁序恩情断、只死中间恶曜随","y":["木"]},{"b":"（全）","p":"125","t":"田宅宫：木星得入四宫中、可见无灾喜庆重、田宅吕荣须守祖、不逢破败福丰隆","y":["木"]},{"b":"（全）","p":"126","t":"男女宫：木星子位主三人、吉宿同宫产俊英、凶嚯若来相克陷、恐忧初子损其身。奴仆：第六宫中如见木、决主一生无寸禄、只因吉曜在闲宫、总有衣食妻无福","y":["木"]},{"b":"（全）","p":"126","t":"妻妾宫：第七宫中木宿游、聪明典雅各祥休、史饶娶得高贤妇、偕老同心到白头。疾厄宫：木星解散照其宫、且免平生患难凶、财禄更招多润泽、堂堂人品赛终童","y":["木"]},{"b":"（全）","p":"126","t":"迁移宫：木星得地九宫存、三方傍照命宫门、更得高高明健处、荣迁真得贵人尊。官禄宫：第十宫中见木星、平生衣禄享生成、文章华丽人皆仰、甲第高登位九卿","y":["木"]},{"b":"（全）","p":"126","t":"福德宫：木星一曜最尊崇、下照当生福德宫、经史优游多博学、不劳步至三公。相貌宫：木宿如临相貌宫、清奇古怪好相逢、闻诗闻礼多贤雅、不作郎官作相公","y":["木"]},{"b":"（全）","p":"126","t":"\\木入子宫：地劫为名最不情、木星到此打齐瓶、化为吉曜犹无害、若变凶星不得生。木星子位号栏干、命若逢之见福难、首尾同宫并火孛、厨无禄食尽天年","y":["木"]},{"b":"（全）","p":"126","t":"入寅宫：木星寅位曰天渊、偏爱逢生乐自然、甲丙生人如值此、尽教福禄庆双个。木居人马禄存星、七强宫喜立鸿名、更得贵人逢禄马、三垣满用佐朝廷","y":["木"]},{"b":"（全）","p":"127","t":"入辰宫：木到辰宫号玉龙、与金同位最亨通、丙午之命如逢此、名显官高禄更丰。岁星辰上号青龙、四正宫中爵禄崇、太白相逢官品极、不读诗书也荫封","y":["金","木"]},{"b":"（全）","p":"127","t":"入午宫：岁星午上刂天德、一世优游无否塞、更得太阳相会行、家财倍万珍珠积。三河周分木为乖、身命遭逢百祸来、三限若教一限到、须主性命到泉台","y":["日","木"]},{"b":"（全）","p":"127","t":"入申宫：木居申上号天鸾、莫作寻常俗命看、男子逢之应紫绶、女人遇此带金冠。木星天贵喜临身、身命同行作辅臣、囗月火金并水土、此为七煞立功勋","y":["木"]},{"b":"（全）","p":"127","t":"入酉宫：木居酉上号天因、徒配刑流出远州、若遇火星同到此、少年暴卒命难留。木星西向刂天伤、火计相侵入天亡、为道为僧身不了、为商为贾路中丧；","y":["火","木"]},{"b":"（全）","p":"127","t":"入戊宫：木为鼓舞少年孤、男克妻兮女克夫、广览诗书并艺术、飘蓬四海作生图。戊为献舞少年孤、男犯休妻女克夫、若见太阳并火曜、终身却有贵人扶","y":["日"]},{"b":"（全）","p":"128","t":"龙德木曜受双鱼、顺则为官逆则儒、祖业丰隆无损坏、子孙代代习诗书。论火星：火星南方","y":["火"]},{"b":"（全）","p":"128","t":"主人凶暴天促。与木同宫则吉。女人为夫星。六丙人为因星。六甲生人为天禄。荧惑之星本目余","y":["火"]},{"b":"（全）","p":"128","t":"博弄经纪及宰屠。爹娘早死莫嗟吁。木来俱各文兼武。上主英雄乱世徒。若会金星淫更佚","y":["金"]},{"b":"（全）","p":"128","t":"招妻产难定呜呼。若逢计宿更遭诛。天首武臣高贵位。如临紫引巾巫。三宫兄弟主流徒。四位祖居多破荡","y":["罗"]},{"b":"（全）","p":"131","t":"与鬼宿：火躔鬼宿刂天祥，家富因何乏子郎，与柳宿：火躔柳宿刂天池，多虑多疑多是非，更得木星来资助，定须学馆作文伶仃孤苦万千般，晚景稍可身安勇义智高才学美，威名应许达皇恩德又施兼有道，渊源学向翰林中间困苦又艰难，奔走东西漫劳贪酒多淫心不足，到头衣食亦无破荡家赀游冶客，资财耗尽走东浮泛自然家业破，奔驰晚岁始身工巧细心兼有志，做些阴骘与儿衣食半半人命蹇，晚年方始见亨只怨天年多天折，不然恶死没家？","y":["木"]},{"b":"（全）","p":"132","t":"成家未及终、若能行顺旺、仅重禄财丰。身命宫中遇火星、此人燥急性聪明、平生喜怒真难测、凡事须教立便成","y":["火"]},{"b":"（全）","p":"132","t":"疾厄宫：火星八位忧血难、灾来非命祸难禁、腰驼背曲缺唇齿、恶杀不临厄减轻","y":["火"]},{"b":"（全）","p":"133","t":"迁移宫：火星照位入迁移、迁变东西主产移、家舍亦须防火厄、末年有屋可安居。官禄宫：火星凶焰入官宫、仕列铨曹少始终、若是变为官禄主、会看附风与攀龙","y":["火"]},{"b":"（全）","p":"133","t":"福德宫：荧惑来临福德、夜生庙旺福丰隆、若值昼生逢水克、定须破败受贫力。相貌宫：火居相貌性刚强、惹祸兴灾果异常、若得吉神来救助、逢人礼貌把名彰","y":["火"]},{"b":"（全）","p":"133","t":"入丑宫：火星牛斗名黄道、为福为祥诚是好、那更上星相会行、夫妻保守期偕老。天驿之星为荧惑、此曜偏宜会磨蝎、更加土宿此宫来、富贵功名凭口舌","y":["火"]},{"b":"（全）","p":"133","t":"入寅宫：火居人马号天升、起处逢生福倍增、更得木星同会此、多才多艺又多能。天星寅位火星临、官位长生秀气兼、不值恶星侵本位、重金重盖爵重添、、0入卯宫：火到卯宫名天乙、货财充足库箱实、若还满用入垣宫、年少成名登杜籍","y":["火","木"]},{"b":"（全）","p":"133","t":"天辅贵星临卯位、蝎宫最喜火来临、禄无失陷身荣贵、名播清声入翰林。入辰宫：天滞居辰是火星、一生用事百无成、若还金帘来相会、不天须当犯国亢休宜火来临、畏逢首尾孛相侵、身命遭逢无吉曜、犯刑恶死少光阴","y":["火"]},{"b":"（全）","p":"134","t":"入午宫：火居午位名大赫、此位朝君无战克、不为利禄自充盈、必定为官居显职。火星狮子号天雷、正直无私福禄来、若望太阳人悖逆、史逢四正子孙乖","y":["日","火"]},{"b":"（全）","p":"134","t":"入未宫：天瘀火星居巨蟹、只愁天丧深为害、不然多难又多灾、纵有资财多破坏。四五七宫并第十、名为天友定应孤、若非父母隔绝早、往往偏房寄外居","y":["火"]},{"b":"（全）","p":"134","t":"入酉宫：火在酉宫名黑道、纵云夜诞非为好、恶星不照吉星临、方可荣华并寿考。酉宫荧惑最为凶、不问七强五弱宫、若得吉星傍临照、也须辛苦受贫穷","y":["火"]},{"b":"（全）","p":"134","t":"入戊宫：天轨火星守白羊、一生享福吉非常、财十禄厚无虚耗、中主荣华冕更吕。白羊天庙最为奇、祸则消除福则随、寅午命宫逢吉曜、少年平步上云梯","y":["火"]},{"b":"（全）","p":"134","t":"论土星：土星中央镇星。行度有晨夕伏退留顺疾迟。在磨羯为本宫。自斗宿十度。至二十一度为正庙","y":["土"]},{"b":"（全）","p":"135","t":"太阴母位不坚牢。若在下弦目障翳。木来必定主文章。火会远行千里余。水星忌与刑同类","y":["月","水"]},{"b":"（全）","p":"139","t":"土星居命主心痴、若有文章发更迟、更会木星并水宿、此生衣食欠精微。财帛宫：土星财帛最堪嘉、水曜同临反破家、身命吉星须细算、阳宫囗月问荣华","y":["木","土"]},{"b":"（全）","p":"139","t":"兄弟宫：土临兄弟五人同、得他之力福重重、恐招异姓为兄弟、四海相逢也是空。田宅宫：土星尊位为阳德、高占强宫为福泽、或在当生四杀中、起祸生灾岂能火","y":["土"]},{"b":"（全）","p":"139","t":"男女宫：土星五位在阳宫、五个男丿L尽送终、孛忽来相犯着是、男孙疾患半成空。奴仆宫：奴仆宫中见土星、万般谋运一无成、不如释道归林教、高卧云中有大名","y":["土"]},{"b":"（全）","p":"139","t":"官禄宫：土星官禄占高强、凶恶威严不可当、若在庙方为禄主、桓圭端冕侍君王。福德宫：土星福德照临时、若处生方始见奇、沙漠扬威名国辅、英声传播镇华夷","y":["土"]},{"b":"（全）","p":"139","t":"相貌宫：土星凶炽不堪闻、限弱身裒主祸逇、不是年来罗盖网、须愁狂疾不完身。土入子宫：土居齐分号天元、寿算绵长福禄个、第七宫中如值此、荣妻益子福绵土星子位是天厨、福德妻宫庆有余、子息命宫官禄位、逢之禄秩达天徜","y":["土"]},{"b":"（全）","p":"140","t":"入卯宫：土居卯位刂天冲、与火相逢亦庆隆、只恐六壬人值此、遭刑受害命须终。卯宫镇星号天梁、足有资财旺此方、旌表门闾官极品、丿L孙代代出朝郎","y":["土"]},{"b":"（全）","p":"140","t":"入巳宫：土居双女非为吉、本主逢之怎奈何、史逢吉宿也多灾、若不遭刑须天折。土星巳上无依倚、纵使吉星多不利、囗生人病没资财、夜遇终归须自缢","y":["土"]},{"b":"（全）","p":"140","t":"入午宫：天道元来是土星、太阴会此倍精神、纵云夜诞仍为福、囗里生人大贵荣。玉堂吉星位南离、主性温柔喜礼仪、黄阁驰名金紫贵、光辉家族显妻儿","y":["月","土"]},{"b":"（全）","p":"140","t":"入未宫：上入未宫名四镇、福多禄厚家十盛、太阴若也与同行、不是望宵终有庆。天相镇星未中央、性好清闲本善良、若见孛星金助月、功名显赫佐朝堂入申宫：申宫上号福生星、本主同乡禄自成、史有官星相会聚、名彰声显贵还荣","y":["月","土"]},{"b":"（全）","p":"141","t":"入戌宫：土居戊位号天关、一世优游得自闲、只恐水星相会遇、终身不免受艰难。白羊宫分是天将、喜囗相逢会太阳、囗土同宫身必贵、更加天寿得延年","y":["日","水"]},{"b":"（全）","p":"141","t":"论金星：金星西方。太白将军之象。行度有晨夕伏见。天秤为本宫。自亢宿五度。至九度正庙","y":["金"]},{"b":"（全）","p":"141","t":"更在庙旺之宫。主文章秀丽。男则美丽堂堂。女则轻盈娇媚。在七强则福禄称情。男子以金星为妻星","y":["金"]},{"b":"（全）","p":"141","t":"金星洁静好颜容。秀目眉白又红。身短不长声响亮。好耽音律习商宫。结交朋友久而恭。不奈是非长悯念","y":["金"]},{"b":"（全）","p":"141","t":"更于金铁巧冶工。临身自有将军势。照命兵权越是雄。因妻荣达不曾空。太阳遇贵人提挈","y":["日"]},{"b":"（全）","p":"142","t":"土星同宫，则为事不正，下贱之人。是主星，夜生有位，昼生有财，有福能掌财，贵人见重：非土星，微有福矣","y":["土"]},{"b":"（全）","p":"145","t":"与星宿：金躔星宿刂天荧，理义精通学冠？，更若火星来会此，是非酒色不堪闻。与张宿：金躔张宿刂天肠，财物多贪行不良，与翼宿：金躔翼宿刂天英，学问文章显大名，生","y":["火"]},{"b":"（全）","p":"145","t":"男儿晚岁牢、初年多偃蹇、成败屡经遭。金星吉曜最为佳、华丽文章世所夸、莫使当年凶忌犯、婚姻贵族福无涯","y":["金"]},{"b":"（全）","p":"145","t":"财帛宫：金居财帛喜为深、女禄多招众所饮、火孛只忧来克犯、中年惟恐早灰心。兄弟宫：第三宫内见金星、义断分金手足情、虽是雁行同气者、反成背面不相亲","y":["金"]},{"b":"（全）","p":"145","t":"田宅宫：金星吉曜成奇局、田宅逢之主厚福、上下加临不见刑、一世安荣自丰足。男女宫：金星第五别为奇、子息当推有四丿L、莫使同宫逢火克、荣宗糶祖不须疑","y":["金"]},{"b":"（全）","p":"145","t":"奴仆宫：金星奴仆限宫时、年少还须克少妻、又主交朋与亲戚、直饶面是背成妻妾宫：金星本是号妻星、要在高强庙旺行、夫妇共荣多福兆、若逢火克又遭刑","y":["金"]},{"b":"（全）","p":"146","t":"迁移宫：金星得地照迁移、调任荣迁福自宜、若更命无凶曜照、仰观平地上云梯。官禄宫：官禄宫中太白星、照临方地产豪英、若为禄主居强位、文武双个佐圣福德宫：金居福德最称奇、德照高门长贵儿、冠世英雄摅锦绣、禹门一跃过天池","y":["金"]},{"b":"（全）","p":"146","t":"相貌宫：金星相貌并西邻、一部髭须胡口人、若遇贵人相接引、定为胥吏处公庭。金入子宫：太白之星到宝瓶、名为玉辂福非轻、内丁之命如逢此、不特长生更富坎宫白兽怕逢金、火于加临祸最深、若见水星怕月助、一生方得免呻吟入丑宫：金来丑上名天库、多玉多金难计数、少年锐志在功名、声誉播扬人所慕","y":["水","金"]},{"b":"（全）","p":"146","t":"天廪之星到斗牛、资财足禄广田畴、丿L孙贵显家门盛、自有声名播九州岛。入寅宫：金星人马号头、破荡家财往外州、须是强宫多吉宿、方能救助不为忧","y":["金"]},{"b":"（全）","p":"146","t":"岱岳峰前金绝体、纵逢吉曜也顽愚、悭贪鄙吝无高下、女作娼兮男匹夫。入卯宫：金星卯上名天败、起处逢伤人不奈、年少应须克六亲、奔波漂荡多灾害","y":["金"]},{"b":"（全）","p":"147","t":"太白金星主大权、喜临楚分息尘烟、出则将兮入则相、三分足用喜骈骈。入午宫：金星变曜曰天肠、入到离宫大吉祥、为子孝廉臣尽节、直须簪冕佐君王","y":["金"]},{"b":"（全）","p":"147","t":"天阳喜遇太阳宫、西地朝南臣尽忠、人子孝廉存礼节、更加的禄自重重。入未宫：金居巨蟹曰天仓、与水同宫福禄吕、若是丙丁人值此、官高位显寿延金星右弼最为良、四正宫中及学堂、只忌六宫并十二、文章纵有也荒唐","y":["日","金"]},{"b":"（全）","p":"147","t":"入申宫：太白临申．号玉堂、庚辛人见旺金乡、若罗火同居于此、须信生平福炽吕。金临申上弓天辰、顺利官超逆则贫、若在十宫为福利、如临五弱反为逆","y":["金"]},{"b":"（全）","p":"147","t":"入亥宫：金临亥位刂天寿、但管一生长富有、天算绵延无绝期、怕逢荧惑反为咎。景星到亥四方明、室璧加临禄有情、君宠臣兮臣尽职、莫愁官禄不升腾","y":["火"]},{"b":"（全）","p":"147","t":"论水星：水辰北方辰星。双女为本宫。自翼宿八度。至十三度为正庙。阴阳宫参角为乐。躔箕参壁轸四宿为升殿","y":["水"]},{"b":"（全）","p":"148","t":"近阴附阴为善庆。大忌火土罗计出没。六壬生人为因星。六庚生人为天禄。辰星快利有文章","y":["水"]},{"b":"（全）","p":"152","t":"水入本命宫：见水星临、文术多智能、外财应有遇、引荐人相承、庙旺迁官职。余宫道合僧、相貌同豪贵、资财晚岁兴","y":["水"]},{"b":"（全）","p":"152","t":"水德星辰在命宫、得逢旺处便攀龙、聪明智识多机变、生在荣华富贵中。财帛宫：水星乘旺莫临财、进退难逃反起灾、手艺一生方可用、凡人财散亦难来","y":["水"]},{"b":"（全）","p":"152","t":"兄弟宫：水星吉曜遇还稀、来临三宫便不宜、上有亲兄下有弟、两头无义便侵欺。田宅宫：善星一曜是辰星、得入强宫福转精、不见三年刑忌照、便须万顷与千男女宫：水星高照子孙位、俊迈文章为国瑞、水数推来只一男、振起家风日荣贵","y":["水"]},{"b":"（全）","p":"152","t":"奴仆宫：辰星莫入六宫中、冠世文章用处空、纵使南宫高甲过、栖迟薄禄走西妻妾宫：水到妻宫对照命、富贵贞贤人难并、忽然恶杀又相侵、心滥情淫性无定疾厄宫：第八宫中水德临、温柔情性足人饮、忌星凶曜来侵犯、沉溺波涛坠井深迁移宫：水星合照最为珍、更当生命位星、宾主和同无恶犯、迁移出处总欢宁","y":["水"]},{"b":"（全）","p":"152","t":"官禄宫：水星偏喜照官宫、出类超群福自隆、委任股肱扶宝祚、官居咼品贵尊福德宫：十一宫中水德来、汪洋智识仰贤才、公严德厚人钦重、泽被生民遍九垓","y":["水"]},{"b":"（全）","p":"152","t":"相貌宫：水星相貌最为强、凛凛清风在庙廊、若遇吉星无恶曜、容颜端正动君王","y":["水"]},{"b":"（全）","p":"153","t":"入丑宫：水居丑位号晨门、朝斗分明主势尊、若不变为刑暗耗、少年及第立殊勋。水星丑地为沉晦、疾厄迁移溺水津、妻妾主逢妻不洁、男为谘贼女风尘","y":["水"]},{"b":"（全）","p":"153","t":"入寅宫：水临寅上名天懿、管取一生无阻滞、设若木星会合时、不惟利禄名兼遂。寅宫渗漏水为凶、六宫疾病命相呼、对照傍临无吉曜、一生辛苦受贫穷","y":["木"]},{"b":"（全）","p":"153","t":"入辰宫：辰宫得水号琴堂、太白同行福倍吕、人命逢之多吉泰、少年显达把名扬。角亢辰星号金龙、更加金水喜重重、堂四正无凶煞、驰誉蜚声翰苑中","y":["水","金"]},{"b":"（全）","p":"153","t":"入巳宫：水来巳上号荣名、乐庙之宫万事亨、若得金星同会此、黑头早着翰林巳宫玉女最为良、更得金星佐国王、男丿L得此官荣显、女人逢此有冠裳","y":["金"]},{"b":"（全）","p":"154","t":"入酉宫：绝禄元来是水星、嫌居酉位不安宁、生来用事多违滞、纵有家财也替凌。水星失偶到金牛、两取三婚尚未休、女子若逢三度嫁、不然离祖在他州","y":["水"]},{"b":"（全）","p":"154","t":"入戊宫：水在白羊号伏尸、一生滞主灾危、虽逢吉曜相扶助、便得成名且亦迟。天刚白羊男女怕、切虑大限损天年、史逢月孛同宫度、定遭刑狱及颠狂","y":["孛"]},{"b":"（全）","p":"154","t":"讠匕力：天乙紫气。以木德最厚。立此名以追步。其余光用之。其行度供伏见迟疾退留。自奎宿十一度","y":["炁"]},{"b":"（全）","p":"154","t":"又为文人解宿。为人豁达之操。对照则为福德。但癸人见之减力。六辛人为天禄。紫气众星中最善","y":["炁"]},{"b":"（全）","p":"154","t":"举措始始为慵更懒。太阳近贵作闲人。月会母亲先化幻。夜火同时医与巫。土木更来尤懒慢","y":["日"]},{"b":"（全）","p":"154","t":"金同妻妾是娼妮。水会智能称俊彦。彗星分得贼人财。天凸僧尼讼争战。天尾星同有机变","y":["计"]},{"b":"（全）","p":"157","t":"紫气临宫学冠伦、如为忌曜号孤神、虽不是天庭客、也作禅门第一人财帛宫：紫气木星虽吉曜、第二宫中不为妙、克己待人是此星、宫主强时财可彀","y":["木","炁"]},{"b":"（全）","p":"157","t":"兄弟宫：紫气来临兄弟时、孤星却主两分离、虽然暂且同相聚、反目无情各所田宅宫：当生紫气四宫行、福荫双亲保寿龄、看取耆年精力健、都缘强位老人星","y":["炁"]},{"b":"（全）","p":"157","t":"男女宫：紫星来照子孙宫、颖悟聪明史美容、迈祖超宗荣贵显、家门吕盛福无穷。奴仆宫：仆宫紫气两同行、落陷孤高总欠情、奴仆成行难保住、自家炊爨自家亲","y":["炁"]},{"b":"（全）","p":"157","t":"妻妾宫：七宫妻妾紫相逢、必主当年有克凶、若在命中及官禄、方袍员顶或孤从。疾厄宫：解灾脱难最高强、紫气生平免祸殃、道德目彰君子泰、超群发秀寿延长","y":["炁"]},{"b":"（全）","p":"157","t":"迁移宫：第九宫中有寿星、堂眉宇美精神、岂知天上清高秀、下照尘寰有道官禄宫：紫衣师道九流人、官禄宫中紫气辰、若是孤高兄弟散、在他清贵作高福德宫：俊雅超群紫气星、来居福德福频频、必然显达应三主、若是为官在大臣","y":["炁"]},{"b":"（全）","p":"157","t":"相貌宫：相貌宫中紫气临、精神消洒福原深、如何晚景身康健、寿宿当年在此任。入子宫：紫气齐瓶号天清、只宜恬淡养精神、命宫遇者伤妻子、散诞清闲僧道人紫气．号紫宸、吉同临作轴臣、孤寡空亡闲极位、僧道孤虚技术人","y":["炁"]},{"b":"（全）","p":"158","t":"入卯宫：星在卯号大空、克害妻儿年少终、不是僧尼并艺术、一生孤独更飘蓬天枢昴位星临、此嚯逢之福且平、但要木星诸吉曜、同临此位福高人入辰宫：华盖从知在辰、此星虽独却堪亲、优游享物无灾咎、啖柏沧松物外人紫文星若到辰、驰名地库自丰荣、再遇木名垣局内、文章学问更聪明","y":["木"]},{"b":"（全）","p":"158","t":"入巳宫：居双女号大相、家积珠珍主富藏、福厚清闲并寿永、只愁妻子见刑伤。天乙星临双女躔、初年孤滞晚安然、更得木星同合照、一生常近帝王前","y":["木"]},{"b":"（全）","p":"158","t":"入午宫：紫气临周号玉肌、人生逢此诚为美、太阳设若同宫分、富贵荣华世无比。紫天喜临于午、此号天津必有涯、富贵一身人莫及、子孙荣满禄尤遐","y":["日","炁"]},{"b":"（全）","p":"158","t":"入酉宫：紫金牛号风凰、一生享福最安康、文章锦绣安天下、若占高强入庙堂酉宫大乙号天昱、庙地行为上达人、更得金星来助月、高强必主寿长春","y":["金"]},{"b":"（全）","p":"158","t":"入亥宫：亥官紫气名天贵、禀性清闲无所累、土木那堪会舍行、少年显达功名遂。大曜双鱼天解中、一生谋运足亨通、更兼忌曜纵横见、若不相残即系梁","y":["炁"]},{"b":"（全）","p":"159","t":"论月于．太乙月于。古人以水星在天。为福为祸最多。立此名以推步。其余光用之有验。其行度无伏见犀疾","y":["水"]},{"b":"（全）","p":"159","t":"男为巫术女为尼。水到穿窬入楼阁。土火乱世号英雄。紫气更能修合药。天尾法场世抛。兄弟奴宫难检约","y":["计","炁"]},{"b":"（全）","p":"162","t":"孛入本命宫：月孛照人命、初年灾破频、机术心自有、权谋术数精、早年防反复。中岁立方成、夜生阴位照、财禄有声名","y":["孛"]},{"b":"（全）","p":"162","t":"月孛须知是恶星、逢之祸患卒难行、若还入庙宫中者、必定前程有大成。财帛宫：孛照财宫真可畏、须防人赖暗为灾、限逢恶曜君须忌、吉宿临宫主横财","y":["孛"]},{"b":"（全）","p":"162","t":"兄弟宫：兄弟不宜见孛星、大小无分手足情、若有三人三路去、四人亦作四方行。田宅宫：第四宫中月孛临、定遭疫疠气相侵、忧煎失业田庄尽、到老仓箱乏寸金","y":["孛"]},{"b":"（全）","p":"163","t":"妻妾宫：望门克妇妇家贫、月孛如何史绝情、亥戊丑申未酉位、夫妻和顺定无因。疾厄宫：疾厄宫中月孛来、少年伏剑染非灾、喜事不闻年岁久、近来常听哭声．展","y":["孛"]},{"b":"（全）","p":"163","t":"迁移古：孛到迁移为恶宿、口舌阴谋被辱凌、逇厄败家他处死、路横尸凸不能兴。官禄宫：月孛光华号彗星、众星一见敛威名、庙方若作天元主、贵拥貔貅百万兵","y":["孛"]},{"b":"（全）","p":"163","t":"孛星在子名天酷、禀性凶顽还有福、遇者妻丿L有克伤、仪谋机变般般了．入子．月孛临人状似虎、子上天权巧心路、若是独行无别星、掌握仅衡至台辅","y":["孛"]},{"b":"（全）","p":"164","t":"入辰宫：辰宫月孛名天惨、太白同宫应福减、若遇水星相逐行、生来必主多刑陷。天妖辰上为凶怪、八煞迁移为六害、若非寄食别人家、庶出倚亲多此辈入巳宫：孛居巳上号孤鸾、男女逢之必寡鳏、忌曜若临须减力、吉星来照也艰难","y":["水","金","孛"]},{"b":"（全）","p":"164","t":"申宫天吉少人知、四正宫逢得者稀、戊乙庚人为上吉、名标四海福相随。入酉宫：孛到酉宫名活曜、不常喜怒性情拗、太阴到此与同行、灾害消兮居显要","y":["月"]},{"b":"（全）","p":"164","t":"金堂酉地喜相侵、不习诗书亦有名、自是封多福禄、锦衣闾里有家声。入戊名孛星到戌名死气、至老孤贫苦未休、身命七强如落陷、牵连官事作冤戌中月孛号天因、白发孤寡亦未休、此曜匕强如在上、官灾横祸作冤雠","y":["孛"]},{"b":"（全）","p":"165","t":"论罗星：天首罗喉。乃历家之交初。对照则曰计都。乃日交会之次。交深则有蚀。古人以日月交融","y":["罗","计"]},{"b":"（全）","p":"165","t":"凡人命限见之。其行度无伏顺留逆。罗喉阳曜利于昼。星宿三度至五度为正庙。在双女阴阳宫为正庙","y":["罗"]},{"b":"（全）","p":"165","t":"六乙人为因星。六癸人为天禄。罗喉性格最为高。形相狰狞胆气豪不奈是非无毒。日生阳位始坚牢","y":["罗"]},{"b":"（全）","p":"167","t":"害妻丿L君莫怨，平生衣食也随时与觜宿：罗躔觜宿号天申，亥命逢之是喜神，与参宿：罗躔参宿号天津，禀性清闲心洞明，与井：罗躔井宿号天空，怒地平生运不通，家道兴隆金玉富，为官应许侍枫筹策自能知道释，众人钦仰振威若得水星同在度，木罗相爱却无","y":["水"]},{"b":"（全）","p":"168","t":"成败屡经遭、昼遇限宫见、迎恩见贵豪。罗喉在命若何看、文武兼资信不难、但得一星金与木、若非禀笔即登坛","y":["罗"]},{"b":"（全）","p":"168","t":"财帛宫：财帛之上是罗喉、己财须得即方休、更若狂图多富积、如何不破被奸偷兄弟宫：第二内有罗喉、悖逆乖为可自忧、宗派同源恩义等、只因凶嚯一时休","y":["罗"]},{"b":"（全）","p":"168","t":"田宅宫：罗喉天首最凶残、祖业虽多守则难、可惜田园千万顷、都因凶嚯见阑珊男女宫：罗喉临照子宫时、戏彩盈门岂历宜、恰似花繁红艳盛、寂然少有一留枝","y":["罗"]},{"b":"（全）","p":"168","t":"奴仆宫：罗喉难与善星交、奴仆之宫愈怒号、假使尊严崇道德、反居陋巷自簟瓢","y":["罗"]},{"b":"（全）","p":"169","t":"妻妾宫：罗喉凶名天首、不占高强对宫守、是惟一世有灾逇、孤寡难婚更加丑。疾厄宫：天罗喉第八宫、世间何事比其凶、直饶食禄重重贵、面首须防有病攻","y":["罗"]},{"b":"（全）","p":"169","t":"迁移宫：罗喉凶曜刂权星、临照迁移回禄惊、得在旺宫为禄主、必汰提荐贵荣身。官禄宫：罗喉原是贵权星、四正居强最吉宁、运限逢之多吉庆、更延寿算享遐龄","y":["罗"]},{"b":"（全）","p":"169","t":"福德宫：天首罗喉为福德、超群出众事乖张、合主瘟瘟兼盗贼、财空贫贱少年亡相貌宫：天首罗星相貌方、别为阴德解其殃、更兼忌曜纵横见、若不相残即系梁","y":["罗"]},{"b":"（全）","p":"169","t":"罗入子宫：罗喉子上名天暴、禀性刚强心太躁、同舍如还见木星、德及边方弭贼盗。天枵神首太玄星、相呼集贵有佳声、更在七宫逢吉曜、还须显赫且高升","y":["木","罗"]},{"b":"（全）","p":"169","t":"入寅宫：罗居寅上号天威、掌握兵戎拥帝畿、光糶朝廷羌悉服、功成齐秦凯歌归。罗喉寅位弓天威、握威权镇四夷、此是权星来入庙、扬名何处不光辉","y":["罗"]},{"b":"（全）","p":"170","t":"入巳宫：巳上罗喉为地隔、八煞宫中成水厄、虽然吉曜与同流、性格轻盈招盗巳上罗曜为地隔、八煞宫中成水厄、虽然吉曜与同流、性格轻盈招盗贼","y":["罗"]},{"b":"（全）","p":"170","t":"入未宫：罗喉在未名天厄、与月同宫为病贼、最喜未星相会行、家中金玉多财未上罗喉号暗星、岂知凶祸苦来侵、身命犯之难得寿、轻则孤单鹤发人入申宫：罗入申宫为伏断、独守空房无侣伴、会照如逢月孛星、耽迷酒色心情乱","y":["罗","孛"]},{"b":"（全）","p":"170","t":"申宫天废是罗喉、禀性顽愚少智谋、更犯煞星同一位、阵前战士更无头。入酉宫：罗居酉位弓天文、掌握兵机立大勋、甲癸生人逢此曜、文章显赫佐明君","y":["罗"]},{"b":"（全）","p":"170","t":"裸刑之曜在从魁、女嫁男婚不用媒、淫荡无仁无礼节、弃妻傍妾小和谐。入戌宫：戌宫天卫是罗喉、骨肉多伤大可愁、设若同宫逢水宿、少年必定主刑流","y":["罗"]},{"b":"（全）","p":"170","t":"戊上都官狱吏神、为人鲠直别尊卑、土曜同临并四正、一生受禄有君恩。入亥宫：罗居亥上另文昌、年少多才特异常、人首元来居帝阙、官尊爵大令名干宫天煞是罗喉、怕至阴宫禄位休、若被忌星相照破、更加八煞死荒邱","y":["罗"]},{"b":"（全）","p":"171","t":"乃历家之交终。故计都对时则罗喉。轸宿十三度。至十六度为正庙。双鱼宫壁宿四度。至十度亦为庙","y":["罗","计"]},{"b":"（全）","p":"171","t":"昂心二宿为乐。尾娄二宿为旺。六甲人为因星。六壬人为天禄。计都本名凶恶曜。双女白、0为好庙","y":["计"]},{"b":"（全）","p":"172","t":"子损妻定破散，平生孤苦不舒愁。与室宿：计躔室宿号天真，性烈官高位不轻，与壁宿：计躔壁宿号天鱼，四度之间十度居，若得木星来救助，为官七品至公与庙之中官极贵，十年之内位金","y":["木"]},{"b":"（全）","p":"174","t":"与翼宿：计躔翼宿号天蛇，性毒心凶身刺花，与轸宿：计躔轸宿号天强，官职须教训练场，恶事更兼重复见，不然心乱好淫节度兵刑须大佐，才猷奋迅佐朝计入本命宫：计都临照命、性暴逞才能、皆祖身孤立、依高附势行、初年灾祸起","y":["计"]},{"b":"（全）","p":"174","t":"晚岁福宜生、夜逢独位照、家门财业成。计都暗曜最凶星、日月无光可畏人、得遇之宫加庙旺、雍容台辅股肱臣","y":["计"]},{"b":"（全）","p":"174","t":"财帛宫：财帛之宫见计都、忽然富贵变为虚、莫教恶曜来侵犯、致使家囊扫地无。兄弟宫：昆仲宫中有计都、参商义薄有嗟吁、直饶四海皆同气、各自营谋各自居","y":["计"]},{"b":"（全）","p":"174","t":"田宅宫：强宫之上计都侵、福禄消亡祸自深、祖业到头都不管、空劳计较没身心。男女宫：男女宫中见计星、多因刑害太无情、虽然亦有二三个、也似枭鹰养不成奴仆宫：计临奴仆不堪言、不走还须损寿元、月于会时偷盗散、家中消耗破田园","y":["计"]},{"b":"（全）","p":"174","t":"妻妾宫：计都暗曜莫相逢、何况加临对命宫、举止乖张饶害克、定知造物不相容。疾厄宫：次弱之宫名疾厄、计都守此多刑克、若逢吉曜更加临、无事却为衣食迫","y":["计"]},{"b":"（全）","p":"174","t":"迁移宫：计都天尾照迁移、利害之端仔细推、出外迎祥因庙旺、不然下照定倾危。官禄宫：计都之宿最凶残、官禄逢之利害间、若在庙方须贵重、丹墀廷诤逆天","y":["计"]},{"b":"（全）","p":"175","t":"福德宫：天之首尾临福德、平生凶事反为吉、坦然不忍妄加人、患难尤能拯危急。相貌宫：计都加临最不宜、平生恋酒被花迷、忽然更有忌星照、残疾应须损四肢","y":["计"]},{"b":"（全）","p":"175","t":"计入子宫：计都入子弓天凶、性毒情贪又且穷、惟有己壬人遇此、又还为福主享通。欲知黑道在何宫、子位计都不可逢、八煞命宫遭毒药、可怜短命丧丿L郎","y":["计"]},{"b":"（全）","p":"175","t":"入丑宫：丑上计都名四喜、身居牛斗威权起、只愁妻子见刑伤、若是为官在朝里。计都为恶伏殃星、丑上逢之最不仁、作事阴谋凶且狠、土人得此不为","y":["计"]},{"b":"（全）","p":"175","t":"入寅宫：计都寅上号天渊、反祸为祥吉庆个、壬巳生人若逢此、生来享福更延年。计都不入三阳宫、人马宫逢悖逆星、田宅宫逢人不义、更加三五转无情","y":["计"]},{"b":"（全）","p":"175","t":"入卯宫：计在氐房名玉柄、人逢此宿多祥庆、虽然值杀及刑因、但管一生常富盛。计都却喜卯中藏、四正宫中弓禄吕、兄友弟恭仁又义、家风荣盛性温良","y":["计"]},{"b":"（全）","p":"175","t":"入巳宫：计都在巳名天水、虽曰为凶亦为瑞、便为恶宿相会行、也须显达身荣贵。太乙宫中喜计都、处身廊庙得安居、君宠臣兮臣尽节、扬名鹰塞到中书","y":["计"]},{"b":"（全）","p":"175","t":"入午宫：都临午号天岿、此是朝元遇者希、若得太阳同会照、白衣换取绿衣归。枉亡星宿在于离、神尾居之大不宜、魄散鄧都年不永、更忧狼籍损妻儿","y":["日"]},{"b":"（全）","p":"176","t":"入未宫：五鬼山来属计都、只嫌未位不相符、太阴在位同居此、不天终须主配徒。未上白衣事不堪、阴宫凶吉两相参、强宫吉曜同为福、第七宫中妻见二入申宫：计居申位名天贼、与水同居多否塞、不天终须一世贫、伶仃飘荡成孤克","y":["月","计"]},{"b":"（全）","p":"176","t":"酉中日月怕同临、妻妾宫逢有异心、史犯太阴娘呷克、太阳父位少光阴。入戊宫：计都戊上名天窘、破荡资财不自量、壬己生人为禄厚、只愁妻子早年亡","y":["日","月","计"]},{"b":"（全）","p":"176","t":"计都休作凶神位、躔至双女六喜神、文章笔下龙蛇走、却作惊天动地人星与星所产生的角度对人生的影响：日与月会：日月同宫主旧声、文章富贵有科名、昼夜分司兼旺庙、始知明主秉钩衡","y":["计"]},{"b":"（全）","p":"176","t":"木会：日木同宫贵显臣、平生多福少灾违、木星是主兼乘旺、必作当朝上贵人。火会：日火同宫失火炎、祸盈百六莫轻言、人灾遇此民遭厄、天丧生民害义廉土会：日土相逢庆瑞饶、天产人龙佐圣朝、星临百六邦家泰、万福攸同百祸","y":["木"]},{"b":"（全）","p":"177","t":"紫会：太阳紫气喜相逢、润泽生民稼穑+、百六会时祥瑞应、人生会此必三公。于会：日孛同宫最不嘉、只宜为旅不宜家、生逢白昼多灾疾、夜则康宁无叹嗟","y":["日","炁"]},{"b":"（全）","p":"177","t":"罗会：太阳正照被罗侵、父死他乡儿没亲、先代家财多破尽、奔波衣食不如人计会：日计相逢景福昌、官尊直谏佐明王、怕逢朔旦生奸伪、百六如逢大不祥","y":["日"]},{"b":"（全）","p":"177","t":"在未宫，衣食至无退。在戍、辰二宫，甚鞍马牛羊。日木同名：主近贵人，半生少灾有福，足财帛，多子孙，更得木星乘旺气转好","y":["木"]},{"b":"（全）","p":"177","t":"是主星，大贵。如木星行伏段名恶宿，损财产，日在庙则贵。日火同名：主为人有信行，作事圆滑，好文章，多财物，若得一生在旺宫者，主日土同名：主性恪聪明，有词章","y":["木"]},{"b":"（全）","p":"179","t":"孛会：月孛元来喜太阴、逢之必定长精神、如逢百六力卩祥瑞、为官必定主权人罗会：太阴天首喜相逢、智将鹰扬塞外威、只恐望宵主叛逆、福临百六主伤悲","y":["月","罗","孛"]},{"b":"（全）","p":"179","t":"计会：太阴天尾望宵同、爰产奸凶不孝忠、不在望时终有怪、投河毒药或瘟逢。月木同：主文学出众，更得大贵人见知","y":["月","计"]},{"b":"（全）","p":"179","t":"月孛同宫：夜生招狱讼，日生犹可，不利母。月罗同宫：必主贫贱，妻弃子逃。昼生多招刑法，夜生犹可，不利母","y":["孛"]},{"b":"（全）","p":"179","t":"月计同宫：夜生招狱讼，日生犹可，不利母。月土火同宫：夜同土星，必招到害，风狂天寿之人","y":["土"]},{"b":"（全）","p":"179","t":"夜同火星，虽有刑克，则享福禄，若安庙旺，则主大贵","y":["火"]},{"b":"（全）","p":"180","t":"木与火会：木星会火喜偏饶、值此官尊福寿超、百六会时家国泰、忠臣孝子满皇朝。土会：木星宜与上同宫、百六逢之稼穑十、会此乘轩并衣锦、记名青史着奇金会：木星最喜遇金星、喜嚯如逢百福兴、百六会时多吉庆、人生指日到公卿","y":["金","木"]},{"b":"（全）","p":"180","t":"水会：天命之宫木水星、一生聪俊播芳声、三方史在高强位、金榜须排第一名。紫会：木星紫；","y":["水","木"]},{"b":"（全）","p":"180","t":"福偏隆、百六逢之庆不穷、史在庙宫阴德重、官居将帅伯侯同。孛会：木星若也会俊枪、总有惊忧变吉祥、巨蟹宫中如会遇、少年荣折杜枝香","y":["木"]},{"b":"（全）","p":"180","t":"罗会：木与罗喉同一舍、喜在阳宫分昼夜、昼则堂堂韩魏公、夜则魁梧吕仆射。计会：木星若也计相逢、反祸为祥千福集、百六当之福自添、如历巨川舟楫至","y":["木","罗"]},{"b":"（全）","p":"181","t":"金会：从来荧惑怕伤金、共照阴阳必主淫、史有恶星刑战着、不过强仕即悲吟。水会：火星逢水自相刑、怕在阳宫与昼生、不满三旬防横死、若能知命学修行","y":["火"]},{"b":"（全）","p":"181","t":"紫会：火星紫气最廉半、百六逢之处福龄、逢生必是人间瑞、龙风从中第一人。孛会：荧惑最能诛孛彗、除扫纔枪为庆瑞、官荣上爵秉威权、百六逢之为富贵","y":["火","炁"]},{"b":"（全）","p":"181","t":"罗会：火星最忌见罗喉、害义伤廉大可愁、兵火焚烧遭劫掠、金珠丰粟总无留。计会：火星最忌会计都、令人风疾怪形躯、如逢百六多才学、不向封侯也被诔火上同宫：主性凶恶，好杀害，土是主星，昼生，火是主星，夜生，又顺行本位，至防御练","y":["火","罗","计"]},{"b":"（全）","p":"182","t":"火计同宫：主患痈疖而死：日生，烧屋。土与金会：上星若也会金星、妻妾荣华福禄真、一跃龙门能变化、九州岛人物更多能","y":["金"]},{"b":"（全）","p":"182","t":"水会：一上星若与水星同、举世孤高胆志雄、秉节挥戈文武备、福临百六庆无穷。紫会：土星紫喜相依、冠冕荣身职位、丹赤忠心刚.II毅、德施万里足光辉","y":["水","土"]},{"b":"（全）","p":"182","t":"孛会：镇星不要会纔枪、百六逢之祸害长、僻疾怪形须至孽、佣奴群小疾生殃。罗会：土星专恶会罗喉、百六天灾大可愁、人遇一生多困苦、瘟疫病染坐亡因","y":["土","罗"]},{"b":"（全）","p":"182","t":"计会：土宿计都不可逢、人生浅薄更颛蒙、诔徒溺水兼痈患、百六天灾万种凶。土金同宫：主好色能怀，一生财帛聚而多散，有妇人见重，得好妻妾，亦因女人发旺","y":["计"]},{"b":"（全）","p":"183","t":"紫会：太白相逢紫气星、彤庭光耀化鲲鲸、威加夷狄为真将、变理阴阳佐帝庭。孛会：金星与孛若纵横、百六逢之木吉亨、人产遇时须饱暖、家多金帛保康宁","y":["金","炁"]},{"b":"（全）","p":"183","t":"罗会：金星不喜会天凸、狼戾奸凶为契友、富豪苗裔也卑微、百六当之殃不少。计会：金星设若逢天尾、奸计平生愚且诡、百六当之大不祥、财破人亡灾病起","y":["金","计"]},{"b":"（全）","p":"184","t":"金计同宫：主坠马，夫妻多离异，难在中年。水与紫会：水星紫气喜相当、天产斯文福势吕、官爵显荣家又富、千斯仓与万斯孛会：辰星不欲相交彗、男则为奴女为婢、邪淫浊滥主贫寒、百计千谋无一遂","y":["水","炁"]},{"b":"（全）","p":"184","t":"罗会：水星最忌与罗同、值此须教一世穷、不孝不忠多暴虐、不然瘠哑与盲聋。计会：水与计都相照会、缺唇跛足并驼背、或生癖疾女多淫、不入法埸也徒配","y":["水","计"]},{"b":"（全）","p":"184","t":"水计同宫：主兵刃，寇盗之厄。水孛同宫：主贫贱。水紫同宫：有财禄、足寿。：紫气挽抢两会期、庆来百福尽相宜、官居柱石人间瑞、泽及生民万汇为弋刁'了'．会罗会：紫气罗喉喜会同、人生刚毅足英雄、挥戈却自半奸贼、笑取功勋反掌中","y":["罗","炁"]},{"b":"（全）","p":"185","t":"计会：紫曜还同见计都、家多财帛富庄租、此宫人产天然福、百六逢之万祸怯。紫月同名：主得父母力，近贵人","y":["计"]},{"b":"（全）","p":"185","t":"上同宫：主为土地之官，好神仙之事，长生之道。火同心卑下。火星顺行，主福禄宏远。木同宫：主大人举荐之力，亦主贵显","y":["火"]},{"b":"（全）","p":"185","t":"孛同宫：主足谋多虑，能掌兵机，职任渭高。孛与罗会：孛星若会罗喉宫、勒石燕然纪大功、常人遇此必多灾、百六逢之定主凶","y":["罗"]},{"b":"（全）","p":"185","t":"计会：月孛计都不可逢、人生淡薄主贫穷、偏招宿疾风痨厄、百六逢之不善孛金同宫：主行为不良，妻亦然","y":["计","孛"]},{"b":"（全）","p":"188","t":"以当生日时，逆数至太阳交中气时，以三日为一年，一日为四个月，一时为十日，外加十年，即是出童限年数，又须扣清虚岁若干年，其法与子平推大运相同，但子平大运，有阴阳顺逆，且从节气起算，十二宫行大限表：三年减一为端的","y":["日"]},{"b":"（全）","p":"189","t":"第三篇：中国古代演命法论命法：凡看五星之法，先是排定太阳，以生时加在太阳度上，则知安命在何宫，方为端的，须是以度主为要，宫主次之，盖宫主州郡也，度主县邑也，山县而州，县为切近，二主须要生旺得时为紗，凡身主切于命主，度主切于宫主，夜生人重身度主，囗生人重命度主，经云，身好命不好，有福无寿，命好身不好，有寿无福","y":["日"]},{"b":"（全）","p":"190","t":"凡日生人，以太阳为重，夜生人以太阴为主，如太阳逢恶曜，昼生，如太阴遇凶星夜诞，合此者，无不贫夭，如日生吉宿逢阳，夜生吉星钓月，有此者，无不富贵，尤当会合十五度中为切要也","y":["日","月"]},{"b":"（全）","p":"190","t":"昼生人，则要太阳在寅卯辰巳午未上，方应朝阳向明之格，如昼生人，太阳在申酉戊亥子丑E，皆非合格，夜生要太阴照命，行限亦要火罗月孛当限，方为得体","y":["日","月","孛"]},{"b":"（全）","p":"191","t":"须看时令为紧，春木夏火秋金冬水季土，若金令金水守照，反为孤贫与身同躔亦然，盖冬火罗近太阳不妨，又看旺相休因死绝为紧","y":["日"]},{"b":"（全）","p":"193","t":"夜反孤星非所宜。月火金星为夜曜。日光晦昧克妻儿。4，辨阴阳：凡初一一三四五日。戊亥子丑时生人","y":["金"]},{"b":"（全）","p":"193","t":"无光父母主生离。5，推迟留：凡木火上金水。而有迟留伏逆之辨。以尊其太阳故也。盖太阳者君象也","y":["日"]},{"b":"（全）","p":"193","t":"五星者臣下也。臣见君则让于礼。所以五星近太阳则迟。迟则行缓也。五星三方见太阳则留","y":["日"]},{"b":"（全）","p":"193","t":"留则不行也。五星太阳同行。伏则不见也。五星对照见太阳则逆。逆则退行也。而顺行有气","y":["日"]},{"b":"（全）","p":"194","t":"孛逢戊上（娄度）是三圻。罗喉酉（昴度）亥（壁度）君须忌。月无光卯酉头（月房度日毕度）","y":["罗"]},{"b":"（全）","p":"195","t":"12、神杀露：假如命限是金。行逢火度火星。流水或三方对照。诗曰：露杀交争气散倾","y":["火"]},{"b":"（全）","p":"196","t":"行逢怒杀岂为祥。17，值难枵：值者。正二太阳之类也。八杀宫主也。天因天耗也。且如宫身度主","y":["日"]},{"b":"（全）","p":"196","t":"官灾死败转为凶。20、鬼见鬼：假如坐命斗木。限行亢金亦然。失次加流年金星。三合对照犯限决死","y":["金"]},{"b":"（全）","p":"198","t":"女命，必看身主如何，一身最要清吉，不可驳杂，金水相从太阴则吉，逢恶星则凶，又看人盘得所，不可执论，逐宫推之则可，忌三方血刃加沓，计罗照命，或沓在刃宫，或守照，必主血气疾亡，大忌飞廉刃锋交破","y":["月"]},{"b":"（全）","p":"198","t":"凡丁亥生人，以太阴为刃，主逢飞廉大凶，次看福主如何，福主失经，入弱宫必无福，入强宫得所，则生平有福","y":["月"]},{"b":"（全）","p":"198","t":"女命在驿马，又带水孛，照身命者，或在五弱之宫，皆主淫奔，其余与男子同断。女命，不宜太阳在命，或拱照命，加以身强，皆主欺夫夺权，性急有男子之志","y":["日"]},{"b":"（全）","p":"198","t":"女人忌四余星旺，皆主重婚，月孛当头，伶俐太过，克夫害子，犹有丑声，多淫下贱，若命坐咸池者，必淫，行限遇之，淫而凶，土孛淫秽，金无择，水火淫而刑，火上孤孀，或男女星旺而得地，当生贵子，主有好称呼也","y":["孛"]},{"b":"（全）","p":"203","t":"阳刃若来迎克主生来不识着衣裳月的盈亏与人生：中国文化中有关上古原始的传统科学部分，例如：天文、星象、以及五行、天干、地支、奇门遁甲乃至易经的阴阳、八卦、卜筮以及后世的堪輿、星命、六壬卦等，都是根据地球、月亮和太阳系统运行活动的法则而来","y":["日"]},{"b":"（全）","p":"205","t":"牛顿的依据是，那时将有囗蚀，月亮在近地点，而且这时后木星也正好接近地球；山此他推论会引起地震以及大气层的活动","y":["木"]},{"b":"（全）","p":"206","t":"而地震之发生要等别的行星经过日蚀发生过的空间时引发。日蚀是发生在黄经一百五十八度，他推算七月后，也就是一九三三年三月八囗至十二目之间，火星会经过黄经一百五十八度，而火星又是被称为战神，具有很大的威力，因此必然触发地震","y":["火"]},{"b":"（全）","p":"206","t":"丁是他在数月前就警眚长堤一带的人，要提防三月十日发生的地震。果然，三月十日下午，当火星进入黄经一百五十八度时，大地震在长堤一带发生，死了一百多人，那时行动缓慢的海王星仍滞留在黄经一百五十八度","y":["火"]},{"b":"（全）","p":"207","t":"根据易经的原理，和中国阴阳家的学说，有冬至一阳生，夏至一阴生之论。当冬至或夏至一到，太阳向北或向南移动时，地球上的大山脉一带，似乎感受新的拉紧的力量，而在冬至或夏至以后的新月或满月，日月的影响达到最高时，发生地震的可能性很大","y":["日"]},{"b":"（全）","p":"207","t":"据古代星相学家的观察，目蚀或月蚀之时，若有水星相会，大气层会发生狂风，并夹着闪电，然后地表突然会现出裂缝，而引起地震","y":["水"]},{"b":"（全）","p":"207","t":"据葛特就G。ad）博士研究木星经过金牛宫时，所发生地震的结果，他认为太白金星或水星或木星在金牛宫会合时，会发生地震","y":["水","金","木"]},{"b":"（全）","p":"207","t":"山木星和火星会合引起的地震，以及山土星引起的地震，先有一阵的轻动的预兆：而天王星式的地震则突如其来，没有任何预兆","y":["火","木","土"]},{"b":"（全）","p":"207","t":"图三为另一种可能引起大地震的行星位置。图中0度为春分点，也就是太阳在此占时正值春分，O度至三O度之空间，在星相学上称为白羊宫","y":["日"]},{"b":"（全）","p":"207","t":"一七八三年的意大利大地震，死亡四万人，那时，海王星在秋分点，木星在冬至点，上星在夏至点，成丁字型","y":["木"]},{"b":"（全）","p":"207","t":"一九0八年十二月八日，在意大利发生的另一次大地震，死亡人数达七万八千人之多，那时太阳、水星和天王星在冬至点附近，海王星在夏至点，土星正接近春分点，而月亮则在近地点","y":["日","水","土"]},{"b":"（全）","p":"207","t":"这时，水星和火星连合，土星和地球联机与日月联机几成直角，而天王星和地球联机与囗月联机成六十度","y":["水","火","土"]},{"b":"（全）","p":"207","t":"民国四十九年五月廿二囗，当火星通过曾发生囗蚀（黄经一百八十八度四十五秒）之正相对位置（黄经八度四十","y":["火"]},{"b":"（全）","p":"208","t":"两者所引发的地震，都发生在日蚀所落阴影之处。图四：图五为另一相同的例子，为一八八二年十一月十日在爪哇发生日蚀时的行星位置，那时日月和海王星相对，火星和冥王星相对","y":["火"]},{"b":"（全）","p":"208","t":"六个月后，也就是一八八三年五月十二日，当太阳和土星会合在曾发生日蚀处的正相对位置时，爪哇发生大地震和火山爆发，火山爆发连续了十多天","y":["日","土"]},{"b":"（全）","p":"208","t":"图五：星相学与光色：太阳光谱包括七种颜色，和日月以及五大行星配合。红色是代表火星的颜色，蓝色是金星的颜色，黄色代表水星，绿色是土星的颜色，紫色是木星的颜色，橙色是太阳的颜色，而月亮的颜色则是靛色","y":["日","水","金","火","木","土"]},{"b":"（全）","p":"208","t":"至于行星所统属的疾病，可山该星的颜色治疗。火星代表炎症，所以发炎性的疾病，如天花、狼疮和皮肤发炎等使用红光有益","y":["火"]},{"b":"择日","p":"3.1","t":"荥七政朝与乐三等“257大福度259论天气三十六恒星考算法十二宫名、中法十二官、算时刻分秒数推算立命真度法．查黄道新尺顶丑宫八度一260一263“267“268269推算七政四馀到地平方位法一273近代天星弧角课实例“273宅运新案弧角天星课··280依法推步天星弧角太阳到山方演算例解“289陶胥来先生葬其先生吉课一264陶胥来先生建造宗祠吉课，，265·128·","y":["日"]},{"b":"择日","p":"3.2","t":"先祖桐轩公择修顺德学宫奎文阁梁吉课301宅主庚甲：主事丙辰321北平东经、北纬度数表“332长沙东经、北纬度数表334台北东经、北纬度数表336新竹东经、北纬度数表338大陆各省府太阳出地高度340广东省各州府太阳出地高度“341广西省各州府太阳出地高度343量天尺345论鸟兔太阳351太阳行度表352七政四馀化曜354·129·","y":["日"]},{"b":"择日","p":"4.1","t":"大幅度命宫求法台湾适用太阳命宫度立成表平均恒星时表（润年用）平均恒星时表（平年用）经度（地方时校正表）日光即约时间的缘起我国应用日光节约时历年起迄日期我国主要都市经纬时差表日本主要都市经纬时差表从太阳黄道求赤纬从黄道求赤道地平方位求方·130，'356“357，360，361．365，，367·368，370·371·372·3？","y":["日"]},{"b":"择日","p":"4.2","t":"有方位求太阳到山时刻376图距北纬赤后分春、图距南纬赤后分秋377太阳黄道计算法381弧角黄道十二宫计算法383求十一宫、十二北极法385、十一、十二宫黄道387用表查到山时刻395太阳黄道求法403太阳黄道位置的推算415·131·","y":["日"]},{"b":"择日","p":"6.1","t":"三元总算弧角星盘十二宫先求太阳实行宫度。次求距春分黄道经度。从戌官起算。加太阳实行午官三度","y":["日"]},{"b":"择日","p":"8.1","t":"一凡修造一切喜庆等事，以所用之时，加太阳宫顺数至卯即是命宫。安葬一切修墓等事，以所用之时，加太阳官顺数至西即是命官","y":["日"]},{"b":"择日","p":"8.1","t":"一命度太阳所之度，量天尺一行直下，到命官之度即是命度，星象络度流星顶度亦此法也","y":["日"]},{"b":"择日","p":"8.2","t":"一木以金为难，水孛为恩，土计为仇。火以水孛为难，木气为恩，金星为仇。金以火罗为难，土计为恩，木气为仇","y":["金"]},{"b":"择日","p":"8.2","t":"水以土计为难，金星为恩，火罗为仇。土以木气为难，火罗为恩，水孛为仇。日以木气为难，金水为恩","y":["金"]},{"b":"择日","p":"9.1","t":"二十至二十三一昼夜，十三度有余。二四至三十一昼夜。十四度有余。一诸星行度，太阳一年綢天，太阴一月一周天，岁星十二年一周天，火星产一周天镇星二十八年一周天，金星一年一周天，辰星癖一周天，气星二十九年一周天，孛星九年一周沃，罗什八年一周天","y":["日","月","水","金","火","木","土"]},{"b":"择日","p":"9.1","t":"一凡用地盘太阳，须查太阳之浅深。如子山午向，大暑後太阳入，七140","y":["日"]},{"b":"择日","p":"9.2","t":"一凡用天盘太阳，须分时之刻数，盖太阳一时一宫。如子山午向，午正初初刻太阳到向，午初一刻尚在丙午，正三刻已到丁论","y":["日"]},{"b":"择日","p":"9.2","t":"时必须论刻，方能有推。五星四馀，亦随太阳而转。如地盘日在午，月在于，用卯时，天盘日在卯，月在西，星馀亦依次而推","y":["日"]},{"b":"择日","p":"9.2","t":"一诸曜行度，俱从子正起算。一日月薄蚀，七日内勿用。太白经天，孛星现象日耳月耳，日晕，月晕，一切变升，并迅雷狂风暴雨之时俱不可用","y":["金"]},{"b":"择日","p":"10.1","t":"t一空一，居三隔三等格。即看与山向有何弓照。有何拱夹，或横天交气，罗计拦截，太阳到向，太阴到山，日月拱夹双用双用拱夹日月，日月夹向拱山，日月夹山拱向","y":["日","月"]},{"b":"择日","p":"18.1","t":"惟以七政之善恶喜忌（四余有气无形故不用）。为人命之休昝悔吝。而专重大阴宫舍之用，喜木星金星忌火星土星","y":["金","火","木","土"]},{"b":"择日","p":"18.2","t":"三角言一合也，一星有一星之本角界，如水在子初至子七度为水星本界也。推测易知，著有表令录于后一览可知","y":["水"]},{"b":"择日","p":"18.2","t":"其选择条件，专取太阴在何官，自为家之。而五行生克之理不论也。其言各月朔望安命官0星了以定物价之贵贱","y":["月"]},{"b":"择日","p":"20.2","t":"雲詳辰支氣千金無來為到支來土復水水人造局殿為化成居才金相喜自好用者初人造照橋逢化耀福群工旺也是在星火財福當循既丁基時詩山閭夏取宜冬柱冬要喜總查照非明臨宜垣人氣參能名方家葬中格星四水春求千旺秋贊子兀旺陽是佳合類火格雙魚水水貴辰星塏水牛宿為垣馬到到子坐坡向兀辰合到為六合吉·163·夏冬至至到向山太大大寒向山六山正會升太白為厶土相水潤明水清木寶從瓶五殿涵蟾金水涵金水陽水","y":["水","金"]},{"b":"择日","p":"22.1","t":"立立秋春向山太向山明秋方拱照立后為六照火正金木星財","y":["木"]},{"b":"择日","p":"23.1","t":"期厶用吉深豈第孫昌熾能登虎榜雲梯雲師子寒氣真何祥如亦京福作直課學辰水求星有是福大同文居明祥馬兀來盛格會濟五滄會行者海合龍月稽財良明亥日天八卦兒篇禄中上采富詩甲山旺春土好栽培火須用水金令木格貴木歲丑天寅卯陽照為省方貴進當里職加尋添氣枝木角宿日月居日月月脊垣木升殿向陽花木火木木用值氏垣到J甲為人守到照坐為到守庚到拱向照朝到元乾吉或丁為到乾六厶吉．168·帝白驚露到直向山太立立夏冬向山直小暑方拱吉后六吉木主山水正為木火火星用里","y":["火"]},{"b":"择日","p":"25.1","t":"為或癸為1到|庚厶天立立冬夏向山太驚白小寒后拱照立六吉主水星為火為星巽山正體木水化；","y":["水"]},{"b":"择日","p":"25.2","t":"已算火來如焚支屬能惑盛火參是逢蔭造主金化躔好金精行土小推游培四效度來得倚妙全邊木但不表用作赤星嘉為祥淺伏化日須静果純南中學惟衆雲高居土星高留大若才時抵值升達殿月父勿詩秋冬之草格選母見工愁查氣夏精顛天熟伏巳滿氣樂春水苟逢兀盛宜水格火土强火貴熒惑垣火書升元总豪用值事星年宿喜》為化垣到已人守到照坐為}到逢月日日朝天日月同殿火垣為到拱居文向照垣明為朝到火元丑吉或小小向山水暑冬至谷拱肖后為，i星土星金火格火天為到六．173·","y":["土"]},{"b":"择日","p":"29.1","t":"兀总雲用值辰金推旺4看在化垣金金垣甲歷海詩良庚秋庚天山度吓金1月水在金金水星補升水水逢從長山庚澤人通命氣金山居澤乾通位氣金金0事馬胃為到留顺憑伏寧書細詳觀平凶莫倉卒方月太白星推臨奮會時篇化中較貴不叠导格好取星册里物查超越從陰冬白露中兀氣尋深春實庚人為到守坐昭為守到向拱1帝驚白到向山太立立冬夏向山露小寒至只主欄秋叉火可四季工祥水夏上金可留心為星星為水星用屬金令土金夏天金水要臨产","y":["水","金"]},{"b":"择日","p":"29.2","t":"太：到遇元白處夏《氣斜迎端秋照祥陽分喜福元自武相排佳從貴要丑來太月神同相金相登元总庚水人從臨陰厶老伏會三欣乾通光逢天蛇失金遇會主冷丑卦不愛躔助鬼月牌懷庸龍雲詩格貴土太逢酉金月恩陽春水在水躔孟武旺度仲曲厶海參勾'口同吉陳金水白補居陽垣水星逢升龍殿長金命陽，金山金金用值年宿化垣人為到守為守到垣卯到為為照元到或為合到雁六厶吉，181","y":["水"]},{"b":"择日","p":"29.2","t":"帝春秋分分向山太霜谷降雨向山悬至方拱吉秋后六羆吉金土星星水星星星為星火為正體化殺當冬旺正中卯尋亥防斬騎","y":["水","土"]},{"b":"择日","p":"30.1","t":"雲得辛金太以金居星人為到守察白歸侯守到垣乙息力恩各右局左發要金原福寧從造仇中詩得辛時金得範局水母陰陰求子寒亭露中祖旺氣孫存際金精夏氣却昆炎焚格鬼宿0厶原是少金各太歸向神臨徑而真動有諱貴格以為良凶居垣日奎宿歸垣參五兑來星方多時革福熒丘無七有水到政勢是查向行德色嶺用嘉乾升金金水助相月金土星金人堅斗寶金金號水太從常陽日山居通垣到為向拱為照朝元到艮或到為六合·182·天清寒明露向山寒清鳐明向山秋大雪后方拱寒后厶照吉水星星木星虽火","y":["水","木","土"]},{"b":"择日","p":"32.1","t":"辰星居垣水星升殿金水相涵玄武持旗金水从阳双鱼戏水水附阳光水日会合水土朝北水润金明水清宝瓶元总七政四馀贵格解水星在巳申二官","y":["水"]},{"b":"择日","p":"32.1","t":"水星缠在箕壁参较四宿也。冬生金寒水冷多降，书夜皆吉。亥子二月，水星与日同官也。金水掌吉神居垣殿，书生者奇","y":["水"]},{"b":"择日","p":"32.1","t":"水星同命在亥宫度日月水星同官也。水星与日同宫度也。水星与土星同在亥宫或子宫。金星与水星同在辰宫","y":["水","金","土"]},{"b":"择日","p":"32.2","t":"五星循环水涵蟾魄水火既济水土相会水临双女一星伴月镇星居垣土星升殿火土得牛土金坚宝土罗相会勾陈镇殿土宜见水元总木火土金水循行环拱诸位","y":["土"]},{"b":"择日","p":"32.2","t":"水星与月同在未宫。水星在子宫火星在午宫。水星与土星同在申宫。水星在巳宫。水星与太阴同宫","y":["月","水","火","土"]},{"b":"择日","p":"32.2","t":"土星在子丑二宫。土星女胄柳氏四宫。火星与上星同在西丑二宫秋冬土埋金寒，馀月土星与金星同宫","y":["金","火","土"]},{"b":"择日","p":"32.2","t":"E星与罗候同在长宫。辰、戌、丑、未月土星与太阳同宫土星与水星同在子宫","y":["日","水","土"]},{"b":"择日","p":"33.1","t":"土煲相会土星与火星同在且官土日合照十星与太阳同在戌宫土好宝瓶上星在子宫虚度。火月同宫火星同月在子丑二月在丑宫斗宿","y":["日","火","土"]},{"b":"择日","p":"33.1","t":"太阴朝斗火土高强火星与土星同宫、而夏生者土燥火炎为忌，馀月吉。五星连珠五星连续无间，顺度垣生者奇","y":["月","火","土"]},{"b":"择日","p":"33.1","t":"土星在丑宫。土号太常土归郑国土星在辰宫亢度。太阳在寅宫房宿。太阳升殿岁星居垣木星在寅亥二宫木星升殿木躔角斗奎井四宿","y":["日","木","土"]},{"b":"择日","p":"33.2","t":"厶石总荼木火文明冬春月.木火二者同'吕木气连枝木、气、孛在寅亥二宫。木罗会合木星与罗侯同在戌宫奎度","y":["木"]},{"b":"择日","p":"33.2","t":"山泽通气木星在寅宫金星在酉宫，坐寅、西一山为是。木躔角宿木星在辰宫角宿。木月清贵木星与月同时守子宫","y":["金","木"]},{"b":"择日","p":"33.2","t":"日月居垣日居午月居未宫日月同宫日月共守一宫日帝居阳太阳在午宫星宿。日月连辉日月木火金水同宫相照；","y":["日"]},{"b":"择日","p":"33.2","t":"青龙扶觇木日同宫在寅卯月生。木上水井日月并明卡山木星水星同人井位。月本无光借日为明书生合","y":["水","木"]},{"b":"择日","p":"34.1","t":"日出扶桑日坐雷门焚惑居垣火星升殿火金逢月火照天门火土画逢日月朝天厶合格金水辅阳朱雀卸符金水辅阴太阴居垣元总录太阳在寅宫房宿","y":["日","月","火"]},{"b":"择日","p":"34.1","t":"太阳在卯宫火星在卯、戌二宫。火星蹿尾室嘴翼四宿。火星金星与太阴同宫同度。火星在亥宫室宿","y":["日","月","金","火"]},{"b":"择日","p":"34.1","t":"火星土星同在辰酉二宫。日月同在亥官。太阳金星水星同在午宫太阳、金星、水星同宫。巳午月生，太阳与火星同宫","y":["日","水","金","火","土"]},{"b":"择日","p":"34.2","t":"月在沧海金助月华一曜朝阳太白居垣金星升殿金水会合金水逢龙长庚人命金居乾位金躔鬼宿金星人斗金水五蛇金号太常元总太阴在酉宫也","y":["月","金"]},{"b":"择日","p":"34.2","t":"金星与太阴同在未宫。火星同日守午宫。金星在辰酉二宫。金星躔亢牛娄鬼四宿。金星与水星同宫","y":["月","水","金","火"]},{"b":"择日","p":"34.2","t":"金星与水星同在辰宫角亢宿。金星太阴同在酉宫金星居於亥官上。金星人未宫鬼宿。金星在丑宫斗宿金星水星在巳宫轸宿","y":["月","水","金"]},{"b":"择日","p":"35.1","t":"月泊风光月在天门月坐雷门日月朝北白虎从驾四馀独步月到月宫日到日躔日月遇朝木计逢鱼水孛扶印罗计中分水孛同秦元总太阴在巳宫太阴在亥官","y":["月"]},{"b":"择日","p":"35.1","t":"太阴在卯宫。日月同在巳宫。申西月：金星、太阳同宫。气孛罗计各占一月在未宫也。又名月挂扶梢","y":["日","月","金"]},{"b":"择日","p":"35.1","t":"太阳躔星虚房昂宿。日在子宫月在丑宫。木计同在亥宫水孛带卯星在未宫。罗居午计居子","y":["日"]},{"b":"择日","p":"35.2","t":"木在辰西二宫。木居子丑二官。木星与土星同官。火星在巳申二宫。火星在西官胃宿","y":["火","木","土"]},{"b":"择日","p":"36.1","t":"火金交战火到金多火水未济双女土在木宫土水相激土居水地金嫌人马金乘火位金忌白羊金在木宫金居日分金火同居元总火星与金星同宫","y":["金","火"]},{"b":"择日","p":"36.1","t":"火星居辰酉二火先人宫水後人宫而照命也。土星在巳宫轸宿。土星在寅亥二宫。土星与水星同宫土星在巳申二宫","y":["水","火","土"]},{"b":"择日","p":"36.1","t":"金星在寅宫箕宿。金星在卯戌二宫。金星在戌宫金星居寅亥二宫。金星在午宫。金星火星同在午宫·194·","y":["金","火"]},{"b":"择日","p":"36.2","t":"金木共躔金愁见火水泛白羊水叶火位水居土室水火同步火罗犯日土计掩月木蔽阳光木计火金火遇金罗水孛逢楚荸尤水人元总录金星木星在同宫","y":["金","木"]},{"b":"择日","p":"36.2","t":"金星火星同在寅宫。水星在戌宫娄胃宿。水星在卯戌二宫。水星在子丑二宫。水星与火星同宫","y":["水","金","火"]},{"b":"择日","p":"36.2","t":"昼，太阳火罗同宫。夜，土星计都太阴同宫。昼，木气与太阳同宫。木星计都、火星、金星同在亥宫","y":["日","月","金","火","木","土","计"]},{"b":"择日","p":"36.2","t":"火星罗侯同在午宫。水星孛星同在巳宫。月孛水星同在寅宫","y":["水","火","孛"]},{"b":"择日","p":"37.1","t":"泉枯牛索四馀优阳计临狮位孛骑狮子土孛骑牛乾坤否塞风雷相薄水火相射元总录水星月孛同在丑宫","y":["水","孛"]},{"b":"择日","p":"37.1","t":"紫气、月孛、罗侯、计都计星在午宫张度。月孛在午宫张度。月孛在丑宫牛宿。金星罗侯在申宫","y":["金","计","炁","孛"]},{"b":"择日","p":"37.1","t":"水星在卯宫。火星在巳宫。火星在子宫或水星在卯戌宫、火星在巳申宫山泽沈埋金星在寅宫木星在酉宫·196·","y":["水","金","火","木"]},{"b":"择日","p":"37.2","t":"算福星法天步真原出二宫不能主大财帛得福省事照方。能主大财帛。太阳卯宫二十度五十五分","y":["日"]},{"b":"择日","p":"37.2","t":"遁作二十二。从戌数至计二百卅二度。为太阳积度。太阴寅宫八度。从戌数至寅。计二百四十八度","y":["日","月"]},{"b":"择日","p":"37.2","t":"为太阴积度。以太阴积度。减太阳积度。馀一十六度。加於命宫亥四度。共二十一度。为亥宫二十度","y":["日","月"]},{"b":"择日","p":"37.2","t":"即福星所在。又法太阳峁二十二度。太阴寅宫八度。从太阳逆数至太阴。廿一十六度。命宫亥四度","y":["日","月"]},{"b":"择日","p":"38.2","t":"冷度元总豪頂天月廑日寶五卯x八十二丁壬乙己末寅亥卯東出地土福木戌亥亥九廿四度度度挲火李令氣弦照木星十廿立命亥宫四計在日月后羅在日月前分底地火酉升同行·199在金宫界退行在本舍升殿行在火星宫界退行在吉星宫界在本界到喜","y":["火","木"]},{"b":"择日","p":"39.1","t":"木星在本舍会福星升殿。亥宫政到命度照临。又与太阳三合照极吉。太阳到喜乐宫。拱照命度金水拱日月","y":["日","木"]},{"b":"择日","p":"39.1","t":"各星朝日月。升天顶十宫。与金星六合照与木星方照火土星。在降舍降角与吉星在高。光华满照浑天宝照云","y":["金","木","土"]},{"b":"择日","p":"39.1","t":"五星效顺此之谓也。此课用于卯山。迭葬俱吉太阳到山木星福星与之拱照也。用立命真度立成表","y":["日","木"]},{"b":"择日","p":"39.2","t":"设前星盘太阳卯宫二十一度五十五分。进作二十二度用未时初一刻九分。其法以立成表。查太阳卯宫廿二度","y":["日"]},{"b":"择日","p":"40.1","t":"元录太阳、每日平行五十九分零八秒。每月行一宫。金水二星同。太阳、每日平行三度一十分零三十五秒","y":["日"]},{"b":"择日","p":"40.1","t":"二日丬行一宫。一月一同天土星、每日平行．分零一秒。二十八个月行一宫。十八伍行一周天","y":["土"]},{"b":"择日","p":"40.1","t":"木星、每日平行四分五十九秒一年行一宫。十二年一周天。火星、每日平行三十一分二十匕秒","y":["火","木"]},{"b":"择日","p":"40.1","t":"两个月行一宫。一年行一周天。月孛、每日平行六分四十一秒，九个月行一宫。九钎行一周天","y":["孛"]},{"b":"择日","p":"40.1","t":"罗计、每日退行三分十一秒。卜八个月行一宫十八年行一周天。紫气、每日平行二分零六秒","y":["炁"]},{"b":"择日","p":"40.2","t":"初度@十分。即太阳人泮宿初度四十分也。兹求历元后各年之黄道宿度。则以所求之年。距历兀若干年","y":["日"]},{"b":"择日","p":"40.2","t":"加于黄道经度。每年岁差五十一秒相榧进作1宫减之相减余。三十六分即与日躔黄道初宫加乙丑年冬至限太阳人宿初度二十六分也","y":["日"]},{"b":"择日","p":"41.1","t":"用西洋弧三角法推算十二宫星世光绪五年。己卯岁十月。初二王寅日未时。初一刻九分。太阳卯官二l-壹度五十五分","y":["日"]},{"b":"择日","p":"57.1","t":"此光照度与西法同。太阳光照十七度。太阴光照十二度、木星光照十二度。土星光照十度","y":["日","月","木","土"]},{"b":"择日","p":"57.1","t":"金星光照八度。火星光七度半。水星光照七度。假合火逊逐十星。相七度则二星占光。各星光度数均者相会则各星度数减半同沾光","y":["水","金","火"]},{"b":"择日","p":"57.2","t":"星在禾宫五度，亦呼为相遇。又如火星正戌宫。木星在巳官。金星在申富。金离穴追及木却将火之光","y":["金","火","木"]},{"b":"择日","p":"57.2","t":"以火与木亦为相遇。谓金先与火六合照。后与木星相弦照也。又火在戌宫。木星在巳土星在申宫","y":["木","土"]},{"b":"择日","p":"58.1","t":"最忌火土二星。会冲弦照日月。中法则忌火罗犯日。凡木火土三星。不宜与太阳冲照。盖太阳君象也","y":["日"]},{"b":"择日","p":"58.2","t":"如命主躔危正才天官躔毕心是也。日者太阳君象也。用天下之星而不为诸星之用。凡星居日之前后","y":["日"]},{"b":"择日","p":"59.1","t":"元忌录月者太阴后象也。到中秋时分外光明。几在上弦以至于望。谓之得令有格在下弦则光少而力弱","y":["月"]},{"b":"择日","p":"59.1","t":"则其母以及身。四月宿毕张危心是也。按月最忌土星同度。金水扶其精华。或木星与之吉照","y":["木","土"]},{"b":"择日","p":"59.1","t":"但吉星与命主在太阳前。则逆共气则精亲在太阳后。逆其气则精凶星反是耶律楚材云。凶灾不能解救","y":["日"]},{"b":"择日","p":"59.2","t":"以木为最吉。金星次之水星遇吉则星则吉。其中微有不同耳。西法又如各星会照论吉亠厶照为吉","y":["水","金"]},{"b":"择日","p":"62.1","t":"第一凶星是冲照其次弦照。凶星吉照可用。如火星与太阳三合六合是也。吉星凶照不可用","y":["日","火"]},{"b":"择日","p":"62.1","t":"如木星与太阳冲照弦照是也。满三百六十度为一周。一百八十度为半周。九十度为一象限","y":["日","木"]},{"b":"择日","p":"62.2","t":"此十二宫之，曲人，所以为生尽在是矣。人命有五照星有五k阳、二太阴、三命宫。四十宫五福星","y":["月"]},{"b":"择日","p":"62.2","t":"取第一召权者如取木星。要金木二星比日月强。命照星要有二。如只一照星。寿命不长取照星所在之宫","y":["木"]},{"b":"择日","p":"63.1","t":"罗计即日月行白道。正交于黄道之度。其衡为中交。月孛乃月行极高之度。为木星之馀。从象可测每日平行二分零六秒","y":["木","孛"]},{"b":"择日","p":"63.1","t":"廿九个月行一宫。无迟晋伏逆。则计在西也。太阳木星性皆热属书。太阴金星性皆润属夜","y":["日","月","金","木"]},{"b":"择日","p":"63.1","t":"火土二星反是星。土星性寒却属书。火星燥却属夜。水星遇画星则书。遇夜星则夜出太阳之前为书","y":["日","水","火","土"]},{"b":"择日","p":"63.2","t":"无总之后为夜。属书者书喜在地平上。属夜者夜孝在地平上。与太阳相会后。至上弦则润","y":["日"]},{"b":"择日","p":"63.2","t":"上弦至望则热。望至下弦则燥。下弦至相再会则寒。土木火三星。与太阳相会後至第一位晋处","y":["日"]},{"b":"择日","p":"63.2","t":"性与润自第一冲性多热自相冲得。至第二位位晋。至与太阝丨丨相晋处。与太阳再会时。金水二星与日相後","y":["日"]},{"b":"择日","p":"63.2","t":"至第二位晋处。性与润自第一位逆彳了后禾阝目会时”性与热自会后至位0·後与太阳会第二位晋处","y":["日"]},{"b":"择日","p":"63.2","t":"1生自第时。各星、'各星之遇。有·自冲相／，凹lt过各异并召力无力。所以天之气佩们不也太阴自朔至望属自个晦属太阳西","y":["日","月"]},{"b":"择日","p":"63.2","t":"土木火三星同。太会牢相冲口太阳东相冲至相会。後属人阳两小轮前半。属太阳东金水二星相会至相冲属木、阳相冲至相会","y":["日"]},{"b":"择日","p":"63.2","t":"属太阳西也。土木火三星k阳东出有力金水二星。後太阳西人力有五星东出西人各有度数","y":["日"]},{"b":"择日","p":"64.1","t":"土木火三星。离太阳不过六十度金星离太阳不过四十五度。水星离太阳不过廿五度。离太阳至远","y":["日","水","金"]},{"b":"择日","p":"64.1","t":"不过如此度数。土木火三星。离太阳六十度。以外不在东出西人之数。论十二宫阴阳白羊戌宫","y":["日"]},{"b":"择日","p":"64.1","t":"属火分寅午戌。热属乾为太阳木星三角。戌西申属热属湿。春分至夏至前宫彐分已酉丑属冷属乾","y":["日","木"]},{"b":"择日","p":"64.1","t":"为太阴金星三角。未午巳属热属乾。夏至至秋分前气分。申子辰属热属湿。为土星水星三角","y":["月","水","金","土"]},{"b":"择日","p":"64.2","t":"未属湿属冷。为火星三角。丑子亥属湿属冷。曲、四、七、十宫为四正拄有力。二、五、九+一伪、六、八、十二宫为四弱杜无力如四辅柱一半有力","y":["火"]},{"b":"择日","p":"64.2","t":"一星在十宫。一星在十一宫。星虽高於十宫。第一吉星是木星。其性善温和。兔、彐金星","y":["金","木"]},{"b":"择日","p":"64.2","t":"其性亦善亦温和。是火星其性繰二凶星是土星。其性寒冷不和平。水星遇吉星则吉。若水星独在一宫","y":["水","火","土"]},{"b":"择日","p":"65.1","t":"月升酉，金升如木升未。本升庙旺有！即升之对冲为无权。日木在寅午戌。夜太阴木星。为本角一等","y":["月","木"]},{"b":"择日","p":"65.1","t":"为本珀一等。月金在已西丑画金星。为本角一等。夜金星画太阴。为本鱼二等水土在申子辰","y":["月","金"]},{"b":"择日","p":"65.2","t":"火星在亥卯未。夜火星为本角一等。为本角二等。凡日月五星。到本甬力增力到本角之对宫","y":["火"]},{"b":"择日","p":"67.2","t":"右为十二官度五星界表。如木星在戌宫初度至六度为木星所属度上`则木星到界为有力，不言太阳太阴者","y":["日","月","木"]},{"b":"择日","p":"67.2","t":"若木星行到所属度上。则太召阳之力。金星行到所属度上。则有太阴之力。按各宫度数有六家","y":["月","金","木"]},{"b":"择日","p":"68.2","t":"第三土星天。箫四木星天。第五火星人弟六太阳天。第七金星天。第八水星天。第九太阴天","y":["日","月","水","金","火","木","土"]},{"b":"择日","p":"68.2","t":"最屮也，故行有迟速不同。以七政次第而论。太阳居中层上木火居太阳之上层。金水月居太阳之下层","y":["日"]},{"b":"择日","p":"68.2","t":"故云九重人之说也，太阳光照十七度人阴光照十一度半。木星光照十二度。土星光照十度","y":["日","木","土"]},{"b":"择日","p":"68.2","t":"ffrhl光照八度。火星光照七度半。水星光照七度。径星第一'等人星照七度半。二等星光照五度半","y":["水","火"]},{"b":"择日","p":"68.2","t":"或同到天顶。皆召大权事力。有一等凶之星。人命度遇之不山星在太阳光下八用半","y":["日"]},{"b":"择日","p":"69.1","t":"离十七秒不吉。第一坏人命。土星在七宫。火冕在十宫。凡二星围一星。其他星来救。如一星环绕一善星","y":["土"]},{"b":"择日","p":"69.1","t":"则善亦变恶。太阳最怕与火曱相会。与土星相冲。太阴最怕与土星相会、火曱相冲，太阳与金奎夏","y":["日","月","土"]},{"b":"择日","p":"69.1","t":"三合六合箱照。太阴光满则吉。失咒不吉宫度哼与木星金星：或上犀用。再与太阴三合六照星更击太阳齐东地平到选时命入六合吉照","y":["日","月","金","木"]},{"b":"择日","p":"69.1","t":"造葬皆可但火主夏。不可在四正，。又不可与太阳会冲弦照。凶星是土星。因彼地极寒。天时地利自枇感应愚见中法第一凶星是火星．自古中华设天文者","y":["日","火","土"]},{"b":"择日","p":"69.1","t":"以·卜为吉。今历观人命。土星在十宫。与太阳三合六合咀者。其人多富贵寿考。些一澄与人同也","y":["日","土"]},{"b":"择日","p":"69.1","t":"造命与人命同法。放土星可用而火星不可用也。西法选择重大阴。中法选择重太阳。所谓只召阳乌万古全然把西法太阳亦召时不可取如遇火主夏会冲弦照","y":["日","火","土"]},{"b":"择日","p":"69.1","t":"此时论太阳逆行。如太阴不在吉位。金木二星又不能用。遇造葬事急促。处於必不己者。取太阳到东地·260","y":["日","月"]},{"b":"择日","p":"69.2","t":"与水星会、无火上二星会冲弦照。又不在四正官亦可。此天星择吉之迁就法也。西法选择重大阴","y":["水"]},{"b":"择日","p":"69.2","t":"取其吉应之速也。或在太阳光下。列不能为福。凶星顺行巧。论夭气太阳在舍，、大热有小雨牮遇大冲主风","y":["日"]},{"b":"择日","p":"69.2","t":"天气常变得上星在舍。夏至天湿木星在舍。小风天和气平。在於六阴宫雨。小雨不冷不热","y":["木"]},{"b":"择日","p":"69.2","t":"水星在舍丿主风天气变。无三日不变。界主祸福之来。时位主吉加吉。火分寅午戍三官。属热属乾主热","y":["水"]},{"b":"择日","p":"69.2","t":"太阳为金一切忄1阴为主。土星主收聚之力。木星主生长之力，人怒。金星主色欲。水星主思宪记性：月朔望》·26！","y":["日","水","金","木","土"]},{"b":"择日","p":"70.1","t":"下弦在最卑。木火土先太阳东出召力。金水後太阳西入有力。五星在太阳光内。名为焦伤损力必矣","y":["日"]},{"b":"择日","p":"70.1","t":"离太阳愈远。凶先太阳东出。後太阳西人主多疾病。太阳最怕火土二星。太亿最怕火主夏","y":["日"]},{"b":"择日","p":"70.1","t":"後出如六十度以外。不在东西出人之例。五星在太阳光下。凡事皆太阳代之。星善则善．星恶则恶","y":["日"]},{"b":"择日","p":"70.1","t":"如火星在阳光下。火星不能伤人。太阳召火星之性。皆有逐有离。对度亦是同宫。廿度外俱为逐为离","y":["日","火"]},{"b":"择日","p":"70.1","t":"金木二星吉。逐火土二星凶。逐水星昭吉有凶。不逐离星不鱼亦无好星。人及生穷苦。若召好星照","y":["水"]},{"b":"择日","p":"70.1","t":"所以遵其太阳也。太阳君象也。五星臣象也。臣见君则礼让於礼。所以五星近太阳则迟","y":["日"]},{"b":"择日","p":"70.2","t":"无总则行缓也。五星=方见太阳则晋。晋则不行也。五星与太阳同行则伏。伏则不见也。五星对照见太阳则逆","y":["日"]},{"b":"择日","p":"70.2","t":"三十六恒星考角宿大星。辰宫目渡五十九分。纬南一度五十丸分。有金星性吉。微有火星性大角星","y":["金","火"]},{"b":"择日","p":"70.2","t":"辰宫廿一、度日．分“纬北少卪一度三分。有火星性凶。微有水星性。卯宫十一度十二分","y":["水","火"]},{"b":"择日","p":"70.2","t":"北纬四十四度卅八分。有金水二星性吉。泖宫十三度十四分。纬北初度廿六分。有水木星之性吉","y":["木"]},{"b":"择日","p":"70.2","t":"寅官七度五十六分。纬南四度廿七分。微有木星注。寅宫廿五度十一分。纬南十六度i行水火二星之性凶","y":["木"]},{"b":"择日","p":"71.1","t":"丑又度廿三分。纬玺匮五十分。有火星太畅之性凶。丑宫十三度OO分。纬北六十一四十八分","y":["火"]},{"b":"择日","p":"71.1","t":"有金水二星性吉。丑宫一0·度四十分。纬北度四十五分。有火星太阳之性凶。且宫上匕度四十分","y":["日","火"]},{"b":"择日","p":"71.1","t":"有土星之性吉。亥三度卅七分。纬北五十九度五十六分。有金水之性吉。亥宫七度川三分","y":["土"]},{"b":"择日","p":"71.1","t":"有金土之性吉昂宿星。酉宫廿八度七分。纬北四度OO分。有火星太阴之性凶。申官初度O分","y":["月","火"]},{"b":"择日","p":"71.2","t":"有金水二星之性吉。未宫十二度十九分。纬市廿九度卅分。有水星性微兼火性。未宫廿度廿三分","y":["水"]},{"b":"择日","p":"71.2","t":"纬南十三度卅四分。有水星性吉。未宫廿一度廿六分。纬北六度三十八分。有水火二星之性","y":["水"]},{"b":"择日","p":"71.2","t":"未官廿四度二分。纬南十五度五十匕分0水星性微兼火性。午宫四度0二分。纬北一度川風人阳之性凶","y":["水"]},{"b":"择日","p":"72.1","t":"午宫五度三十分。纬北一度十四分。有火星太阳之性凶。轩辕十二星。午宫廿七度四十三分","y":["日","火"]},{"b":"择日","p":"72.1","t":"纬北八度四十七分。有土星性微兼火性。午宫廿八度O分。纬北初度廿七分。有火星性凶","y":["火","土"]},{"b":"择日","p":"72.1","t":"与太阳相会时。定在小轮最高。离日迟迟至相冲时。定在小轮最卑。最卑至相会为升。相会至最卑为降","y":["日"]},{"b":"择日","p":"72.1","t":"日月塑望在高。二弦在最卑。与太阳相冲。早从地平见。定在小轩最高。与太阳相会·晚在地平见","y":["日"]},{"b":"择日","p":"72.2","t":"在太阳z上。与太阳相会後。在最高与太阳相冲後。在太阳之下。与太阳相冲。早见在最高","y":["日"]},{"b":"择日","p":"72.2","t":"与太阳相会。晚见在最卑。算法忄二宫名丑为初宫。寅为十一宫。十二官复为丑初也。中法拎二元枵子官","y":["日"]},{"b":"择日","p":"73.1","t":"推算立命真度法如光绪丙子年。廿八日辰时。用事日缠斗宿十三度。顶丑宫廿二度。查上篇太阳丑宫廿二度","y":["日"]},{"b":"择日","p":"73.2","t":"太阳缠宫二度。查前数太阳且寫'．度。横肩得i八个小时0九分。用寅时正三刻十分。山亇正计至寅时","y":["日"]},{"b":"择日","p":"73.2","t":"用满除廿四小时。只剩方，向卜页太阳巳官十五度。横看一一0五数。则命寅官八度[卜·宫子丿度十六度","y":["日"]},{"b":"择日","p":"73.2","t":"得十八小时查太阳丑宫人度数。由午正釉五分。用卯时初一刻","y":["日"]},{"b":"择日","p":"74.1","t":"只剩得主小时五十分。查上页太阳已宫廿八度。横看一五三数。则立夤宫十八度四十五分","y":["日"]},{"b":"择日","p":"75.2","t":"若推算七政到方。如此图七月初三申时初初刻。先查太阳到地平方位表。申时初初刻真太阳到地平西方七度","y":["日"]},{"b":"择日","p":"75.2","t":"除太阳已到之七度不计。要将太阳未踱之八度。置于算盆之中。然後查历数太阳缠午宫十八度","y":["日"]},{"b":"择日","p":"75.2","t":"作十九度算因尺有初度故十八度即十九度凡各星俱要如此加法除太阳已缠之十九度不计。又要将太阳未缠之十一度","y":["日"]},{"b":"择日","p":"75.2","t":"置于算盆之中。又将水星所缠之七度。加于算盆之中。丑得一十八度。除去西方十五度。尚馀十三度占到地平庚方","y":["水"]},{"b":"择日","p":"75.2","t":"逆计到金星所踱之十三度。作十四度复将此六度加于算盆中。共得十力内273","y":["金"]},{"b":"择日","p":"76.1","t":"占到地平申方。以申方十五度计之除四度。尚该十一度始与申方加多一度共十二度。即金星到地平申十二度也","y":["金"]},{"b":"择日","p":"76.1","t":"此数不可人算又以金星所踬已宫之十四度。巳尚有十六度。辰宫三十度。卯官三十度。及木星所踱寅宫之二十四度","y":["金","木"]},{"b":"择日","p":"76.1","t":"占到地平巳方以巳方除去十四度。顺方巳方加多一度。十五度顺方安之。即木星到地平已方二度也","y":["木"]},{"b":"择日","p":"76.1","t":"此数亦不可人算又属木星所缠寅宫之廿三度。逆计之寅宫。丑宫三十度。子宫三十度。及土星所踱之亥宫十九度","y":["木","土"]},{"b":"择日","p":"76.1","t":"即土星到地平寅方六度也。又从土星所踵之二十度。计至火星所踱之二十度二作十度作廿一度贯多一度","y":["火","土"]},{"b":"择日","p":"76.1","t":"复将些一度。加于算盆中。共得斗一度依上法推之即土星到地平寅方五度也馀俱做此。地平二十四方","y":["土"]},{"b":"择日","p":"77.1","t":"太阳责道到未正照坐山。今择修造坤山兼未，坐未宫五要不分，大吉大利，修主年命，利亥卯未午三合六台，及甲戊命进贵，乙癸命纳甲俱吉","y":["日"]},{"b":"择日","p":"77.1","t":"谨择於光绪十三年，六月初一日丁亥，宜用未初初艺芬，太到山大吉又择於光绪十二，六月初一日丁亥，宜用未初初刻乁分，太阴水星旋亦刂山","y":["月","水"]},{"b":"择日","p":"78.2","t":"已宫23度45分贵元：太阳丑官6度45分太阴已官1度1分贵元：木星已官9度47分马元：水星午官21度16分禄元：金星辰宫10度16分火星于官0度度29分土星本课取、太阳到山，太阴合照高元守照、贵元守照、恩星守照，水是会合水太魚巳巳盤角弧肀北五分取日十初月八坐時壬庚丁辛山初午寅酉未兼申寅·279","y":["日","月","水","金","火","木","土"]},{"b":"择日","p":"79.1","t":"動天角弧西之周盤星法三洋選仰艮向兼分年寅陰乇十甲子月初壬午刻木令寅立尾十火度0九度度度六六五艽亢兀十江夜正課葬金界福往七縣廿戌子分北六四極度十出翌秒地二在守度宫立天命福十命頂木星二亥·280","y":["木"]},{"b":"择日","p":"80.2","t":"可之當多格乛人·貴元水星貴天立東一日演]孝勝士出用“此守櫞元星為木星命出刻用列湘數，荨之先極垣格．為禄星禄本地十卯得283","y":["水","木"]},{"b":"择日","p":"81.2","t":"趨避祖卯宫度卅五分元总录马禄贵兀兀南亥南亥南南亥南北辰亥宫纬纬罕纬宫纬宫宫宫宫0一0廿一00一一九三竺七度廑度度四度度藶度度度度卅十卅廿辛三罕五十十十卅一壯廿五九八匹八五八一一十五四九式格圓角孤課星天向亥山巳撰盤寺八辛卯頂冰昼十辛丑天肀角月庚寶正丙寶五五福下地格全旺主风又朝一在亥宫禄两白为禄人星地力用财光得元禄亥宫'元星并马元·禄平分》-马宫'马为岁元，辰立0，天星贵丁格月格贵'贵元在贵星'水星马命东曱元，太星人月囗，人为元·285","y":["水"]},{"b":"择日","p":"84.1","t":"后算「初求虚弧度」廿九度四四分正切O九七五六七五八七，加通弦，减去太阳距度纬度南三度廿二分馀切一三O四三三、馀数为O八五二六三三六四馀弦八八度O五分、相减、「次求虚度角度」六太阳黄道经度辰卯寅丑于亥等六宫内，即以「未全角度」八度O五分、相减「次求墟度角度」七六度十二分，馀数为十一度五三分，一小时化十五度，共化四七分川二秒用事午时前为威，午时后为加，即得十一时士芬廿八秒午时初初士芬是为太阳到巳山即地平经度时刻","y":["日"]},{"b":"择日","p":"85.1","t":"最陶胥来先生葬其先生吉课小雪後太阳到甲寅山分金度刀取亥卯未木局补山己未日以相主巳土坐年上又得禄","y":["日"]},{"b":"择日","p":"85.1","t":"甲山与已日会有合则与庚戌命不互相克制。未日为甲戌庚山命之贵人卯时等王岁之贵人太阳与月德到山庚戊王命之岁贵禄井乙奇又吊到山到穴四柱纯粹禄贵重之造命之吉诚未易得葬後两年之内连添三丁造命好获福最快又窃幸光灵之安妥也","y":["日"]},{"b":"择日","p":"85.1","t":"天兺丕且至官十九度即西人地之度。为穴度水星正到东地平对照穴度临照命宫最吉。坎就人首水木为就山之星","y":["水"]},{"b":"择日","p":"86.2","t":"陶胥来先生建造宗祠吉课课遵天步真原谨择王申年八月二十日申时初初刻为用事时分东方出地子宫一度三十二分为命宫有太阳太阴福星三照木星金星对照而日月叉与水星福星左右三合互相吉照何吉如之火同水星到水星宫界在阴宫权小土星行里到降下角无力凡修造要命在定宫太阴在风局申宫与一吉星吉照正遇其星在庙旺宫分又在黄道北先太阳东出太阴亦在东光华满照则吉此盆件之皆合浑天宝照日二曜迎祥五星效顺此之谓也","y":["日","月","水","金","木","土"]},{"b":"择日","p":"86.2","t":"按此星盆最吉妙在日月会诸吉星三合照命度木星在角对照命官又与王丙子午坐向天盆相应天然巧合日月诸吉殃照命度即日月诸吉拱照坐宫也木星会金与！","y":["木"]},{"b":"择日","p":"86.2","t":"对照命度即木星会吉星对照坐官也云以此山之地‰地此刻之天盆则日月双四馀焕彩既山川之尽善更象纬讹诚为上上吉课可为天星择吉之标准也此课嘉庆丁已年分人月廿二日申时巳交邝露与令乃昆陵陈平伯自择为子山午向翻造中嗶的丿！","y":["木"]},{"b":"择日","p":"87.1","t":"爷元总录寅令大庚戊庚丁申午戌巳火初八計月申申十十与大福并度太阳会角大星福星三照与火星到七宫鱼内冲照命宫弦照太阴罗计犯月土星又弦照太阳凶多吉少彼专用天星者尚且加此其馀可知录此以为天星选择之戒井将陶胥来原论照录於後","y":["日","月","火","土"]},{"b":"择日","p":"88.2","t":"无总阳到山向命度以用事时分此天星中易於取用亦本占人善之法怛太阳有呻寸不吉如与火星或土星相会或冲弦照此囿论太阳逆行切不呵用凡遇造艺若天星八字要求全责备诚事也杨筠松云不得蕃真龙得年月也须富贵旺人家郭景纯云地吉葬凶与奔尸同造命之关系祸福岂可轻忽右论皆出陶胥孑来先生其中论造命体用极是如三冬金水宜透木火三夏火二土局宜透金水此五行妙用复能消息人微录之为选择之助“299","y":["日","火","土"]},{"b":"择日","p":"89.2","t":"弧角星盆椎算。得东比地已宫三度。为命宫有太阳会金星土星水星太阴亽五星吉同到命度","y":["日","月","水","金","土"]},{"b":"择日","p":"89.2","t":"照临有大权。又到巳丙向朝坐尢为大吉木为岁星升殿。亥宫对照命度。火星在降舍）无权而与日月金水土五福","y":["火","木"]},{"b":"择日","p":"89.2","t":"卯时齐到东地平与坐宫三合拱照。木星化天才贵人到西地平拱照坐向。日月五星与命度山方关照","y":["木"]},{"b":"择日","p":"90.2","t":"此课四柱两甲、两乙、甲阳、干则现阳贵人而夹阴贵人乙阴千则现阴贵人、而夹阳贵人、甲文、乙武、甲奇遁得乙偶、乙偶遁得甲奇、四柱奇偶贵人两两相对、甲乙属木河图天三生甲木地八乙成之以甲乙两扶巽方也天盆子时正二刻、木星在本升正到东地平临照命度、太阳金星六照命宫、日月五星在辰已午未四宫、五星、日月与巽方回照拱照","y":["日","金","木"]},{"b":"择日","p":"91.1","t":"人命或造葬遇之，可必其大发，今录存以为天星择吉之标准。木星会并宿，三星正守命度，太阳太阴金星福星三合照命","y":["日","月","金","木"]},{"b":"择日","p":"91.1","t":"水星到本角，会角大星到四宫。土星在降角，又到下去宫弱甚。火星喜夜生，在阴宫权小","y":["水","火","土"]},{"b":"择日","p":"91.1","t":"木星到本升，在东初留，正到东地平强甚。日同金星有大权，又与福星会。选择专重太阴在吉星宫界，夜同火星在天，与木金福星三合照吉莫大也","y":["月","金","火","木"]},{"b":"择日","p":"92.1","t":"易称地道无成，而代有终也。今择於壬申年八月二十日申初初刻为用事时分，东方出地，子宫一度一十二分为命0，有太阳太阴福星三照，木星金星对照而日月又与木星福星左右三六合互相吉照","y":["日","月","金","木"]},{"b":"择日","p":"92.1","t":"火同水星到水星官。金星界在阴宫权小，土星行迟到降下角无力。凡修造要要安命在定宫，太阴在风局，与一吉星吉照，正遇其星在庙旺宫分，又在黄道北，先太阳东出，太阴办在东，光华满照则吉此盘件件皆合","y":["日","月","水","金","土"]},{"b":"择日","p":"93.1","t":"十三癸卯旦〈卯有亥月三合不冲酉命）卯时登穴安葬（黎明时落日出时分金）。小雪前太阳到甲卯山分金度，亥卯木局补龙扶山时太阳到山，穴立酉宫（西地平七宫入地一度为穴宫）","y":["日"]},{"b":"择日","p":"93.1","t":"岁星为龙，山主星坐穴，太阳与穴主星对照穴宫，令星生穴之。恩星左右六合拱穴。卯初了刻，穴立酉宫十度","y":["日","木"]},{"b":"择日","p":"93.1","t":"太「到甲卯山分金度。天黎明日未出用以落圹。卯正三刻十分穴立酉宫二十八度，太阳正出东地平对照，穴度有大以分金大吉·308","y":["日"]},{"b":"择日","p":"94.1","t":"岁月六德聚於四干、又得贵登天门时，此最难遇，造命甚吉。天盘取木星到十宫，官角俱全，又在日东甚强，次取水星亦在日东喜第一宫","y":["水","木"]},{"b":"择日","p":"94.1","t":"但得在东即大吉。又喜兴土星到本角，金星亦在角内，何吉如之","y":["金","土"]},{"b":"择日","p":"95.1","t":"许朱氏前已葬多，今补公共人首之龙，又不老补坐山之亲切有力也。小雪後太阳到甲寅山分彳度〈少过），取亥卯未木局，以补山","y":["日"]},{"b":"择日","p":"95.2","t":"太阳与月德到山，庚壬之命岁贵禄奇又弓到山到穴，四柱纯粹贵禄重重，造命之吉诚未易得也","y":["日"]},{"b":"择日","p":"95.2","t":"天磐穴立宫十九度。水星正到东地平最吉。坎龙入，水木为龙，山之主星。今水星得位汞又得令","y":["水"]},{"b":"择日","p":"95.2","t":"龙旺而山亦相矣，分鑫时穴立申宫初度，金为穴主之恩星，正到命度有权，会太阳对照，到吉星宫界，在六阳宫与五宫三照大登穴八字壬午庚贵到山禄到向马到向戊贵到山马到向辛亥庚马到穴贵到向岁贵到穴山禄到穴己未庚禄到山戊贵到穴丁卯庚贵到山马到向戊贵到山“313","y":["日"]},{"b":"择日","p":"96.2","t":"大福元总令日大辰星辰十辰退十八二四度十庚戊庚丁午申午戌已向火乡初天月首申度度。315·土斋","y":["水"]},{"b":"择日","p":"97.1","t":"命立子宫二十度，即子山午向兼壬丙，坐山之宫度也。寒露後，太阳正三合照山，时太阳会角大星，与时太阴福星三合照命度，即是照坐山之宫度","y":["日","月"]},{"b":"择日","p":"98.2","t":"一则会成巳酉丑金局，以浅艮山气。二则克化命甲乙木（年月已透庚辛二干克命）。则冬至节内西时太阳已入西地平，又适逢合朔，日月俱无光","y":["日"]},{"b":"择日","p":"98.2","t":"冬至後太阳到艮丑山分金度，天盘穴立午宫十九度。有大阴与水木土三星三合照令星到穴（在六阴宫又当冬令权小且与太阳三合照）","y":["日"]},{"b":"择日","p":"98.2","t":"金星正到东地平对照穴度有大权。巳时太阳又三合照山吉天星第一重在选时，此造改一时辰於山命，宜、星宫取舍不啻天渊之隔","y":["日","金"]},{"b":"择日","p":"99.2","t":"宅主庚甲：主事丙辰凡不住宅内者，冲克皆不忌。冲克而有生了解者，亦不忌。今年岁破在山，本不可起造兹不得己，用霜降後小雪前，太阳在卯三合照亥山","y":["日"]},{"b":"择日","p":"99.2","t":"以解岁破，又用巳时初刻，真太阳到向上分金度，晶光对射亥山以解之，则虚实兼到矣。惜来迟半月，日寸日稍促，须有六班匠人，分值各进，同时一齐动手砖瓦木石料，亦用多人预先做就，方不蹉过日时九月十六壬午日辰时，开门起工断木作料，巳时初刻动土平基开水沟墙脚","y":["日"]},{"b":"择日","p":"99.2","t":"二十五辛卯日巳时初刻定磉。十月初二丁酉日辰时初刻（日初出地平时）竖柱，巳时初刻上梁盖屋做脊，接连做去不另择日小雪前太阳犹在卯，=台照亥山","y":["日"]},{"b":"择日","p":"99.2","t":"西日与i0三合，使不冲亥月。且会金局生山。辰时初刻卯宫二十八度，太阳正出东地平坐命有大1辅之太阴与今星〈冬以火为令星）左右屮初刻真太阳到向上分金度·321·","y":["日","月"]},{"b":"择日","p":"100.1","t":"最宫二十四度。岁星为主，三台照令星，六合照凶星，尽解星度妙合大吉。常州项木林选推","y":["木"]},{"b":"择日","p":"100.1","t":"项所云，种种拱照，俱是写得好看，查上梁时刻火星正到十宫内，虽是冬令亦不宜用。项是老作家，尚且如此，其馀可知","y":["火"]},{"b":"择日","p":"100.1","t":"且以已年用亥月，而于支破碎。强以年日牵合谓会金局，其用已时初刻谓照亥山。不知弧扇算法，太阳照山须及分秒，安得谓初刻即实照亥山乎","y":["日"]},{"b":"择日","p":"100.1","t":"凶仅止于火灾，亦云幸矣。陶君与温明叔官保均归咎于火星，仍是迁就天星之说。不知此日虽不犯火星，亦决其必凶，书此以为遗弃神煞，侈谈天者为炯戒也","y":["火"]},{"b":"择日","p":"101.1","t":"辛巳年五月，同二纪前丁巳年十二宫度。命立子宫二十度，适与太福井度，有太阳太阴同金木上三星，又会福与角大星三六合照","y":["日","月"]},{"b":"择日","p":"101.2","t":"惟时冲可缘，真太阳到向对照坐山吉制煞u大惕到山向，或三合吊照山为第一木林专重真太阳到山向，命度以为用事时分","y":["日"]},{"b":"择日","p":"101.2","t":"此天星中易於取用，亦本古人妥善之法。但太阳有时不吉，如与火星或土星相会，或冲弦照，此旧，论太阳逆行切不可用","y":["日","火","土"]},{"b":"择日","p":"101.2","t":"关系祸福如此，岂可轻忽。太阳木星性皆热属书，太阴个润属夜，火土二星反是。火星性燥，却属夜","y":["日","月","火","木"]},{"b":"择日","p":"102.1","t":"画，落太阳之後为夜。属画者，心得喜在地平上，属夜者，夜喜在地平上。太阴之性与太阳相会後，至上弦则润，上弦至望则热望至下弦则燥，下弦至再会则寒","y":["日","月"]},{"b":"择日","p":"102.1","t":"土木火三星与太阳相会後，至至位留处性多润，自至位至与太阳相冲时性多热，自冲後第·位留处性多燥，自第二留与太阳再会时性多寒","y":["日"]},{"b":"择日","p":"102.1","t":"金主夏与太阳相会后，至第一位留处性多润，自第一位逆行後，复与太阳会时性多热，自会後至第二位留处性多燥，目第二位至顺行後，复与太阳会性多寒","y":["日"]},{"b":"择日","p":"102.1","t":"凡太阳齐东地平，到选时命官度，与木星或土星三六合照，造葬皆可用，再与太阴三六合照更吉","y":["日","月","木","土"]},{"b":"择日","p":"102.1","t":"但火土二星不可在四正宫，又不可与太阳会冲，炫照西法第一凶星是土星。缘彼地极寒，天时地利自相感应","y":["日","土"]},{"b":"择日","p":"102.1","t":"愚见中法第一凶星是火星。自古中华谈天文者，且以土为吉星。今历观人命，土星到十宫竺宫与太阳三合照六者其人多富贵寿考，些证也","y":["日","火","土"]},{"b":"择日","p":"102.2","t":"和而火星不可用。如命立子官一度，太阴或五星中一星，亦召丨日纬北三度，已出地一度二十分","y":["月","火"]},{"b":"择日","p":"102.2","t":"如取木星或金星到命官度初分，要看纬南纬北。西法选择重大阴，中法选择重太阳。然据西法太阴亦有时不可取，如太阴不在吉位，金木二星又不能用","y":["日","月","金","木"]},{"b":"择日","p":"102.2","t":"遇造葬事处於必不得已。日时又急促，当取太阳到东地平，与水星会。妞灾主夏会冲弦照","y":["日","水"]},{"b":"择日","p":"102.2","t":"又不在西正宫，用之亦可。此天星择吉之迁就法也，太阴行疾，西法重大阴，取其吉应之速也","y":["月"]},{"b":"择日","p":"102.2","t":"如太阴难取，当取木星或金星到命十宫顺行者可用，再能与太阳三六合照更安厝时，木星到本宫本角，本界在太阳东纬|到十宫天顶","y":["日","月","金","木"]},{"b":"择日","p":"103.1","t":"天星要太阴与土星到降下角，如三宫六宫九宫十二宫是也。再取木星，或金星，到一宫或十官，顺听者吉","y":["月","金","木","土"]},{"b":"择日","p":"103.1","t":"叠凶则为祸亦大。太阳与太阴，井金木二星三合照是叠吉也。与火土二星会冲弦照，或与在天经星凶曱相照，是凶也","y":["日","月"]},{"b":"择日","p":"103.1","t":"木火土先太阳束出仃力，金水后太阳西人有力，五曱在太阳光内名为焦伤损力。太阳愈远其力愈强，忄|一次留力亦强","y":["日"]},{"b":"择日","p":"103.2","t":"官，与此选时命宫相台，则吉。不甚相合则庸。如1拗不合，则祈福反致祸也。如人生落地，时太阳在日却度十五分，至次年太阳又到丑宫二度十五分，即是流叫盘宫度","y":["日"]},{"b":"择日","p":"103.2","t":"太阳到山，如乙山辛兼卯西，要太阳到卯宫四度、卯山西兼乙辛，要太阳到卯宫十二三度","y":["日"]},{"b":"择日","p":"103.2","t":"卯山西兼甲庚，太阳到卯官十九二十度。甲山庚兼卯酉，要太阳到卯宫十八七度，或前三度后三度，总为太阳到山","y":["日"]},{"b":"择日","p":"103.2","t":"如火星与太阳三六合照吉星，凶照不可川如木星与太阳冲弦照，满三百六十度力周，一百八十度为半周，九十度为一象限：宫为命官，万事万物之命，吉凶皆在其中财帛，宫兄弟，四宫父祖田宅，为丿|宫男妇，六宫疾病奴仆，七宫妻卩1人·329","y":["日","火","木"]},{"b":"择日","p":"104.1","t":"亡，九宫迁移，十官功名又属母，十一宫福禄，十二宫祸门监狱。凶星吉照可用吉星恶照可用，惟太阴案真原曰所到宫，主星在四弱柱上（三宫六宫九宫十二官为弱柱，一宫十宫四官匕官为四正柱，九宫十一宫为十宫之辅柱，《宫五官为四宫之辅柱","y":["月"]},{"b":"择日","p":"104.1","t":"）又大阴与凶星（火土）相照，则所行之事久后不吉。又曰太阴不能得吉位，却得木星或金星在天顶之十官，或立命之一顺受者亦可用","y":["月","金","木"]},{"b":"择日","p":"104.1","t":"其说甚明，陶君谓吉星凶照亦不可用，与真原丰背必不可从。凡一切选择，尊重大阴并太阳所在宫主星，选择所为何事，所系何位，并其位官主星，其事所主之星，与选时安命宫及四正柱皆要吉","y":["日"]},{"b":"择日","p":"104.1","t":"谋事欲快疾，决绝不谷缠绵者，选安命主在转宫，太阴亦在转宫，要吉星相咀。修造欲久远坚固，选安命主在定宫，太阴亦在定宫，要吉星相照","y":["月"]},{"b":"择日","p":"104.1","t":"作显扬事，选太阴在阳宫。作隐密事，选太阴在阴宫。若太阴宫主星在四弱柱上，又太阴与凶星相照，所行之事久后不吉","y":["月"]},{"b":"择日","p":"104.2","t":"求子息安床安房门，要太阴在阳官，与有力人阳」。安命在阳宫，命主星亦在阳官。与吉星相照，凹日柱上，无凶星照","y":["月"]},{"b":"择日","p":"104.2","t":"嫁娶要小阴在西宫，或巳午申宫，‰I星照，不与恶星照，金星要在吉度。子午卯西为定宫，辰戌丑未为转宫，寅申巳亥为体官，日在午，月在未，金在辰西，木在寅亥，水在巳申，火在卯戌，土在子丑，为到本舍，乃第有权","y":["金"]},{"b":"择日","p":"114.2","t":"无总论鸟兔太阳例其法以上月下句卯日为主。点至本月初一日止。如月廿八丁卯日加入地支子位顺数","y":["日"]},{"b":"择日","p":"114.2","t":"起初一逆数。初一庚午在震初二幸未到坤。即太阴日也初三壬申到坎。初四癸丑到离。初五甲戍到艮","y":["月"]},{"b":"择日","p":"114.2","t":"甲戌日即兔鸟太阳也。落坎位起顺子点到艮。乃是未时也。即甲戌日未时。如辛未太阴日","y":["日","月"]},{"b":"择日","p":"114.2","t":"而辛乃是丙辛。落震位起子。即辛未日丑时。但太阳修方葬山","y":["日"]},{"b":"择日","p":"116.2","t":"泶曜化餘四政七天禄天仁喜禄印宫魁文科星刃元元元閿元神神星星星星元名年火土月木計日木星木氣月羅禾木甲0囗000000日金氣水木木火氣計日火金火火丙日土思水金火土月土木土孛火金土土戊","y":["木"]},{"b":"择日","p":"117.2","t":"命宫者，生时太阳所在地平饯上也。即太阳在了'自日出卯时，则命官在子也。如正月雨水似後太阳在，地缭绕太阳之踵度）日出卯正，如卯时生，则以亥为命宫辰时生，则以戌官为命宫","y":["日"]},{"b":"择日","p":"117.2","t":"巳时生，则以西宫为命官所以命官者，即由地球所踵太阳之度，与所用时间，和吕地纬度（北极高）之关系也","y":["日"]},{"b":"择日","p":"117.2","t":"太阳之踵次，正月需雨水气过後，太阳方临亥宫0道330度），在雨水之前，则尚在子宫","y":["日"]},{"b":"择日","p":"125.2","t":"分秒31从太阳黄道求赤纬公式：sinö=sinÄsiIiEtana=tanXCOSE=COSÄCOSbcana入分点5依前面公式赤纬以春分秋分为基点，所以：太阳黄道为伊一180·为纬北太阳黄道1","y":["日"]},{"b":"择日","p":"127.1","t":"有方位求太阳到山时刻在纳氏（Napier）比例法中，由球面斜角公式1SI2COS一212A：天頂C：北极B：太阳H：地平方位SN：地平QQ'：赤道未丑：黄道辰：秋分天顶北極B太陽`秋分地距午偏度距子偏度之Q冬至如上图以春分为例：CN：纬度（北极高）AC：北极至天顶（9纬度）““伟边）因：：90度故AC=9C-CN(纬度）如上图：壬B为北纬北距而壬C（赤道至北极）为90度故BC（太阳至北极）BC：90度一赤纬（壬B）·376","y":["日"]},{"b":"择日","p":"127.2","t":"A：天顶0北极B：太阳H：地平方位SN：地平'：赤道未丑：黄道戌．春分冬至太元总以秋分为例A天頂崩距地平C北極距子度未夏至如上图以秋分为例：：纬度（北极高）配一90","y":["日"]},{"b":"择日","p":"128.1","t":"又依球面三解形厶C中ZABC为A角（即天顶之外角）即A角=18伊一SH〈罗经立向之距午偏度）ZABC为B角即太阳角依公式sin=sinbsinAsinbsinA·sinB=SIIIa由以上得知b边=艹纬度A角=1度一（罗经方位距午偏度）a边：秋分后：度+赤纬春分后=90一赤纬以上由b边、a边、A角可从上面公式求B角，即知B角，则可从纳氏之公式1stn-(a+b)21sin-(a—b)·378·","y":["日"]},{"b":"择日","p":"128.2","t":"举例：如下、太阳黄道计算法、太阳到山计算法、孤角十二官计算法图距北纬赤后分舂图距南纬赤后分秋天顶北极太阳地平方位地平赤道未丑：黄道戌：春分天顶北极未夏至丑冬至太阳赤纬南距距午偏度距于偏度春分戌王地平黄道赤道天顶北极太阳地平方位地平赤道未五：责道戌：春分地平黄赤道天顶北极天顶北极未夏至丑冬至太阳赤纬南距距千偏度距子偏度春分戌壬·379·太阳地平方位地平赤道北极未夏至丑冬至太阳赤纬南距距午偏度距子偏度春分戌壬未丑：黄道地刂'戌：春分币天顶","y":["日"]},{"b":"择日","p":"130.2","t":"59'太阳黄道1？即巳宫23·40'\"先求十宫黄道求赤道依公式tana=tanÄcosE“383“","y":["日"]},{"b":"择日","p":"135.1","t":"元：太阳巳宫23度45分太阴官6度45分贵元木星：巳宫1度1分马元：水星已宫9度乙7分禄元：金星午宫21度16分火星辰官10度16分、太阳到山，太阴合照、贵元守照，马元守照、恩星守照，水日会合本课取土星子宫0度29分水太穹宫宫盤星角孤奄分夺驴取日十初月八坐午時壬庚丁辛山初午寅酉未兼分申寅分·392·","y":["日","月","水","金","火","木","土"]},{"b":"择日","p":"136.1","t":"元秉前表北平之太阳到方时刻摘录自协纪辨方前表长沙之太阳到方时刻摘录自张祖同之取吉述正前表台北之太阳到方时刻摘录自汪容骏先生之七正四馀演算例解","y":["日"]},{"b":"择日","p":"136.1","t":"本人亦全部演算过程资料。前表新竹之太阳到方时刻为本人演算出来又按·上表新竹之计算，其黄赤大距以23","y":["日"]},{"b":"择日","p":"136.2","t":"用表查到山時刻（例一）民国75年农历元月14日太阳亥宫8'求未山兼丁用丁分金即距午偏西0'台北地区太阳到山刊刻：则民国75年农历元月14日太阳在亥宫8'而未山兼丁用丁未分金为距午偏西20'即未初50一、先求未山太阳到亥宫8'之时刻即雨水太阳到未山为12时分径直太阳到未山为12时48分兩者相差8分因雨水到径直为所以8'为（8分÷15）×8'=1","y":["日"]},{"b":"择日","p":"136.2","t":"759分即1．8分则未山太阳到亥宫8之时刻为12時56分一1，8分：12時。2分二、再求坤山太阳到亥宫3．18之时刻即雨水太阳到坤山为13时42分径直太阳到未山为13时27分两者相差15分因雨水到径直为所以8'为·395·","y":["日"]},{"b":"择日","p":"138.1","t":"即8，6牙×2=17·24r÷15=1，149时=1时8·96分12时+1时8·％分：13时8·96分即太阳到未山兼丁为13时8，96分此与用表所查13时9分相同点※此所计算出来为一北地区之当地时间，瓠欲换算中原标准时间则须加上经度差即一北经度度差6分则为中原标准时间13时03分矣","y":["日"]},{"b":"择日","p":"140.1","t":"三无总1—C=10.26T2cot5·52559810，26r×2=20·5÷15=1·3689时：1时分12时一1时22分=10时38分即太阳到辰山兼乙为10时38分此计算与用3分，当以计算为准","y":["日"]},{"b":"择日","p":"140.2","t":"太阳黄道求法例：求西元1987年2月4日0时太阳黄道第一表第二表一0．0729，57第三表314·一318'\"1900年87年30日5日279．204·93313·1·2282·7313·63g=30·93第五表g=39，93+1·01·403·","y":["日"]},{"b":"择日","p":"141.1","t":"、元总例：求西元19年12月加日15时太阳黄道1900年88年3日日5日15hg=7279．2028L2十0，68+1，5282，7295．5749，28270．44．93g=7，70．270．40一0·269，98一268'48”※19年12月21日15時28分交冬至·404·","y":["日"]},{"b":"择日","p":"146.2","t":"例：西元1988年y为則一伊·23872×+，03076×（了）一8×0+076×=+·672太陽黄道位置的推算依据S.NewcombTabIesoftheSun中对于太阳要素的记日下：元期：19mJanOGMN=J，D15020·0T=一世纪=年=365·25日平均经度：L=271''","y":["日"]},{"b":"择日","p":"147.1","t":"g=0，0m13黄道倾斜角=27·8··一，一0“5+0'·00181T=1年=一世纪间的变化数量亦即325日之变化量：一日之变化量以t为单位即129713÷36525日=伊·98573日嘔0咿，一变化量太阳黄经〈V+g)+摄动项=L+〈v一g）+摄动项V一g=中心差·416．","y":["日"]},{"b":"十干变曜原理","p":"2","t":"十干变曜口诀：甲火乙孛丙属木，丁是金星戊土求，己为太阴庚是水，辛气壬计癸罗喉根据口诀十干配星政如下：甲乙丙丁戊己庚辛壬癸火星月孛木星金星土星月亮水星紫气计都罗喉根据《内在的天空》这书，可知，在西方星占里面，火土水风四元素，这四元素与方位对应关系如下：东北西南火土水金西方星占的四元素和我国的四象非常相似，在我国术数里面是没有风这一元素的，火土水都有，风在后天八卦位于巽位，巽为辰巳所居，即然火土水都有了，辰属东方，故将风元素替换为木","y":["月","水","金","火","木","土","罗","计","炁","孛"]},{"b":"十干变曜原理","p":"2","t":"十一个星曜除太阳外，已经有五个配好了，还有孛，金星，月亮，紫气，罗喉没有配。木（风）丙丁孛(水)乙戊己庚水火甲土辛气(木)癸壬计(土)乙庚相合，则乙配孛，丙辛相合，则辛配气丁壬相合，配土，但土已经配完了1","y":["日","金","罗","炁"]}];
+/* ===== KB-END ===== */
+
+const BOOK_FULL = b => '七政四余' + b;
+const YAO_ALIAS = {
+  '日': ['太阳'], '月': ['太阴'],
+  '水': ['水星', '辰星'], '金': ['金星', '太白'], '火': ['火星', '荧惑'],
+  '木': ['木星', '岁星'], '土': ['土星', '镇星', '填星'],
+  '罗': ['罗睺', '罗喉'], '计': ['计都'], '炁': ['紫气', '紫炁'], '孛': ['月孛']
+};
+/* ===== RULES-BEGIN ===== */
+const RULES = {"built":"七政四余可判定规则库","structure":["1) 曜 × 地支宫（《星命溯源·論七政躔次喜忌》《四餘躔次喜忌》）——可直接判定。日、月原书按十二宫位（命/财帛/…）叙述，须先定命宫，故不用；日月另立第 5 类。","2) 曜对曜与行度状态（《續論七政四餘分布宜忌及入格真偽》）——可直接判定","3) 成格（同上＋本地八书）——可直接判定","4) 曜 × 十二宫位（命/财帛/兄弟/田宅/男女/奴仆/夫妻/疾厄/迁移/官禄/福德/相貌）——须先定命宫，本页不参与命中","5) 日、月的相对喜忌（《星命溯源·論七政躔次喜忌》原文）：金水引从拱夹、孤阳无辅、木炁掩光、罗主刻剥、犯阳、日生得用/夜生则轻；土计最凶、火罗稍凶、金木水相随、夜生最佳、上下弦作煞、望日中气——可直接判定"],"rules":[{"id":"木@寅","kind":"gong","yao":"木","verdict":"吉","src":"星命溯源·論七政躔次喜忌","why":"寅亥二宫吉；木在卯宫多利，忌见金火","c":{"t":"pos","y":"木","g":"寅"},"text":"木居寅宫：吉。","pl":"木星落在寅宫（寅宫属木），判为「吉」：得地相宜，顺遂有利。"},{"id":"木@亥","kind":"gong","yao":"木","verdict":"吉","src":"星命溯源·論七政躔次喜忌","why":"寅亥二宫吉，为人清秀慈善","c":{"t":"pos","y":"木","g":"亥"},"text":"木居亥宫：吉。","pl":"木星落在亥宫（亥宫属水），判为「吉」：得地相宜，顺遂有利。"},{"id":"木@未","kind":"gong","yao":"木","verdict":"吉","src":"星命溯源·論七政躔次喜忌","why":"未宫亦吉（木升殿于未）","c":{"t":"pos","y":"木","g":"未"},"text":"木居未宫：吉。","pl":"木星落在未宫（未宫属土），判为「吉」：得地相宜，顺遂有利。"},{"id":"木@巳","kind":"gong","yao":"木","verdict":"受生吉","src":"星命溯源·論七政躔次喜忌","why":"巳申二宫受生吉","c":{"t":"pos","y":"木","g":"巳"},"text":"木居巳宫：受生吉。","pl":"木星落在巳宫（巳宫属火），判为「受生吉」：得此宫之气相生，吉。"},{"id":"木@申","kind":"gong","yao":"木","verdict":"受生吉","src":"星命溯源·論七政躔次喜忌","why":"巳申二宫受生吉","c":{"t":"pos","y":"木","g":"申"},"text":"木居申宫：受生吉。","pl":"木星落在申宫（申宫属金），判为「受生吉」：得此宫之气相生，吉。"},{"id":"木@卯","kind":"gong","yao":"木","verdict":"利","src":"星命溯源·論七政躔次喜忌","why":"凡木在卯宫多利","c":{"t":"pos","y":"木","g":"卯"},"text":"木居卯宫：利。","pl":"木星落在卯宫（卯宫属木），判为「利」：尚得其利。"},{"id":"木@戌","kind":"gong","yao":"木","verdict":"脱气平平","src":"星命溯源·論七政躔次喜忌","why":"戌卯二宫脱气，平平见土计","c":{"t":"pos","y":"木","g":"戌"},"text":"木居戌宫：脱气平平。","pl":"木星落在戌宫（戌宫属土），判为「脱气平平」：气被泄去，平平。"},{"id":"木@子","kind":"gong","yao":"木","verdict":"怒","src":"星命溯源·論七政躔次喜忌","why":"子丑二宫怒，见炁则余奴主反孤","c":{"t":"pos","y":"木","g":"子"},"text":"木居子宫：怒。","pl":"木星落在子宫（子宫属水），判为「怒」：失位被克，不得其所，不利。"},{"id":"木@丑","kind":"gong","yao":"木","verdict":"怒","src":"星命溯源·論七政躔次喜忌","why":"子丑二宫怒，见炁则余奴主反孤","c":{"t":"pos","y":"木","g":"丑"},"text":"木居丑宫：怒。","pl":"木星落在丑宫（丑宫属土），判为「怒」：失位被克，不得其所，不利。"},{"id":"火@卯","kind":"gong","yao":"火","verdict":"吉","src":"星命溯源·論七政躔次喜忌","why":"卯戌二宫吉（火庙于卯）","c":{"t":"pos","y":"火","g":"卯"},"text":"火居卯宫：吉。","pl":"火星落在卯宫（卯宫属木），判为「吉」：得地相宜，顺遂有利。"},{"id":"火@戌","kind":"gong","yao":"火","verdict":"吉","src":"星命溯源·論七政躔次喜忌","why":"卯戌二宫吉","c":{"t":"pos","y":"火","g":"戌"},"text":"火居戌宫：吉。","pl":"火星落在戌宫（戌宫属土），判为「吉」：得地相宜，顺遂有利。"},{"id":"火@申","kind":"gong","yao":"火","verdict":"乐","src":"星命溯源·論七政躔次喜忌","why":"申巳宫乐","c":{"t":"pos","y":"火","g":"申"},"text":"火居申宫：乐。","pl":"火星落在申宫（申宫属金），判为「乐」：居此宫安然自得，吉。"},{"id":"火@巳","kind":"gong","yao":"火","verdict":"乐","src":"星命溯源·論七政躔次喜忌","why":"申巳宫乐；巳宫躔轸则受制，躔翊为朱雀乘风","c":{"t":"pos","y":"火","g":"巳"},"text":"火居巳宫：乐。","pl":"火星落在巳宫（巳宫属火），判为「乐」：居此宫安然自得，吉。"},{"id":"火@寅","kind":"gong","yao":"火","verdict":"吉","src":"星命溯源·論七政躔次喜忌","why":"寅宫吉（火生于寅）","c":{"t":"pos","y":"火","g":"寅"},"text":"火居寅宫：吉。","pl":"火星落在寅宫（寅宫属木），判为「吉」：得地相宜，顺遂有利。"},{"id":"火@子","kind":"gong","yao":"火","verdict":"泄气","src":"星命溯源·論七政躔次喜忌","why":"子丑二宫泄气，见金则怒","c":{"t":"pos","y":"火","g":"子"},"text":"火居子宫：泄气。","pl":"火星落在子宫（子宫属水），判为「泄气」：元气外泄，不利。"},{"id":"火@丑","kind":"gong","yao":"火","verdict":"泄气","src":"星命溯源·論七政躔次喜忌","why":"子丑二宫泄气，见金则怒","c":{"t":"pos","y":"火","g":"丑"},"text":"火居丑宫：泄气。","pl":"火星落在丑宫（丑宫属土），判为「泄气」：元气外泄，不利。"},{"id":"火@辰","kind":"gong","yao":"火","verdict":"为火","src":"星命溯源·論七政躔次喜忌","why":"躔辰酉为火","c":{"t":"pos","y":"火","g":"辰"},"text":"火居辰宫：为火。","pl":"火星落在辰宫（辰宫属土），判为「为火」：此宫同为火，不加不减。"},{"id":"火@酉","kind":"gong","yao":"火","verdict":"为火","src":"星命溯源·論七政躔次喜忌","why":"躔辰酉为火","c":{"t":"pos","y":"火","g":"酉"},"text":"火居酉宫：为火。","pl":"火星落在酉宫（酉宫属金），判为「为火」：此宫同为火，不加不减。"},{"id":"土@子","kind":"gong","yao":"土","verdict":"吉","src":"星命溯源·論七政躔次喜忌","why":"子丑二宫吉","c":{"t":"pos","y":"土","g":"子"},"text":"土居子宫：吉。","pl":"土星落在子宫（子宫属水），判为「吉」：得地相宜，顺遂有利。"},{"id":"土@丑","kind":"gong","yao":"土","verdict":"吉","src":"星命溯源·論七政躔次喜忌","why":"子丑二宫吉","c":{"t":"pos","y":"土","g":"丑"},"text":"土居丑宫：吉。","pl":"土星落在丑宫（丑宫属土），判为「吉」：得地相宜，顺遂有利。"},{"id":"土@卯","kind":"gong","yao":"土","verdict":"吉","src":"星命溯源·論七政躔次喜忌","why":"卯戌二宫吉","c":{"t":"pos","y":"土","g":"卯"},"text":"土居卯宫：吉。","pl":"土星落在卯宫（卯宫属木），判为「吉」：得地相宜，顺遂有利。"},{"id":"土@戌","kind":"gong","yao":"土","verdict":"吉","src":"星命溯源·論七政躔次喜忌","why":"卯戌二宫吉","c":{"t":"pos","y":"土","g":"戌"},"text":"土居戌宫：吉。","pl":"土星落在戌宫（戌宫属土），判为「吉」：得地相宜，顺遂有利。"},{"id":"土@寅","kind":"gong","yao":"土","verdict":"凶","src":"星命溯源·論七政躔次喜忌","why":"入寅申巳亥宫凶","c":{"t":"pos","y":"土","g":"寅"},"text":"土居寅宫：凶。","pl":"土星落在寅宫（寅宫属木），判为「凶」：不利。"},{"id":"土@申","kind":"gong","yao":"土","verdict":"凶","src":"星命溯源·論七政躔次喜忌","why":"入寅申巳亥宫凶","c":{"t":"pos","y":"土","g":"申"},"text":"土居申宫：凶。","pl":"土星落在申宫（申宫属金），判为「凶」：不利。"},{"id":"土@巳","kind":"gong","yao":"土","verdict":"凶","src":"星命溯源·論七政躔次喜忌","why":"入寅申巳亥宫凶","c":{"t":"pos","y":"土","g":"巳"},"text":"土居巳宫：凶。","pl":"土星落在巳宫（巳宫属火），判为「凶」：不利。"},{"id":"土@亥","kind":"gong","yao":"土","verdict":"凶","src":"星命溯源·論七政躔次喜忌","why":"入寅申巳亥宫凶","c":{"t":"pos","y":"土","g":"亥"},"text":"土居亥宫：凶。","pl":"土星落在亥宫（亥宫属水），判为「凶」：不利。"},{"id":"土@辰","kind":"gong","yao":"土","verdict":"脱气","src":"星命溯源·論七政躔次喜忌","why":"辰酉宫脱气","c":{"t":"pos","y":"土","g":"辰"},"text":"土居辰宫：脱气。","pl":"土星落在辰宫（辰宫属土），判为「脱气」：气散无力，不利。"},{"id":"土@酉","kind":"gong","yao":"土","verdict":"脱气","src":"星命溯源·論七政躔次喜忌","why":"辰酉宫脱气","c":{"t":"pos","y":"土","g":"酉"},"text":"土居酉宫：脱气。","pl":"土星落在酉宫（酉宫属金），判为「脱气」：气散无力，不利。"},{"id":"土@未","kind":"gong","yao":"土","verdict":"三丘煞","src":"星命溯源·論七政躔次喜忌","why":"未宫曰三丘煞，见水则怒","c":{"t":"pos","y":"土","g":"未"},"text":"土居未宫：三丘煞。","pl":"土星落在未宫（未宫属土），判为「三丘煞」：犯此煞，主孤克，不利。"},{"id":"金@辰","kind":"gong","yao":"金","verdict":"吉","src":"星命溯源·論七政躔次喜忌","why":"辰酉宫吉（金入垣）","c":{"t":"pos","y":"金","g":"辰"},"text":"金居辰宫：吉。","pl":"金星落在辰宫（辰宫属土），判为「吉」：得地相宜，顺遂有利。"},{"id":"金@酉","kind":"gong","yao":"金","verdict":"吉","src":"星命溯源·論七政躔次喜忌","why":"辰酉宫吉（金入垣）","c":{"t":"pos","y":"金","g":"酉"},"text":"金居酉宫：吉。","pl":"金星落在酉宫（酉宫属金），判为「吉」：得地相宜，顺遂有利。"},{"id":"金@未","kind":"gong","yao":"金","verdict":"吉","src":"星命溯源·論七政躔次喜忌","why":"未宫亦吉","c":{"t":"pos","y":"金","g":"未"},"text":"金居未宫：吉。","pl":"金星落在未宫（未宫属土），判为「吉」：得地相宜，顺遂有利。"},{"id":"金@子","kind":"gong","yao":"金","verdict":"受生","src":"星命溯源·論七政躔次喜忌","why":"子丑宫受生","c":{"t":"pos","y":"金","g":"子"},"text":"金居子宫：受生。","pl":"金星落在子宫（子宫属水），判为「受生」：得此宫之气相生。"},{"id":"金@丑","kind":"gong","yao":"金","verdict":"受生","src":"星命溯源·論七政躔次喜忌","why":"子丑宫受生","c":{"t":"pos","y":"金","g":"丑"},"text":"金居丑宫：受生。","pl":"金星落在丑宫（丑宫属土），判为「受生」：得此宫之气相生。"},{"id":"金@午","kind":"gong","yao":"金","verdict":"凶","src":"星命溯源·論七政躔次喜忌","why":"午戌卯三宫凶（金乘火位，少失尊亲）","c":{"t":"pos","y":"金","g":"午"},"text":"金居午宫：凶。","pl":"金星落在午宫（午宫属火），判为「凶」：不利。"},{"id":"金@戌","kind":"gong","yao":"金","verdict":"凶","src":"星命溯源·論七政躔次喜忌","why":"午戌卯三宫凶","c":{"t":"pos","y":"金","g":"戌"},"text":"金居戌宫：凶。","pl":"金星落在戌宫（戌宫属土），判为「凶」：不利。"},{"id":"金@卯","kind":"gong","yao":"金","verdict":"凶","src":"星命溯源·論七政躔次喜忌","why":"午戌卯三宫凶","c":{"t":"pos","y":"金","g":"卯"},"text":"金居卯宫：凶。","pl":"金星落在卯宫（卯宫属木），判为「凶」：不利。"},{"id":"金@巳","kind":"gong","yao":"金","verdict":"脱气平平","src":"星命溯源·論七政躔次喜忌","why":"巳申宫脱气，见孛则为花酒之客","c":{"t":"pos","y":"金","g":"巳"},"text":"金居巳宫：脱气平平。","pl":"金星落在巳宫（巳宫属火），判为「脱气平平」：气被泄去，平平。"},{"id":"金@申","kind":"gong","yao":"金","verdict":"脱气平平","src":"星命溯源·論七政躔次喜忌","why":"巳申宫脱气，见孛则为花酒之客","c":{"t":"pos","y":"金","g":"申"},"text":"金居申宫：脱气平平。","pl":"金星落在申宫（申宫属金），判为「脱气平平」：气被泄去，平平。"},{"id":"金@寅","kind":"gong","yao":"金","verdict":"怒","src":"星命溯源·論七政躔次喜忌","why":"寅亥上及见木炁，则怒","c":{"t":"pos","y":"金","g":"寅"},"text":"金居寅宫：怒。","pl":"金星落在寅宫（寅宫属木），判为「怒」：失位被克，不得其所，不利。"},{"id":"金@亥","kind":"gong","yao":"金","verdict":"怒","src":"星命溯源·論七政躔次喜忌","why":"寅亥上及见木炁，则怒","c":{"t":"pos","y":"金","g":"亥"},"text":"金居亥宫：怒。","pl":"金星落在亥宫（亥宫属水），判为「怒」：失位被克，不得其所，不利。"},{"id":"水@巳","kind":"gong","yao":"水","verdict":"吉","src":"星命溯源·論七政躔次喜忌","why":"入巳申吉（水垣）","c":{"t":"pos","y":"水","g":"巳"},"text":"水居巳宫：吉。","pl":"水星落在巳宫（巳宫属火），判为「吉」：得地相宜，顺遂有利。"},{"id":"水@申","kind":"gong","yao":"水","verdict":"吉","src":"星命溯源·論七政躔次喜忌","why":"入巳申吉（水垣）","c":{"t":"pos","y":"水","g":"申"},"text":"水居申宫：吉。","pl":"水星落在申宫（申宫属金），判为「吉」：得地相宜，顺遂有利。"},{"id":"水@未","kind":"gong","yao":"水","verdict":"吉","src":"星命溯源·論七政躔次喜忌","why":"未子宫吉","c":{"t":"pos","y":"水","g":"未"},"text":"水居未宫：吉。","pl":"水星落在未宫（未宫属土），判为「吉」：得地相宜，顺遂有利。"},{"id":"水@子","kind":"gong","yao":"水","verdict":"吉","src":"星命溯源·論七政躔次喜忌","why":"未子宫吉","c":{"t":"pos","y":"水","g":"子"},"text":"水居子宫：吉。","pl":"水星落在子宫（子宫属水），判为「吉」：得地相宜，顺遂有利。"},{"id":"水@亥","kind":"gong","yao":"水","verdict":"朝天稍吉","src":"星命溯源·論七政躔次喜忌","why":"亥宫朝天稍吉","c":{"t":"pos","y":"水","g":"亥"},"text":"水居亥宫：朝天稍吉。","pl":"水星落在亥宫（亥宫属水），判为「朝天稍吉」：有上达之势，稍吉。"},{"id":"水@丑","kind":"gong","yao":"水","verdict":"少凶","src":"星命溯源·論七政躔次喜忌","why":"丑宫少凶","c":{"t":"pos","y":"水","g":"丑"},"text":"水居丑宫：少凶。","pl":"水星落在丑宫（丑宫属土），判为「少凶」：略有不利。"},{"id":"水@卯","kind":"gong","yao":"水","verdict":"怒","src":"星命溯源·論七政躔次喜忌","why":"卯戌上怒","c":{"t":"pos","y":"水","g":"卯"},"text":"水居卯宫：怒。","pl":"水星落在卯宫（卯宫属木），判为「怒」：失位被克，不得其所，不利。"},{"id":"水@戌","kind":"gong","yao":"水","verdict":"怒","src":"星命溯源·論七政躔次喜忌","why":"卯戌上怒","c":{"t":"pos","y":"水","g":"戌"},"text":"水居戌宫：怒。","pl":"水星落在戌宫（戌宫属土），判为「怒」：失位被克，不得其所，不利。"},{"id":"水@寅","kind":"gong","yao":"水","verdict":"脱气","src":"星命溯源·論七政躔次喜忌","why":"寅宫脱气","c":{"t":"pos","y":"水","g":"寅"},"text":"水居寅宫：脱气。","pl":"水星落在寅宫（寅宫属木），判为「脱气」：气散无力，不利。"},{"id":"炁@子","kind":"gong","yao":"炁","verdict":"怒","src":"星命溯源·四餘躔次喜忌","why":"居子丑则怒，犯主位不吉","c":{"t":"pos","y":"炁","g":"子"},"text":"炁居子宫：怒。","pl":"紫气落在子宫（子宫属水），判为「怒」：失位被克，不得其所，不利。"},{"id":"炁@丑","kind":"gong","yao":"炁","verdict":"怒","src":"星命溯源·四餘躔次喜忌","why":"居子丑则怒，犯主位不吉","c":{"t":"pos","y":"炁","g":"丑"},"text":"炁居丑宫：怒。","pl":"紫气落在丑宫（丑宫属土），判为「怒」：失位被克，不得其所，不利。"},{"id":"炁@寅","kind":"gong","yao":"炁","verdict":"为奴","src":"星命溯源·四餘躔次喜忌","why":"居寅亥为奴，犯主位不吉","c":{"t":"pos","y":"炁","g":"寅"},"text":"炁居寅宫：为奴。","pl":"紫气落在寅宫（寅宫属木），判为「为奴」：为此宫所役使，劳而无功，不利。"},{"id":"炁@亥","kind":"gong","yao":"炁","verdict":"为奴","src":"星命溯源·四餘躔次喜忌","why":"居寅亥为奴，犯主位不吉","c":{"t":"pos","y":"炁","g":"亥"},"text":"炁居亥宫：为奴。","pl":"紫气落在亥宫（亥宫属水），判为「为奴」：为此宫所役使，劳而无功，不利。"},{"id":"炁@卯","kind":"gong","yao":"炁","verdict":"有生成之意","src":"星命溯源·四餘躔次喜忌","why":"居卯戌则有生成之意","c":{"t":"pos","y":"炁","g":"卯"},"text":"炁居卯宫：有生成之意。","pl":"紫气落在卯宫（卯宫属木），判为「有生成之意」：能生养此宫，可取。"},{"id":"炁@戌","kind":"gong","yao":"炁","verdict":"有生成之意","src":"星命溯源·四餘躔次喜忌","why":"居卯戌则有生成之意","c":{"t":"pos","y":"炁","g":"戌"},"text":"炁居戌宫：有生成之意。","pl":"紫气落在戌宫（戌宫属土），判为「有生成之意」：能生养此宫，可取。"},{"id":"炁@辰","kind":"gong","yao":"炁","verdict":"衰","src":"星命溯源·四餘躔次喜忌","why":"居辰酉则衰","c":{"t":"pos","y":"炁","g":"辰"},"text":"炁居辰宫：衰。","pl":"紫气落在辰宫（辰宫属土），判为「衰」：气衰力弱，不利。"},{"id":"炁@酉","kind":"gong","yao":"炁","verdict":"衰","src":"星命溯源·四餘躔次喜忌","why":"居辰酉则衰","c":{"t":"pos","y":"炁","g":"酉"},"text":"炁居酉宫：衰。","pl":"紫气落在酉宫（酉宫属金），判为「衰」：气衰力弱，不利。"},{"id":"炁@巳","kind":"gong","yao":"炁","verdict":"受生吉","src":"星命溯源·四餘躔次喜忌","why":"居巳申受生吉","c":{"t":"pos","y":"炁","g":"巳"},"text":"炁居巳宫：受生吉。","pl":"紫气落在巳宫（巳宫属火），判为「受生吉」：得此宫之气相生，吉。"},{"id":"炁@申","kind":"gong","yao":"炁","verdict":"受生吉","src":"星命溯源·四餘躔次喜忌","why":"居巳申受生吉","c":{"t":"pos","y":"炁","g":"申"},"text":"炁居申宫：受生吉。","pl":"紫气落在申宫（申宫属金），判为「受生吉」：得此宫之气相生，吉。"},{"id":"炁@午","kind":"gong","yao":"炁","verdict":"凶","src":"星命溯源·四餘躔次喜忌","why":"居午凶，加煞克命度大凶","c":{"t":"pos","y":"炁","g":"午"},"text":"炁居午宫：凶。","pl":"紫气落在午宫（午宫属火），判为「凶」：不利。"},{"id":"孛@子","kind":"gong","yao":"孛","verdict":"少吉","src":"星命溯源·四餘躔次喜忌","why":"居子少吉","c":{"t":"pos","y":"孛","g":"子"},"text":"孛居子宫：少吉。","pl":"月孛落在子宫（子宫属水），判为「少吉」：略吉。"},{"id":"孛@丑","kind":"gong","yao":"孛","verdict":"凶","src":"星命溯源·四餘躔次喜忌","why":"居丑凶，加煞克命度大凶","c":{"t":"pos","y":"孛","g":"丑"},"text":"孛居丑宫：凶。","pl":"月孛落在丑宫（丑宫属土），判为「凶」：不利。"},{"id":"孛@亥","kind":"gong","yao":"孛","verdict":"朝天少吉","src":"星命溯源·四餘躔次喜忌","why":"居亥朝天少吉","c":{"t":"pos","y":"孛","g":"亥"},"text":"孛居亥宫：朝天少吉。","pl":"月孛落在亥宫（亥宫属水），判为「朝天少吉」：有上达之势，略吉。"},{"id":"孛@寅","kind":"gong","yao":"孛","verdict":"吉","src":"星命溯源·四餘躔次喜忌","why":"居寅吉（尾火上凶）","c":{"t":"pos","y":"孛","g":"寅"},"text":"孛居寅宫：吉。","pl":"月孛落在寅宫（寅宫属木），判为「吉」：得地相宜，顺遂有利。"},{"id":"孛@戌","kind":"gong","yao":"孛","verdict":"凶","src":"星命溯源·四餘躔次喜忌","why":"居戌凶，主流落（奎度反吉）","c":{"t":"pos","y":"孛","g":"戌"},"text":"孛居戌宫：凶。","pl":"月孛落在戌宫（戌宫属土），判为「凶」：不利。"},{"id":"孛@辰","kind":"gong","yao":"孛","verdict":"平平","src":"星命溯源·四餘躔次喜忌","why":"辰酉平平","c":{"t":"pos","y":"孛","g":"辰"},"text":"孛居辰宫：平平。","pl":"月孛落在辰宫（辰宫属土），判为「平平」：无吉无凶。"},{"id":"孛@酉","kind":"gong","yao":"孛","verdict":"平平","src":"星命溯源·四餘躔次喜忌","why":"辰酉平平","c":{"t":"pos","y":"孛","g":"酉"},"text":"孛居酉宫：平平。","pl":"月孛落在酉宫（酉宫属金），判为「平平」：无吉无凶。"},{"id":"孛@巳","kind":"gong","yao":"孛","verdict":"为奴","src":"星命溯源·四餘躔次喜忌","why":"巳申为奴，犯主位","c":{"t":"pos","y":"孛","g":"巳"},"text":"孛居巳宫：为奴。","pl":"月孛落在巳宫（巳宫属火），判为「为奴」：为此宫所役使，劳而无功，不利。"},{"id":"孛@申","kind":"gong","yao":"孛","verdict":"为奴","src":"星命溯源·四餘躔次喜忌","why":"巳申为奴，犯主位","c":{"t":"pos","y":"孛","g":"申"},"text":"孛居申宫：为奴。","pl":"月孛落在申宫（申宫属金），判为「为奴」：为此宫所役使，劳而无功，不利。"},{"id":"孛@未","kind":"gong","yao":"孛","verdict":"少吉","src":"星命溯源·四餘躔次喜忌","why":"居未少吉（随太阴在未曰抱蟾）","c":{"t":"pos","y":"孛","g":"未"},"text":"孛居未宫：少吉。","pl":"月孛落在未宫（未宫属土），判为「少吉」：略吉。"},{"id":"孛@午","kind":"gong","yao":"孛","verdict":"火凶","src":"星命溯源·四餘躔次喜忌","why":"居午火凶，女人当头克夫害子","c":{"t":"pos","y":"孛","g":"午"},"text":"孛居午宫：火凶。","pl":"月孛落在午宫（午宫属火），判为「火凶」：见火为凶，不利。"},{"id":"罗@子","kind":"gong","yao":"罗","verdict":"中分吉","src":"星命溯源·四餘躔次喜忌","why":"居子午曰中分，吉；居子丑为生","c":{"t":"pos","y":"罗","g":"子"},"text":"罗居子宫：中分吉。","pl":"罗睺落在子宫（子宫属水），判为「中分吉」：恰居两半之中，吉。"},{"id":"罗@午","kind":"gong","yao":"罗","verdict":"中分吉","src":"星命溯源·四餘躔次喜忌","why":"居子午曰中分，吉","c":{"t":"pos","y":"罗","g":"午"},"text":"罗居午宫：中分吉。","pl":"罗睺落在午宫（午宫属火），判为「中分吉」：恰居两半之中，吉。"},{"id":"罗@巳","kind":"gong","yao":"罗","verdict":"受制小吉","src":"星命溯源·四餘躔次喜忌","why":"居巳申受制，小吉","c":{"t":"pos","y":"罗","g":"巳"},"text":"罗居巳宫：受制小吉。","pl":"罗睺落在巳宫（巳宫属火），判为「受制小吉」：被此宫所制，但仍存小吉。"},{"id":"罗@申","kind":"gong","yao":"罗","verdict":"受制小吉","src":"星命溯源·四餘躔次喜忌","why":"居巳申受制，小吉","c":{"t":"pos","y":"罗","g":"申"},"text":"罗居申宫：受制小吉。","pl":"罗睺落在申宫（申宫属金），判为「受制小吉」：被此宫所制，但仍存小吉。"},{"id":"罗@丑","kind":"gong","yao":"罗","verdict":"为生","src":"星命溯源·四餘躔次喜忌","why":"居子丑为生，忌克牛金，凶败","c":{"t":"pos","y":"罗","g":"丑"},"text":"罗居丑宫：为生。","pl":"罗睺落在丑宫（丑宫属土），判为「为生」：为生（古籍术语）。"},{"id":"罗@未","kind":"gong","yao":"罗","verdict":"凶","src":"星命溯源·四餘躔次喜忌","why":"居未主克剥生灾，多官事","c":{"t":"pos","y":"罗","g":"未"},"text":"罗居未宫：凶。","pl":"罗睺落在未宫（未宫属土），判为「凶」：不利。"},{"id":"罗@卯","kind":"gong","yao":"罗","verdict":"为奴","src":"星命溯源·四餘躔次喜忌","why":"居卯戌为奴，犯主位，立命于此不吉","c":{"t":"pos","y":"罗","g":"卯"},"text":"罗居卯宫：为奴。","pl":"罗睺落在卯宫（卯宫属木），判为「为奴」：为此宫所役使，劳而无功，不利。"},{"id":"罗@戌","kind":"gong","yao":"罗","verdict":"为奴","src":"星命溯源·四餘躔次喜忌","why":"居卯戌为奴，犯主位，立命于此不吉","c":{"t":"pos","y":"罗","g":"戌"},"text":"罗居戌宫：为奴。","pl":"罗睺落在戌宫（戌宫属土），判为「为奴」：为此宫所役使，劳而无功，不利。"},{"id":"罗@辰","kind":"gong","yao":"罗","verdict":"夜生怒凶","src":"星命溯源·四餘躔次喜忌","why":"夜生得用，辰酉宫则怒凶","c":{"t":"pos","y":"罗","g":"辰"},"text":"罗居辰宫：夜生怒凶。","pl":"罗睺落在辰宫（辰宫属土），判为「夜生怒凶」：夜生人见此为怒，凶（昼生人稍减）。"},{"id":"罗@酉","kind":"gong","yao":"罗","verdict":"夜生怒凶","src":"星命溯源·四餘躔次喜忌","why":"夜生得用，辰酉宫则怒凶","c":{"t":"pos","y":"罗","g":"酉"},"text":"罗居酉宫：夜生怒凶。","pl":"罗睺落在酉宫（酉宫属金），判为「夜生怒凶」：夜生人见此为怒，凶（昼生人稍减）。"},{"id":"计@丑","kind":"gong","yao":"计","verdict":"朝斗必贵","src":"星命溯源·四餘躔次喜忌","why":"居丑躔斗，名曰朝斗，必贵，只宜独行","c":{"t":"pos","y":"计","g":"丑"},"text":"计居丑宫：朝斗必贵。","pl":"计都落在丑宫（丑宫属土），判为「朝斗必贵」：朝向斗柄，主贵。"},{"id":"计@子","kind":"gong","yao":"计","verdict":"顽土","src":"星命溯源·四餘躔次喜忌","why":"居子为顽土，须用木炁制之方可","c":{"t":"pos","y":"计","g":"子"},"text":"计居子宫：顽土。","pl":"计都落在子宫（子宫属水），判为「顽土」：土气顽钝，不利。"},{"id":"计@寅","kind":"gong","yao":"计","verdict":"吉","src":"星命溯源·四餘躔次喜忌","why":"入寅遇金则吉","c":{"t":"pos","y":"计","g":"寅"},"text":"计居寅宫：吉。","pl":"计都落在寅宫（寅宫属木），判为「吉」：得地相宜，顺遂有利。"},{"id":"计@亥","kind":"gong","yao":"计","verdict":"平平","src":"星命溯源·四餘躔次喜忌","why":"入亥平平","c":{"t":"pos","y":"计","g":"亥"},"text":"计居亥宫：平平。","pl":"计都落在亥宫（亥宫属水），判为「平平」：无吉无凶。"},{"id":"计@卯","kind":"gong","yao":"计","verdict":"独行吉","src":"星命溯源·四餘躔次喜忌","why":"卯戌独行吉","c":{"t":"pos","y":"计","g":"卯"},"text":"计居卯宫：独行吉。","pl":"计都落在卯宫（卯宫属木），判为「独行吉」：此宫无他曜相扰，反吉。"},{"id":"计@戌","kind":"gong","yao":"计","verdict":"独行吉","src":"星命溯源·四餘躔次喜忌","why":"卯戌独行吉","c":{"t":"pos","y":"计","g":"戌"},"text":"计居戌宫：独行吉。","pl":"计都落在戌宫（戌宫属土），判为「独行吉」：此宫无他曜相扰，反吉。"},{"id":"计@辰","kind":"gong","yao":"计","verdict":"吉","src":"星命溯源·四餘躔次喜忌","why":"辰酉吉","c":{"t":"pos","y":"计","g":"辰"},"text":"计居辰宫：吉。","pl":"计都落在辰宫（辰宫属土），判为「吉」：得地相宜，顺遂有利。"},{"id":"计@酉","kind":"gong","yao":"计","verdict":"吉","src":"星命溯源·四餘躔次喜忌","why":"辰酉吉","c":{"t":"pos","y":"计","g":"酉"},"text":"计居酉宫：吉。","pl":"计都落在酉宫（酉宫属金），判为「吉」：得地相宜，顺遂有利。"},{"id":"计@巳","kind":"gong","yao":"计","verdict":"怒","src":"星命溯源·四餘躔次喜忌","why":"巳申则怒","c":{"t":"pos","y":"计","g":"巳"},"text":"计居巳宫：怒。","pl":"计都落在巳宫（巳宫属火），判为「怒」：失位被克，不得其所，不利。"},{"id":"计@申","kind":"gong","yao":"计","verdict":"怒","src":"星命溯源·四餘躔次喜忌","why":"巳申则怒","c":{"t":"pos","y":"计","g":"申"},"text":"计居申宫：怒。","pl":"计都落在申宫（申宫属金），判为「怒」：失位被克，不得其所，不利。"},{"id":"计@未","kind":"gong","yao":"计","verdict":"凶","src":"星命溯源·四餘躔次喜忌","why":"未上凶","c":{"t":"pos","y":"计","g":"未"},"text":"计居未宫：凶。","pl":"计都落在未宫（未宫属土），判为「凶」：不利。"},{"id":"计@午","kind":"gong","yao":"计","verdict":"平吉","src":"星命溯源·四餘躔次喜忌","why":"午上平吉","c":{"t":"pos","y":"计","g":"午"},"text":"计居午宫：平吉。","pl":"计都落在午宫（午宫属火），判为「平吉」：平中带吉。"},{"id":"solo-four","kind":"rel","yao":"火罗孛计","verdict":"主重权","src":"星命溯源·續論七政四餘分布宜忌及入格真偽","why":"火罗孛计乃四凶曜，化凶化吉，并宜独行，则主重权","c":{"t":"solo_any","ys":["火","罗","孛","计"]},"text":"四凶曜（火罗孛计）独行者主重权。","pl":"火、罗、孛、计四凶曜之中，有独自占住一宫而不与它曜相混的：反而主掌重权（凶曜独行，权归于己）。"},{"id":"retro-strong","kind":"rel","yao":"火","verdict":"退而有力","src":"星命溯源·續論七政四餘分布宜忌及入格真偽","why":"火金二星同行，火在后而退，煞星不敢进前以克金，是谓退而有力","c":{"t":"retro_past","a":"火","b":"金"},"text":"火退在金之后：退而有力。","pl":"火星逆行，且按黄道顺序落在金星之后：退行反而有力。"},{"id":"retro-weak","kind":"rel","yao":"金","verdict":"退而无力","src":"星命溯源·續論七政四餘分布宜忌及入格真偽","why":"若金星退，遇火顺行，反克金星，是谓退而无力","c":{"t":"retro_before","a":"金","b":"火"},"text":"金退而火顺行在前：退而无力，反被火克。","pl":"金星逆行，而火星顺行在它前面：退行无力，反被火星所克。"},{"id":"retro-good","kind":"rel","yao":"五星","verdict":"退而升殿入垣为有情","src":"星命溯源·續論七政四餘分布宜忌及入格真偽","why":"五星退行，有退而升殿、入垣、逢生，皆为有情，反作吉论","c":{"t":"retro_any"},"text":"退行之星若升殿、入垣、逢生，皆有情，反作吉论；退星为祸为福尤甚。","pl":"逆行的星若入庙、升殿、得生扶，仍算有情，可以按吉论；退行之星为祸为福，都比顺行更重。"},{"id":"taiyi-baocan","kind":"pattern","yao":"孛月","verdict":"吉","src":"星命溯源·續論七政四餘分布宜忌及入格真偽","why":"须是上弦及望前，既望下弦，在未上见之，及生于戌亥子丑夜生者方合此格","c":{"t":"and","c":[{"t":"same_in","a":"孛","b":"月","g":"未"},{"t":"moon_phase","lo":90,"hi":270},{"t":"night"}]},"text":"孛与月同宫于未，月非晦朔，又为夜生：太乙抱蟾格。","name":"太乙抱蟾格","ys":["孛","月"],"pl":"月孛与太阴同在未宫，月不在晦朔、又逢夜生：成「太乙抱蟾格」，吉。","ge":"太乙抱蟾"},{"id":"baosi-gui","kind":"pattern","yao":"孛月","verdict":"不作福","src":"星命溯源·續論七政四餘分布宜忌及入格真偽","why":"如非其地，又非其时，名为抱死鬼，却不能为福","c":{"t":"and","c":[{"t":"same","a":"孛","b":"月"},{"t":"not","c":{"t":"and","c":[{"t":"pos","y":"孛","g":"未"},{"t":"moon_phase","lo":90,"hi":270},{"t":"night"}]}}]},"text":"孛与月同行，但不在未上、或非上弦望前、或非夜生：名为抱死鬼，不作福论。","name":"抱死鬼（伪格）","ys":["孛","月"],"pl":"月孛与太阴同行，但不在未宫、或不在上弦望前、或不是夜生：名为「抱死鬼」，不作福论。","ge":"抱死鬼"},{"id":"muluo-huishe","kind":"pattern","yao":"木罗","verdict":"吉（在寅）","src":"星命溯源·續論七政四餘分布宜忌及入格真偽","why":"木罗会舍，必在寅上为吉，盖木喜罗乐之地，二星相得；在他宫则乱格","c":{"t":"same_in","a":"木","b":"罗","g":"寅"},"text":"木与罗同宫于寅：木罗会舍，吉。","name":"木罗会舍","ys":["木","罗"],"pl":"木星与罗睺同在寅宫：木罗会舍，吉。","ge":"木罗会舍"},{"id":"huoqi-zhiquan","kind":"pattern","yao":"火炁","verdict":"大吉","src":"星命溯源·續論七政四餘分布宜忌及入格真偽","why":"在寅卯为大吉，盖火庙于卯、生于寅，寅为炁之垣、卯为炁之旺地，不以昼夜为拘","c":{"t":"same_in_any","a":"火","b":"炁","gs":["寅","卯"]},"text":"火与炁同宫于寅或卯：火炁为职权，大吉，他宫福减半。","name":"火炁为职权","ys":["火","炁"],"pl":"火星与紫气同在寅宫或卯宫：火炁为职权，大吉（在其他宫福减半）。","ge":"火炁职权"},{"id":"mubei-fuyin","kind":"pattern","yao":"木孛","verdict":"得局","src":"星命溯源·續論七政四餘分布宜忌及入格真偽","why":"在未为得局，盖木升殿于未、孛入庙于未，二星得所方吉，他宫福减半","c":{"t":"same_in","a":"木","b":"孛","g":"未"},"text":"木与孛同宫于未：木孛为符印，得局。","name":"木孛为符印","ys":["木","孛"],"pl":"木星与月孛同在未宫：木孛为符印，得局。","ge":"木孛符印"},{"id":"riyue-quchao","kind":"pattern","yao":"日月","verdict":"贵","src":"古赋注","why":"亥为帝阙之地，如日在子宫、月在丑宫，谓之日月趋朝（《古赋注》中册）","c":{"t":"and","c":[{"t":"pos","y":"日","g":"子"},{"t":"pos","y":"月","g":"丑"}]},"text":"日在子宫、月在丑宫：日月趋朝。","name":"日月趋朝","ys":["日","月"],"pl":"太阳在子宫、太阴在丑宫：日月趋朝，主贵。","ge":"日月趋朝"},{"id":"luoji-jieduan","kind":"pattern","yao":"罗计","verdict":"看跳出之星","src":"星命溯源·續論七政四餘分布宜忌及入格真偽","why":"计罗截断之格，不宜太阳跳出，犯此名为孤君远遁，君主无辅，极为不美","c":{"t":"and","c":[{"t":"any","c":[{"t":"and","c":[{"t":"pos","y":"罗","g":"子"},{"t":"pos","y":"计","g":"午"}]},{"t":"and","c":[{"t":"pos","y":"罗","g":"午"},{"t":"pos","y":"计","g":"子"}]},{"t":"and","c":[{"t":"pos","y":"罗","g":"辰"},{"t":"pos","y":"计","g":"戌"}]},{"t":"and","c":[{"t":"pos","y":"罗","g":"戌"},{"t":"pos","y":"计","g":"辰"}]}]},{"t":"not","c":{"t":"same","a":"日","b":"罗"}},{"t":"not","c":{"t":"same","a":"日","b":"计"}}]},"text":"罗计分守子午（或辰戌）成轴截断、太阳不随罗计同宫：罗计截断。严格化：截断须落子午/辰戌轴；得格与否看跳出之星（须命宫官禄等角色，程序只标事实）。","name":"罗计截断","ys":["罗","计"],"pl":"罗睺与计都正对成一条轴，把盘面切成两半：这叫罗计截断之格。若太阳独自被留在轴外，就是「孤君远遁」（不美）；留在轴外的若是福禄财命主、官权贵爵寿星，反而成格。","ge":"罗计截断"},{"id":"gujun-yuandun","kind":"pattern","yao":"日罗计","verdict":"不美","src":"星命溯源·續論七政四餘分布宜忌及入格真偽","why":"计罗截断之格，不宜太阳跳出，犯此名为孤君远遁，君主无辅，极为不美","c":{"t":"and","c":[{"t":"any","c":[{"t":"and","c":[{"t":"pos","y":"罗","g":"子"},{"t":"pos","y":"计","g":"午"}]},{"t":"and","c":[{"t":"pos","y":"罗","g":"午"},{"t":"pos","y":"计","g":"子"}]},{"t":"and","c":[{"t":"pos","y":"罗","g":"辰"},{"t":"pos","y":"计","g":"戌"}]},{"t":"and","c":[{"t":"pos","y":"罗","g":"戌"},{"t":"pos","y":"计","g":"辰"}]}]},{"t":"solo","a":"日"}]},"text":"罗计截断（子午/辰戌轴）而太阳独行在外：孤君远遁。严格化：先须成截断轴，太阳乃独行跳出。","name":"孤君远遁","ys":["日","罗","计"],"pl":"罗计相对，而太阳独自在轴外：孤君远遁。太阳是君象，最需要有五曜辅佐、吉星拱夹；孤立在外，主人一生奔波。","ge":"孤君远遁"},{"id":"wuxing-lianzhu","kind":"pattern","yao":"木火土金水","verdict":"大贵","src":"古赋注","why":"如子宫安命，而土星在丑、木星在寅、火星在卯、金星在辰、木星在巳，五星如贯珠然序次一边，各居垣，大贵之局，世不多见","c":{"t":"chain","ys":["土","木","火","金","水"]},"text":"五星各居一宫、依地支顺序连排（序次一边）：五星连珠，大贵之局。","name":"五星连珠","ys":["木","火","土","金","水"],"pl":"五星各占一宫，按地支顺序连成一串：五星连珠，大贵之局。","ge":"五星连珠"},{"id":"jinshui-huanyang","kind":"pattern","yao":"日金水","verdict":"吉","src":"星命溯源·論七政躔次喜忌·古赋注","why":"太阳加临，金水拱夹，得用日生，则父大吉；喜金水相见大妙","c":{"t":"flank","a":"金","b":"水","center":"日","max":60},"text":"金、水分居太阳两侧相拱夹：金水环阳，吉（日生尤妙）。","name":"金水环阳","ys":["日","金","水"],"pl":"金星、水分列太阳两侧相拱夹：金水环阳，吉（昼生人更好）。","ge":"金水环阳"},{"id":"muqi-yanguang","kind":"pattern","yao":"日木炁","verdict":"忌","src":"星命溯源·論七政躔次喜忌","why":"忌木炁掩光，罗主刻剥","c":{"t":"and","c":[{"t":"not","c":{"t":"night"}},{"t":"any","c":[{"t":"same","a":"木","b":"日"},{"t":"same","a":"炁","b":"日"}]}]},"text":"昼生，且木（或炁）与太阳同宫：木炁掩光，太阳失明（忌）。严格化：须昼生＋木或炁同宫（《十一曜定格》「木蔽阳光：昼生忌木气掩」）。","name":"木炁掩光","ys":["日","木","炁"],"pl":"木星与太阳同宫或近度：木炁掩光，太阳失明（忌）。","ge":"木炁掩光"},{"id":"tuji-jia-yue","kind":"pattern","yao":"月土计","verdict":"最凶","src":"星命溯源·論七政躔次喜忌","why":"太阴忌见土计最凶，火罗稍凶","c":{"t":"flank","a":"土","b":"计","center":"月","max":60},"text":"土、计分居太阴两侧相夹：太阴忌见土计，最凶。","name":"土计夹月","ys":["月","土","计"],"pl":"土星、计都分列太阴两侧相夹：太阴最忌见土计，最凶。","ge":"土计夹月"},{"id":"日-命宫","kind":"gongwei","yao":"日","verdict":"吉","src":"星命溯源·論七政躔次喜忌","why":"在命宫则吉","c":null,"gongwei":"命宫","text":"日入命宫宫：吉。","pl":"太阳走到命宫（本人、一生格局），主吉。"},{"id":"日-财帛","kind":"gongwei","yao":"日","verdict":"父有财","src":"星命溯源·論七政躔次喜忌","why":"在财帛则父有财","c":null,"gongwei":"财帛","text":"日入财帛宫：父有财。","pl":"太阳走到财帛（钱财），主父有财。"},{"id":"日-兄弟","kind":"gongwei","yao":"日","verdict":"父失利","src":"星命溯源·論七政躔次喜忌","why":"在兄弟则父失利","c":null,"gongwei":"兄弟","text":"日入兄弟宫：父失利。","pl":"太阳走到兄弟（手足、同辈），主父失利。"},{"id":"日-田宅","kind":"gongwei","yao":"日","verdict":"父富","src":"星命溯源·論七政躔次喜忌","why":"在田宅则父富","c":null,"gongwei":"田宅","text":"日入田宅宫：父富。","pl":"太阳走到田宅（家业、房产），主父富。"},{"id":"日-男女","kind":"gongwei","yao":"日","verdict":"父平安得子力","src":"星命溯源·論七政躔次喜忌","why":"在男女则父平安得子力","c":null,"gongwei":"男女","text":"日入男女宫：父平安得子力。","pl":"太阳走到男女（子女），主父平安得子力。"},{"id":"日-奴仆","kind":"gongwei","yao":"日","verdict":"父劳碌或为奴","src":"星命溯源·論七政躔次喜忌","why":"在奴仆则父劳碌或为奴","c":null,"gongwei":"奴仆","text":"日入奴仆宫：父劳碌或为奴。","pl":"太阳走到奴仆（下属、劳力），主父劳碌或为奴。"},{"id":"日-妻妾","kind":"gongwei","yao":"日","verdict":"有好妻","src":"星命溯源·論七政躔次喜忌","why":"在妻妾则主有好妻","c":null,"gongwei":"妻妾","text":"日入妻妾宫：有好妻。","pl":"太阳走到妻妾（配偶），主有好妻。"},{"id":"日-疾厄","kind":"gongwei","yao":"日","verdict":"父有疾","src":"星命溯源·論七政躔次喜忌","why":"在疾厄父有疾","c":null,"gongwei":"疾厄","text":"日入疾厄宫：父有疾。","pl":"太阳走到疾厄（疾病、灾厄），主父有疾。"},{"id":"日-迁移","kind":"gongwei","yao":"日","verdict":"父出外为商","src":"星命溯源·論七政躔次喜忌","why":"在迁移则父出外为商","c":null,"gongwei":"迁移","text":"日入迁移宫：父出外为商。","pl":"太阳走到迁移（外出、异地），主父出外为商。"},{"id":"日-官禄","kind":"gongwei","yao":"日","verdict":"父有名","src":"星命溯源·論七政躔次喜忌","why":"在官禄则父有名，加吉星方可","c":null,"gongwei":"官禄","text":"日入官禄宫：父有名。","pl":"太阳走到官禄（事业、官职），主父有名。"},{"id":"日-福德","kind":"gongwei","yao":"日","verdict":"祖父有福","src":"星命溯源·論七政躔次喜忌","why":"在福德祖父有福","c":null,"gongwei":"福德","text":"日入福德宫：祖父有福。","pl":"太阳走到福德（福分、享受），主祖父有福。"},{"id":"日-相貌","kind":"gongwei","yao":"日","verdict":"父平平有貌","src":"星命溯源·論七政躔次喜忌","why":"在相貌则父平平有貌","c":null,"gongwei":"相貌","text":"日入相貌宫：父平平有貌。","pl":"太阳走到相貌（容貌、性情），主父平平有貌。"},{"id":"月-命宫","kind":"gongwei","yao":"月","verdict":"吉","src":"星命溯源·論七政躔次喜忌","why":"入命宫吉","c":null,"gongwei":"命宫","text":"月入命宫宫：吉。","pl":"太阴走到命宫（本人、一生格局），主吉。"},{"id":"月-财帛","kind":"gongwei","yao":"月","verdict":"有财","src":"星命溯源·論七政躔次喜忌","why":"入财帛宫主有财","c":null,"gongwei":"财帛","text":"月入财帛宫：有财。","pl":"太阴走到财帛（钱财），主有财。"},{"id":"月-兄弟","kind":"gongwei","yao":"月","verdict":"有情吉","src":"星命溯源·論七政躔次喜忌","why":"入兄弟宫有情吉","c":null,"gongwei":"兄弟","text":"月入兄弟宫：有情吉。","pl":"太阴走到兄弟（手足、同辈），主有情吉。"},{"id":"月-田宅","kind":"gongwei","yao":"月","verdict":"母有田宅","src":"星命溯源·論七政躔次喜忌","why":"入田宅宫则主母有田宅","c":null,"gongwei":"田宅","text":"月入田宅宫：母有田宅。","pl":"太阴走到田宅（家业、房产），主母有田宅。"},{"id":"月-男女","kind":"gongwei","yao":"月","verdict":"先女后男吉","src":"星命溯源·論七政躔次喜忌","why":"入男女主先女后男吉","c":null,"gongwei":"男女","text":"月入男女宫：先女后男吉。","pl":"太阴走到男女（子女），主先女后男吉。"},{"id":"月-奴仆","kind":"gongwei","yao":"月","verdict":"劳碌起家","src":"星命溯源·論七政躔次喜忌","why":"入奴仆主劳碌起家，必庶母生不然末胎","c":null,"gongwei":"奴仆","text":"月入奴仆宫：劳碌起家。","pl":"太阴走到奴仆（下属、劳力），主劳碌起家。"},{"id":"月-妻室","kind":"gongwei","yao":"月","verdict":"因亲得妻","src":"星命溯源·論七政躔次喜忌","why":"入妻室主因亲得妻","c":null,"gongwei":"妻室","text":"月入妻室宫：因亲得妻。","pl":"太阴走到妻室（配偶），主因亲得妻。"},{"id":"月-疾厄","kind":"gongwei","yao":"月","verdict":"有权有疾","src":"星命溯源·論七政躔次喜忌","why":"入疾厄主有权有疾，母灾多病","c":null,"gongwei":"疾厄","text":"月入疾厄宫：有权有疾。","pl":"太阴走到疾厄（疾病、灾厄），主有权有疾。"},{"id":"月-迁移","kind":"gongwei","yao":"月","verdict":"平平","src":"星命溯源·論七政躔次喜忌","why":"入迁移则平平，主过房出祖","c":null,"gongwei":"迁移","text":"月入迁移宫：平平。","pl":"太阴走到迁移（外出、异地），主平平。"},{"id":"月-官禄","kind":"gongwei","yao":"月","verdict":"贵盛","src":"星命溯源·論七政躔次喜忌","why":"入官禄则贵盛","c":null,"gongwei":"官禄","text":"月入官禄宫：贵盛。","pl":"太阴走到官禄（事业、官职），主贵盛。"},{"id":"月-福德","kind":"gongwei","yao":"月","verdict":"生平有福","src":"星命溯源·論七政躔次喜忌","why":"入福德则生平有福","c":null,"gongwei":"福德","text":"月入福德宫：生平有福。","pl":"太阴走到福德（福分、享受），主生平有福。"},{"id":"月-相貌","kind":"gongwei","yao":"月","verdict":"母貌美","src":"星命溯源·論七政躔次喜忌","why":"入相貌则母貌美","c":null,"gongwei":"相貌","text":"月入相貌宫：母貌美。","pl":"太阴走到相貌（容貌、性情），主母貌美。"},{"id":"日-金水引从","kind":"rel","yao":"日","verdict":"吉","src":"星命溯源·論七政躔次喜忌","why":"太陽加臨，金水拱夾，得用日生，則父大吉；喜金水相見大妙","c":{"t":"any","c":[{"t":"same","a":"金","b":"日"},{"t":"same","a":"水","b":"日"},{"t":"trine","a":"金","b":"日"},{"t":"trine","a":"水","b":"日"}]},"text":"太阳得金水引从拱夹：吉，父大吉。","pl":"金星、水星在太阳前后随从而行（或分列两侧拱夹）：吉，主父大吉。"},{"id":"日-孤阳无辅","kind":"rel","yao":"日","verdict":"凶","src":"星命溯源·論七政躔次喜忌","why":"太陽無輔，名曰孤陽，男子不得祖業，女子外家必零落","c":{"t":"not","c":{"t":"any","c":[{"t":"same","a":"金","b":"日"},{"t":"same","a":"水","b":"日"},{"t":"trine","a":"金","b":"日"},{"t":"trine","a":"水","b":"日"}]}},"text":"太阳无金水相辅（孤阳）：凶。","pl":"太阳没有金星、水星来相辅（这叫孤阳）：凶。"},{"id":"日-木炁掩光","kind":"rel","yao":"日","verdict":"凶","src":"星命溯源·論七政躔次喜忌","why":"忌木炁掩光","c":{"t":"any","c":[{"t":"same","a":"木","b":"日"},{"t":"same","a":"炁","b":"日"},{"t":"near","a":"木","b":"日","max":12},{"t":"near","a":"炁","b":"日","max":12}]},"text":"木/紫气掩太阳之光：凶。","pl":"木星或紫气与太阳同宫或相近，遮住阳光：凶。"},{"id":"日-罗主刻剥","kind":"rel","yao":"日","verdict":"凶","src":"星命溯源·論七政躔次喜忌","why":"羅主刻剝","c":{"t":"any","c":[{"t":"same","a":"罗","b":"日"},{"t":"oppose","a":"罗","b":"日"}]},"text":"罗睺与太阳同宫或对照：主刻剥，凶。","pl":"罗睺与太阳同宫或正好相对：主刻剥，凶。"},{"id":"日-犯阳","kind":"rel","yao":"日","verdict":"凶","src":"星命溯源·論七政躔次喜忌","why":"火入垣則可，犯陽則不可","c":{"t":"any","c":[{"t":"same","a":"火","b":"日"},{"t":"near","a":"火","b":"日","max":15}]},"text":"火星犯太阳（犯阳）：凶。","pl":"火星冲犯太阳（犯阳）：凶。"},{"id":"日-夜生则轻","kind":"rel","yao":"日","verdict":"有力弱","src":"星命溯源·論七政躔次喜忌","why":"夜生人則輕（太陽得用日生）","c":{"t":"night"},"text":"夜生人见太阳：力轻。","pl":"夜生人见太阳：力量轻。"},{"id":"日-日生得用","kind":"rel","yao":"日","verdict":"吉","src":"星命溯源·論七政躔次喜忌","why":"得用日生，則父大吉","c":{"t":"not","c":{"t":"night"}},"text":"日生人得太阳为用：吉。","pl":"昼生人得太阳为用：吉。"},{"id":"月-土计最凶","kind":"rel","yao":"月","verdict":"最凶","src":"星命溯源·論七政躔次喜忌","why":"忌見土計最凶","c":{"t":"any","c":[{"t":"same","a":"土","b":"月"},{"t":"same","a":"计","b":"月"},{"t":"oppose","a":"土","b":"月"},{"t":"oppose","a":"计","b":"月"}]},"text":"太阴见土星/计都（同宫或对照）：最凶。","pl":"太阴遇土星或计都（同宫或正好相对）：最凶。"},{"id":"月-火罗稍凶","kind":"rel","yao":"月","verdict":"稍凶","src":"星命溯源·論七政躔次喜忌","why":"火羅稍凶","c":{"t":"any","c":[{"t":"same","a":"火","b":"月"},{"t":"same","a":"罗","b":"月"},{"t":"oppose","a":"火","b":"月"},{"t":"oppose","a":"罗","b":"月"}]},"text":"太阴见火星/罗睺：稍凶。","pl":"太阴遇火星或罗睺：稍凶。"},{"id":"月-金木水相随","kind":"rel","yao":"月","verdict":"吉","src":"星命溯源·論七政躔次喜忌","why":"金木水相隨則吉，夜生人最佳","c":{"t":"any","c":[{"t":"same","a":"金","b":"月"},{"t":"same","a":"木","b":"月"},{"t":"same","a":"水","b":"月"},{"t":"trine","a":"金","b":"月"},{"t":"trine","a":"木","b":"月"},{"t":"trine","a":"水","b":"月"}]},"text":"太阴得金木水相随：吉。","pl":"太阴得金星、木星、水星相随：吉。"},{"id":"月-夜生最佳","kind":"rel","yao":"月","verdict":"吉","src":"星命溯源·論七政躔次喜忌","why":"夜生人最佳","c":{"t":"night"},"text":"夜生人得太阴：最佳，吉。","pl":"夜生人得太阴：最吉。"},{"id":"月-上下弦作煞","kind":"rel","yao":"月","verdict":"凶","src":"星命溯源·論七政躔次喜忌","why":"如上下弦是煞，則作煞論","c":{"t":"any","c":[{"t":"moon_phase","lo":80,"hi":100},{"t":"moon_phase","lo":260,"hi":280}]},"text":"太阴值上下弦：作煞论，凶。","pl":"太阴正当上弦或下弦：按煞论，凶。"},{"id":"月-望中气有力","kind":"rel","yao":"月","verdict":"吉","src":"星命溯源·論七政躔次喜忌","why":"日月皆論中氣；月上中旬生者有力","c":{"t":"moon_phase","lo":170,"hi":190},"text":"太阴值望（中气）：有力，吉。","pl":"太阴正当望（中气）：有力，吉。"},{"id":"huotu-deniu","kind":"pattern","ge":"火土得牛","yao":"火土","c":{"t":"same_in_any","a":"火","b":"土","gs":["丑","酉"]},"verdict":"吉（主寿）","text":"火土同宫于丑或酉，谓之得牛，主寿。","pl":"火星与土星同落丑宫（牛宫）或酉宫（金牛之地）：这叫「火土得牛」，古法主长寿。","why":"火土会于牛宫，不独龟龄而已。","src":"果老星宗·躔度赋／七政四余古赋注（中册）"},{"id":"jinzhu-yuehua","kind":"pattern","ge":"金助月华","yao":"月金","c":{"t":"same_in_any","a":"月","b":"金","gs":["未","巳","申"]},"verdict":"大富贵","text":"月与金同宫于未、巳、申，主大富贵。","pl":"太阴与金星同落未宫（月华）、巳宫或申宫：这叫「金助月华」，古法主大富贵。","why":"未宫为月华也。金星同月居未，谓之金星助月。金与月同在巳宫、申宫，又谓之金助月华。","src":"七政四余古赋注（中册）"},{"id":"riyue-bingming","kind":"pattern","ge":"日月並明","yao":"日月","c":{"t":"and","c":[{"t":"same","a":"日","b":"月"},{"t":"night"}]},"verdict":"吉","text":"日月同宫（合朔）且夜生：日月並明。严格化：须并合昼夜条件（《成格局》G01 草案；昼夜取向存异说，moira 记作昼）。","pl":"太阳与太阴同落一宫：这叫「日月並明」，古法为吉。（昼夜取向另有「日月会 & 昼」一说，两说并存，此处只取同宫。）","why":"日月并明。或分出官福清健。","src":"七政四余（全）／果老星宗·十一曜定格"},{"id":"yinyang-juhui","kind":"pattern","ge":"阴阳俱晦","yao":"日月","c":{"t":"and","c":[{"t":"moon_phase","lo":0,"hi":12},{"t":"night"}]},"verdict":"凶","text":"月近晦朔又值夜生，日月居晦位。","pl":"月亮距太阳不到 12°（晦朔之月）而盘时为夜：这叫「阴阳俱晦」，古法不以吉论。","why":"日月居晦位，皆非吉论。","src":"果老星宗·星格贵贱总赋（引）／moira 政余忌格"},{"id":"mu-da-baoping","kind":"pattern","ge":"木打宝瓶","yao":"木","c":{"t":"and","c":[{"t":"pos","y":"木","g":"子"},{"t":"mingpos","g":"子"}]},"verdict":"凶（疑似）","text":"木入子宫（宝瓶）且命宫同在子：木打宝瓶。严格化：「非坐命宫则毋论」（《星经杂注》），未定盘不判。","pl":"木星落子宫（宝瓶位）：古称「木打宝瓶」。古籍限定「非坐命宫则毋论」「若为命主反以吉论」，须先定命宫才能定论，此处只作疑似。","why":"凡金骑人马、土埋双女、火烧牛角、木打宝瓶，命限逢此怒星者，决死之道也。","src":"七政四余（全）／七政四余星经杂注"},{"id":"jin-qi-renma","kind":"pattern","ge":"金骑人马","yao":"金","c":{"t":"and","c":[{"t":"pos","y":"金","g":"寅"},{"t":"mingpos","g":"寅"}]},"verdict":"凶（疑似）","text":"金入寅宫（人马）且命宫同在寅：金骑人马。严格化：非坐命宫则毋论；有救（遇土则吉）另参。","pl":"金星落寅宫（人马）：古称「金骑人马」，寅属火，金受克。同属四刑忌，须命宫才可定论，此处只作疑似。","why":"金骑人马、土埋双女、火烧牛角、木打宝瓶，本凶兆，若为命主，反以吉论；非坐命宫则毋论。","src":"七政四余古赋注（下册）／七政四余星经杂注"},{"id":"tu-mai-shuangnv","kind":"pattern","ge":"土埋双女","yao":"土","c":{"t":"and","c":[{"t":"pos","y":"土","g":"巳"},{"t":"mingpos","g":"巳"}]},"verdict":"凶（疑似）","text":"土入巳宫（双女）且命宫同在巳：土埋双女。严格化：非坐命宫则毋论；见气非凶（有救）。","pl":"土星落巳宫（双女）：古称「土埋双女」，巳为土之脱气，故云被埋。同属四刑忌，须命宫才可定论，此处只作疑似。","why":"土埋双女，木打宝瓶，水泛白羊，金骑人马，本凶兆，若为命主，反以吉论。","src":"七政四余古赋注（下册）／七政四余星经杂注"},{"id":"huo-shao-niujiao","kind":"pattern","ge":"火烧牛角","yao":"火","c":{"t":"and","c":[{"t":"pos","y":"火","g":"酉"},{"t":"mingpos","g":"酉"}]},"verdict":"凶（疑似）","text":"火入酉宫（金牛）且命宫同在酉：火烧牛角。严格化：非坐命宫则毋论。","pl":"火星落酉宫（金牛）：古称「火烧牛角」，火入金乡。同属四刑忌，须命宫才可定论，此处只作疑似。","why":"金愁见火，火入金乡，金火同周，火烧牛角。","src":"七政四余古赋注（中册）／七政四余（全）"},{"id":"shui-fan-baiyang","kind":"pattern","ge":"水泛白羊","yao":"水","c":{"t":"and","c":[{"t":"pos","y":"水","g":"戌"},{"t":"mingpos","g":"戌"}]},"verdict":"凶（疑似）","text":"水入戌宫（白羊）且命宫同在戌：水泛白羊。严格化：非坐命宫则毋论。","pl":"水星落戌宫（白羊）：古称「水泛白羊」，戌为火位，水入火乡。同属四刑忌，须命宫才可定论，此处只作疑似。","why":"水泛白羊，金骑人马，土埋双女，木打宝瓶。须知此类以何谓，非坐命宫则毋论。","src":"七政四余星经杂注／七政四余古赋注（中册）"}]};
+/* ===== RULES-END ===== */
+
+const KB_KW = [
+  ['庙旺', /庙|旺|得地|落陷|失地|乘旺/],
+  ['格局', /格局|赋云|经云|诗云|诀曰|格曰|赋曰/],
+  ['星性', /性吉|性凶|之性|吉凶|善恶/],
+  ['行度', /行度|平行|每日行|一日行|顺行|逆行|留|伏/],
+  ['神煞', /神煞|天乙|驿马|华盖|咸池|劫煞|空亡|孤辰|寡宿|禄马|贵人/],
+  ['择日', /择日|选日|宜用|不宜|忌用/]
+];
+const FIVE_STARS = ['水', '金', '火', '木', '土'];
+const KB_FILTERS = ['全部', '宫符', '曜符', '状态符'];
+
+let sel = null;
+let hover = null;
+let kbFilter = '全部';
+let kbTickLast = 0;
+let kbSigLast = '';
+/* 「古籍原断」是默认收起的 <details>，但面板会因盘面时刻变化而重绘，
+   重绘会丢掉展开状态（实测 200ms 内就被合上）。这里记住哪一条展开着，
+   重绘时按记忆加回 open 属性，展开状态才稳定。 */
+let gujiOpen = null;   /* 展开的「古籍原断」卡片键 */
+let stdOpen = false;    /* 「判定标准」是否展开（面板重绘后要恢复） */
+
+/* ---------------- 样式 ---------------- */
+const chartStyle = document.createElement('style');
+chartStyle.textContent = [
+  '#btnChart{position:fixed;right:12px;top:10px;z-index:12;font-size:12px;padding:4px 10px;border-radius:6px;',
+  'border:1px solid #3a5a85;background:#16233a;color:#cfe0f5;cursor:pointer}',
+  '#btnChart.on{background:#2b4a76;border-color:#4d78ad}',
+  '#hint{right:408px;max-width:44vw}',
+  '#chartWrap{position:fixed;right:12px;top:46px;bottom:196px;width:380px;z-index:11;',
+  'background:rgba(10,16,28,.88);border:1px solid #2c4160;border-radius:10px;display:flex;flex-direction:column;',
+  'overflow:hidden;color:#cfe0f5;font:13px/1.6 var(--dsh-ui),sans-serif}',
+  '#chartWrap.hide{display:none}',
+  '#chartTop{display:flex;align-items:center;gap:8px;padding:7px 10px;border-bottom:1px solid #24354f}',
+  '#chartTop b{color:#9ecbff}',
+  '#chartSel{flex:1;color:#8aa6c8;font-size:12px}',
+  '#btnChartClose{background:none;border:0;color:#8aa6c8;font-size:17px;line-height:1;cursor:pointer}',
+  '#kbFilter{display:flex;flex-wrap:wrap;gap:4px;padding:0 8px 5px}',
+  '#kbFilter button{font-size:11px;padding:2px 7px;border-radius:9px;border:1px solid #35496b;background:#16233a;color:#a9c3e2;cursor:pointer}',
+  '#kbFilter button.on{background:#2b4a76;border-color:#4d78ad;color:#e8f2ff}',
+  '#kbList{flex:1;overflow-y:auto;padding:0 8px 10px}',
+  '.kbStat{border:1px solid #2c4160;background:#101a2c;border-radius:6px;padding:6px 8px;margin:4px 0 8px;font-size:12px;line-height:1.7}',
+  '.kbStat .row1{color:#9ecbff;font-weight:bold}',
+  '.kbStat .row2{color:#a9c3e2}',
+  '.kbStat b{color:#ffd98a}',
+  '.kbCard{border-left:2px solid #3a5a85;background:#121d30;border-radius:5px;padding:5px 8px;margin:6px 0;font-size:12.5px;line-height:1.7}',
+  '.kbCard b{color:#ffd98a}',
+  '.kbCard .src{color:#7f97b8;font-size:11px;margin-top:3px}',
+  '.kbCard .verdict{display:inline-block;padding:0 6px;margin:0 0 3px;border-radius:9px;background:#1d2f49;color:#ffd98a;font-size:11.5px}',
+  '.kbCard .plain{color:#dce8f6}',
+  '.kbCard .now{color:#8fabc9;font-size:11.5px;margin-top:2px}',
+  '.kbCard details.guji{margin-top:3px}',
+  '.kbCard details.guji summary{color:#657f9e;font-size:11px;cursor:pointer;list-style:none}',
+  '.kbCard details.guji summary::-webkit-details-marker{display:none}',
+  '.kbCard details.guji summary:before{content:"▸  "}',
+  '.kbCard details.guji[open] summary:before{content:"▾  "}',
+  '.kbCard details.guji .gq{color:#8ea4bb;font-size:11px;line-height:1.6;border-left:2px solid #2a3a4e;padding:2px 0 2px 6px;margin:3px 0 0}',
+  '.kbEmpty{color:#7d94b3;font-size:12px;padding:10px 4px;line-height:1.8}',
+  '#tbody tr{cursor:pointer}',
+  '#tbody tr.sel{background:#22406b}',
+  '.lbl.stg-good{color:#9ff0a8 !important}',
+  '.lbl.stg-bad{color:#ff9a9a !important}',
+  '.lbl.stg-mid{color:#bcd2ee !important}',
+  '.stLine{margin-top:4px;padding:3px 6px;border-radius:5px;background:#16233a;font-size:12.5px}',
+  '.su{font-size:10.5px;color:#8aa6c8}',
+  '.stLine.good{color:#9ff0a8;border-left:3px solid #7fe08a}',
+  '.stLine.bad{color:#ff9a9a;border-left:3px solid #ff7a7a}',
+  '.stLine.mid{color:#bcd2ee;border-left:3px solid #8fb0d8}',
+  '.stLine b{font-size:14px}',
+  '.lbl.hot{color:#ffd98a !important;font-weight:700;text-shadow:0 0 3px #000,0 0 9px rgba(255,217,138,.95),0 0 22px rgba(255,200,110,.55)}',
+  '.lbl.gong.hot{color:#ffd98a !important;font-weight:700}',
+  '.lbl.gongci{font-size:11px;color:#7f97b8;letter-spacing:1px}',
+  /* ── 昼夜生 · 营地：排盘面板标题标识 ── */
+  '#dyeMark{font-style:normal;font-weight:400;font-size:11.5px;margin-left:6px;padding:0 5px;border-radius:8px;',
+  'border:1px solid #2f4569;letter-spacing:.5px}',
+  '#dyeMark.dayC{color:#ffd98a;border-color:#5a4a2a}',
+  '#dyeMark.nightC{color:#a9c0e6;border-color:#33496e}',
+  /* 阵营小注（阴阳气息 · 水火） */
+  '.campnote{padding:0 10px 4px;color:#7d94b3;font-size:11px;line-height:1.6}',
+  '.campnote .k{color:#8fa8c6}',
+  '.campnote .y{color:#e2c98a}',
+  '.campnote .n{color:#9fb4d6}',
+  '.campnote .w{color:#7fbcd8}',
+  '.campnote .f{color:#dfa878}',
+  '.campnote .r{color:#ffd98a}',
+  '.campnote .sep{color:#3a5273;padding:0 5px}',
+  '.kbStat .camp{font-size:11px;color:#8aa6c8;margin-top:2px}',
+  '.kbStat .camp .y{color:#e2c98a}',
+  '.kbStat .camp .n{color:#9fb4d6}',
+  '.kbStat .camp .w{color:#7fbcd8}',
+  '.kbStat .camp .f{color:#dfa878}',
+  '.stwhy b{margin-left:1px;color:#eaf2ff}',
+  '.verdict .vpt{margin-left:6px;color:#9fb6d4;font-size:10.5px}',
+  'details.std{margin-top:4px;font-size:11.5px;color:#9fb6d4}',
+  'details.std summary{cursor:pointer;color:#8fb0d8}',
+  'details.std .stdBox{margin-top:4px;padding:6px 8px;border-radius:5px;background:#131f33;line-height:1.7;color:#a9c2e0}',
+  'details.std .stdBox b{color:#dfe9f8}',
+  '#gejuBig{position:fixed;left:50%;top:29%;transform:translate(-50%,-50%);z-index:14;pointer-events:none;',
+  'opacity:0;transition:opacity .55s ease;text-align:center;font-family:var(--dsh-ui),sans-serif}',
+  '#gejuBig.on{opacity:1}',
+  '#gejuBig .nm{font-size:56px;font-weight:700;letter-spacing:.18em;color:#eef6ff;',
+  'text-shadow:0 0 16px rgba(140,190,255,.9),0 0 44px rgba(90,150,255,.6)}',
+  '#gejuBig.bad .nm{color:#ffe9e9;text-shadow:0 0 16px rgba(255,150,150,.9),0 0 44px rgba(255,90,90,.55)}',
+  '#gejuBig .sub{margin-top:12px;font-size:13.5px;letter-spacing:.1em;color:#bcd6f2}'
+].join('');
+document.body.appendChild(chartStyle);
+
+/* ---------------- 面板 DOM ---------------- */
+const chartWrap = document.createElement('div');
+chartWrap.id = 'chartWrap';
+document.body.appendChild(chartWrap);
+
+const chartTop = document.createElement('div');
+chartTop.id = 'chartTop';
+chartWrap.appendChild(chartTop);
+const chartTitleEl = document.createElement('b');
+chartTitleEl.textContent = '七政四余排盘';
+chartTop.appendChild(chartTitleEl);
+const chartSelEl = document.createElement('span');
+chartSelEl.id = 'chartSel';
+chartSelEl.textContent = '点选十一曜';
+chartTop.appendChild(chartSelEl);
+const chartCloseEl = document.createElement('button');
+chartCloseEl.id = 'btnChartClose';
+chartCloseEl.textContent = '×';
+chartTop.appendChild(chartCloseEl);
+
+/* 面板常驻说明（「十二宫与曜位已在 3D 场景中…」）按用户要求整块去掉：
+   面板只在选中曜之后显示 判定 + 条文，空态保持干净。 */
+const kbFilterEl = document.createElement('div');
+kbFilterEl.id = 'kbFilter';
+chartWrap.appendChild(kbFilterEl);
+
+const kbListEl = document.createElement('div');
+kbListEl.id = 'kbList';
+chartWrap.appendChild(kbListEl);
+
+/* 右上角「排盘」入口按钮已按需求移除：不再挂载 btnChartEl，排盘面板保留代码但无入口 */
+const btnChartEl = document.createElement('button');
+btnChartEl.id = 'btnChart';
+btnChartEl.textContent = '排盘';
+
+/* ---------------- 曜的状态（现代行度 + 古籍伏逆留断法） ---------------- */
+function yaoStatus(b, sunLon) {
+  const r = b.rate;
+  const stay = Math.abs(r) < 0.0055;
+  const spd = speedClass(b.char, r);
+  const dir = stay ? '留' : (r < 0 ? '逆行' : '顺行' + (spd && spd !== '平' ? '（' + spd + '）' : ''));
+  const d = norm180(b.lon - sunLon);
+  const ad = Math.abs(d);
+  let vis;
+  if (b.char === '日') vis = '君象 · 七政之主';
+  else if (b.char === '月') vis = '身象 · 后妃之象　距日 ' + ad.toFixed(1) + '°';
+  else if (b.char === '罗' || b.char === '计') vis = '四余虚星 · 常退行 · 逢日月则蚀';
+  else if (b.char === '炁' || b.char === '孛') vis = '四余虚星 · 顺行 · 无光象';
+  else if (ad <= 10) vis = '伏（在日光下 · 焦伤损力）　距日 ' + ad.toFixed(1) + '°';
+  else if (ad >= 170) vis = '对照（光盛 · 古籍谓之逆）　距日 ' + ad.toFixed(1) + '°';
+  else vis = (d > 0 ? '夕见（日在西）' : '晨见（日在东）') + '　距日 ' + ad.toFixed(1) + '°';
+  return { stay: stay, dir: dir, vis: vis, ad: ad, sunLon: sunLon };
+}
+
+/* 《择日》三元总录：「五星遇日须当伏，三合逢阳便是逆，要识对宫为逆度，不逢阳处顺行周。」 */
+function bookPhase(b, sunLon) {
+  const d = norm360(b.lon - sunLon);
+  const m = Math.min(d, 360 - d);
+  if (m <= 12) return '伏（与日同行）';
+  if (Math.abs(m - 120) <= 12) return '留（三合逢阳）';
+  if (m >= 168) return '逆（对宫为逆度）';
+  return '顺（不逢阳处顺行周）';
+}
+
+/* ---------------- 条文检索 ---------------- */
+function selBody() {
+  if (!sel || !snap) return null;
+  for (const b of snap.bodies) if (b.id === sel) return b;
+  return null;
+}
+function kbTags(t) {
+  const out = [];
+  for (const kv of KB_KW) if (kv[1].test(t)) out.push(kv[0]);
+  return out;
+}
+function escHtml(s) {
+  return String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+}
+function hlText(t, b, zhi) {
+  let s = escHtml(t);
+  const pats = (YAO_ALIAS[b.char] || []).concat([b.char + '宫', zhi + '宫']);
+  for (const p of pats) {
+    if (!p) continue;
+    const pe = escHtml(p);
+    s = s.split(pe).join('<b>' + pe + '</b>');
+  }
+  return s;
+}
+
+/* ---------------- 规则求值：只判「当下是否成立」 ---------------- */
+const YAO_ALL = '日月水金火木土罗计炁孛';
+const YAO_FULL = { '日': '太阳', '月': '太阴', '水': '水星', '金': '金星', '火': '火星', '木': '木星', '土': '土星', '罗': '罗睺', '计': '计都', '炁': '紫气', '孛': '月孛' };
+
+function trueHourNow() {
+  const jdTrue = simJD + lonDeg * 4 / 1440 + equationOfTimeMin(simJD) / 1440;
+  const c = jdToCalendar(jdTrue);
+  return c.h + c.mi / 60 + (c.s || 0) / 3600;
+}
+function isNightNow() { const h = trueHourNow(); return h < 6 || h >= 18; }
+/* 昼夜生人：沿用本盘既有口径——真太阳时 6:00–18:00 为昼生，余为夜生。
+   依据《七政四余古赋注》「昼生从日，从阳。夜生从月，从阴。」「昼从阳，夜从阴」。 */
+const DYEWORD = { day: '昼生', night: '夜生' };
+function dayNightNow() { return isNightNow() ? 'night' : 'day'; }
+
+function chartCtx() {
+  const m = {};
+  for (const x of snap.bodies) m[x.char] = x;
+  const gi = ch => gongIndex(m[ch].lon);
+  const zdiff = (p, q) => { let d = (gi(p) - gi(q)) % 12; if (d < 0) d += 12; return d; };
+  const soloOf = ch => !snap.bodies.some(x => x.char !== ch && gongIndex(x.lon) === gi(ch));
+  const related = ch => snap.bodies.filter(x => x.char !== ch).filter(x => {
+    const d = zdiff(x.char, ch);
+    return d === 0 || d === 6 || d === 4 || d === 8;
+  }).map(x => x.char);
+  return { m: m, gi: gi, zh: ch => GONG[gi(ch)].chen, zdiff: zdiff, soloOf: soloOf, related: related };
+}
+
+function evalCond(c, ctx) {
+  const M = ctx.m, L = ch => norm360(M[ch].lon), sep = (a, b) => Math.abs(norm180(L(a) - L(b)));
+  let ok = false, why = '';
+  switch (c.t) {
+    case 'pos': ok = ctx.zh(c.y) === c.g; why = c.y + '在' + c.g + '宫（' + (L(c.y) % 30).toFixed(2) + '°）'; break;
+    case 'same': ok = ctx.gi(c.a) === ctx.gi(c.b); why = c.a + '与' + c.b + '同宫（' + ctx.zh(c.a) + '宫）'; break;
+    case 'same_in': ok = ctx.gi(c.a) === ctx.gi(c.b) && ctx.zh(c.a) === c.g; why = c.a + '、' + c.b + '同在' + c.g + '宫'; break;
+    case 'same_in_any': ok = ctx.gi(c.a) === ctx.gi(c.b) && c.gs.indexOf(ctx.zh(c.a)) >= 0; why = c.a + '、' + c.b + '同在' + ctx.zh(c.a) + '宫'; break;
+    case 'oppose': ok = sep(c.a, c.b) > 170; why = c.a + '与' + c.b + '相距 ' + sep(c.a, c.b).toFixed(1) + '°（对照）'; break;
+    case 'trine': ok = sep(c.a, c.b) > 110 && sep(c.a, c.b) < 130; why = c.a + '与' + c.b + '相距 ' + sep(c.a, c.b).toFixed(1) + '°（三合）'; break;
+    case 'near': ok = sep(c.a, c.b) <= c.max; why = c.a + '与' + c.b + '相距 ' + sep(c.a, c.b).toFixed(1) + '°（≤' + c.max + '°）'; break;
+    case 'solo': ok = ctx.soloOf(c.a); why = c.a + '独行（' + ctx.zh(c.a) + '宫内别无他曜）'; break;
+    case 'solo_any': { const h2 = c.ys.filter(y => ctx.soloOf(y)); ok = h2.length > 0; why = '独行者：' + (h2.join('、') || '无'); break; }
+    case 'retro_any': { const h2 = snap.bodies.filter(x => x.rate < -0.0055).map(x => x.char); ok = h2.length > 0; why = h2.length ? ('逆行中：' + h2.join('、')) : '无曜逆行'; break; }
+    case 'retro_past': ok = M[c.a].rate < -0.0055 && norm360(L(c.b) - L(c.a)) < 180; why = c.a + (M[c.a].rate < -0.0055 ? '逆行' : '顺行') + '，相对' + c.b + '落在其后 ' + norm360(L(c.b) - L(c.a)).toFixed(1) + '°'; break;
+    case 'retro_before': ok = M[c.a].rate < -0.0055 && norm360(L(c.a) - L(c.b)) < 180; why = c.a + '逆行且居于' + c.b + '之前 ' + norm360(L(c.a) - L(c.b)).toFixed(1) + '°'; break;
+    case 'flank': { const da = norm180(L(c.a) - L(c.center)), db = norm180(L(c.b) - L(c.center));
+      ok = Math.abs(da) <= c.max && Math.abs(db) <= c.max && da * db < 0;
+      why = c.a + '距' + c.center + ' ' + da.toFixed(1) + '°、' + c.b + '距' + c.center + ' ' + db.toFixed(1) + '°（分居两侧）'; break; }
+    case 'moon_phase': { const d = norm360(L('月') - L('日')); ok = d >= c.lo && d <= c.hi; why = '月距日 ' + d.toFixed(1) + '°（0°朔·90°上弦·180°望·270°下弦）'; break; }
+    case 'night': { const n = isNightNow(); ok = n; why = '盘时真太阳时 ' + trueHourNow().toFixed(2) + ' 时 → ' + (n ? '夜' : '昼'); break; }
+    case 'mingpos': {
+      /* 命宫坐某宫：未定盘则不可判（严格化：四刑忌须「坐命宫」方论，非坐命宫毋论）。
+         命宫＝本命日太阳所居之宫（《七政四余（全）》188页起大限法之简化口径）。 */
+      if (birthJD === null) { ok = false; why = '未设生辰·命宫不可定（严格化：非坐命宫毋论）'; break; }
+      const mz = GONG[gongIndex(norm360(sunApparentLon(birthJD)))].chen;
+      ok = (mz === c.g); why = '命宫在' + mz + (ok ? '宫（坐命应验）' : '宫（非' + c.g + '宫·毋论）');
+      break;
+    }
+    case 'chain': { const gs = c.ys.map(y => ctx.gi(y)), seen = {};
+      ok = gs.every(g => (seen[g] ? false : (seen[g] = 1)));
+      if (ok) for (let i = 1; i < gs.length; i++) if (((gs[i] - gs[i - 1]) % 12 + 12) % 12 !== 1) ok = false;
+      why = c.ys.map((y, i) => y + '在' + GONG[gs[i]].chen).join(' → '); break; }
+    case 'and': { const rs = c.c.map(x => evalCond(x, ctx)); ok = rs.every(x => x.ok); why = rs.map(x => x.why).join('；'); break; }
+    case 'any': { const rs = c.c.map(x => evalCond(x, ctx)); const h2 = rs.filter(x => x.ok); ok = h2.length > 0; why = h2.length ? h2.map(x => x.why).join('；') : (rs.length ? rs[0].why : ''); break; }
+    case 'not': { const r2 = evalCond(c.c, ctx); ok = !r2.ok; why = '（非）' + r2.why; break; }
+    default: ok = false; why = '（未实现的条件类型 ' + c.t + '）';
+  }
+  return { ok: ok, why: why };
+}
+
+/* ---------------- 判定 + 条文渲染 ---------------- */
+const STATE_WORDS = ['受生', '脱气', '入垣', '得地', '落陷', '失位', '得位', '朝天', '拱夹', '拱', '夹', '庙', '旺', '陷', '怒', '喜', '留', '伏', '顺行', '逆行', '独行', '畏', '忌'];
+
+function clauseMarks(t, b, zhi, rel, stateWords) {
+  const f = [];
+  if (t.indexOf(zhi + '宫') >= 0) f.push('宫符·' + zhi + '宫');
+  else if (new RegExp('[' + YAO_ALL + ']?[在居入躔守临到犯经]' + zhi).test(t)) f.push('宫符·' + zhi);
+  for (const c of rel) {
+    if (f.length >= 4) break;
+    if (new RegExp(c + '(星|曜|在|居|入|犯|合|冲|守|临|到)|(与|合|见|犯|冲|同)' + c).test(t)) f.push('曜符·' + c);
+  }
+  for (const w of stateWords) if (f.length < 5 && t.indexOf(w) >= 0) { f.push('状态符·' + w); break; }
+  return f;
+}
+
+function renderKB() {
+  const b = selBody();
+  if (!b) {
+    chartSelEl.textContent = '点选十一曜';
+    kbFilterEl.innerHTML = '';
+    /* 空态不再写任何说明文字：面板只在选中曜之后才有内容（用户要求去掉这块常驻说明） */
+    kbListEl.innerHTML = '';
+    return;
+  }
+  const lon = norm360(b.lon), gi = gongIndex(lon), zhi = GONG[gi].chen;
+  const gt = gongText(lon), sunLon = sunApparentLon(simJD);
+  const st = yaoStatus(b, sunLon);
+  chartSelEl.textContent = b.name + '　' + gt + '　' + st.dir;
+
+  const ctx = chartCtx();
+  const stt = stateMap[b.id] || evalYaoState(b.char, ctx);
+
+  /* 1) 规则命中 */
+  const myRules = [];
+  for (const r of RULES.rules) {
+    if (r.yao.indexOf(b.char) >= 0) myRules.push(r);
+    else if (r.ys && r.ys.indexOf(b.char) >= 0) myRules.push(r);
+  }
+  const hits = [], miss = [];
+  for (const r of myRules) {
+    if (!r.c) { miss.push(r); continue; }
+    let ev;
+    try { ev = evalCond(r.c, ctx); } catch (e) { ev = { ok: false, why: '求值异常' }; }
+    const o = {};
+    for (const k in r) o[k] = r[k];
+    o.why0 = r.why;   /* 规则自带的古籍原句，卡片里折叠显示 */
+    o.why = ev.why;   /* 当前盘面的事实性说明（带度数） */
+    (ev.ok ? hits : miss).push(o);
+  }
+  hits.sort((p, q) => (q.kind === 'pattern' ? 1 : 0) - (p.kind === 'pattern' ? 1 : 0));
+
+  /* 2) 条文筛选 */
+  const rel = ctx.related(b.char);
+  const sw = {};
+  for (const w of STATE_WORDS) {
+    for (const r of hits) if (String(r.verdict || '').indexOf(w) >= 0) { sw[w] = 1; break; }
+  }
+  if (st.stay) sw['留'] = 1;
+  if (st.dir === '逆行') sw['逆行'] = 1; else if (st.dir === '顺行') sw['顺行'] = 1;
+  const stateWords = Object.keys(sw);
+
+  const rows = [];
+  for (const r of KB) {
+    if (r.y.indexOf(b.char) < 0) continue;
+    const f = clauseMarks(r.t, b, zhi, rel, stateWords);
+    if (!f.length) continue;
+    let sc = f.length;
+    if (f[0].indexOf('宫符') === 0) sc += 4;
+    if (f[0].indexOf('宫符·' + zhi + '宫') === 0) sc += 2;
+    rows.push({ r: r, f: f, sc: sc });
+  }
+  rows.sort((p, q) => (q.sc - p.sc) || (p.r.t.length - q.r.t.length));
+
+  const counts = { '全部': rows.length, '宫符': 0, '曜符': 0, '状态符': 0 };
+  for (const s of rows) for (const f of s.f) { const k = f.split('·')[0]; if (counts[k] !== undefined) counts[k]++; }
+  const kept = rows.filter(s => kbFilter === '全部' || s.f.some(f => f.indexOf(kbFilter) === 0));
+  let cur = kbFilter;
+  if (cur !== '全部' && counts[cur] === 0) cur = kbFilter = '全部';
+  const shown = (cur === '全部' ? rows : kept).slice(0, 40);
+
+  let fh = '';
+  for (const f of KB_FILTERS) {
+    const n = counts[f] || 0;
+    if (f !== '全部' && n === 0) continue;
+    fh += '<button data-f="' + f + '"' + (kbFilter === f ? ' class="on"' : '') + '>' + f + ' ' + n + '</button>';
+  }
+  kbFilterEl.innerHTML = fh;
+  if (kbFilterEl.querySelectorAll) {
+    for (const bt of kbFilterEl.querySelectorAll('button')) {
+      bt.addEventListener('click', function () {
+        kbFilter = this.getAttribute('data-f') || '全部';
+        renderKB();
+      });
+    }
+  }
+
+  const phase = (FIVE_STARS.indexOf(b.char) >= 0) ? bookPhase(b, sunLon) : '';
+  const su = suOf(simJD, b.lon);
+  const chen = GONG[gi].chen;
+  const mwS = miaoWang(b.char, chen);
+  const mwText = mwS ? ('庙旺 <b>' + mwS + '</b>') : (shiYuan(b.char, chen) ? '<b>失垣（落陷）</b>' : '无庙旺');
+  const spdS = speedClass(b.char, b.rate);
+  let html = '<div class="kbStat">' +
+    '<div class="row1">' + b.name + '　黄经 ' + lon.toFixed(3) + '°　' + gt + '（' + GONG[gi].ci + '）</div>' +
+    '<div class="row2">躔度　入' + su.name + ' ' + su.deg.toFixed(2) + '°（' + su.short + '宿属' + su.attr + '）　' + mwText + (spdS ? '　行度' + spdS : '') + '</div>' +
+    '<div class="row2">行度 ' + (b.rate >= 0 ? '+' : '') + b.rate.toFixed(4) + '°/日　' + st.dir + '　' + st.vis + '</div>' +
+    (phase ? '<div class="row2">古籍断伏逆留：<b>' + phase + '</b></div>' : '') +
+    '<div class="stLine ' + stt.cls + '">' + b.name + '状态：<b>' + ST_WORD[stt.cls] + '</b>（' + (stt.score > 0 ? '+' : '') + stt.score + '）' +
+      (stt.gongV ? '　宫位断：' + escHtml(stt.gongV) : '') + '</div>' +
+    (stt.parts.length ? '<div class="row2 stwhy">计分：' + stt.parts.map(function (p) {
+        return escHtml(p.v) + '<b>' + (p.pts > 0 ? '+' : '') + p.pts + '</b>';
+      }).join(' ｜ ') + '　＝ <b>' + (stt.score > 0 ? '+' : '') + stt.score + '</b></div>' : '') +
+    '<div class="row2">核规则 <b>' + myRules.length + '</b> 条　命中 <b>' + hits.length + '</b> 条　对应条文 <b>' + rows.length + '</b> 条</div>' +
+    '<details class="std"' + (stdOpen ? ' open' : '') + '><summary>判定标准</summary><div class="stdBox">' +
+      '<b>分档</b>：合计 ≥ +1 判「好」，≤ −1 判「不好」，0 判「平平」。<br />' +
+      '<b>权重</b>：成格 ×3　宫位（命/财帛…）×2　其余（曜×地支宫、曜与曜、行度）×1。<br />' +
+      '<b>庙旺分</b>（Moira 表，不待条文）：垣 3　庙 3　旺 2　乐 2　喜 1　怒 −2；失垣 −2。<br />' +
+      '<b>吉凶词</b>：先看负面词（凶／怒／不美／无力／弱／失利／受制／掩光…），再看正面词（吉／乐／受生／朝斗／利／有情…）；两表都不含的断语（多为宫位类的「父有财」）不作吉凶论，计 0 分。<br />' +
+      '<b>说明</b>：这是把古籍断语折算成分数后的<b>综合倾向</b>，不是原文的逐条结论；每一分都可在「计分」一行和下方卡片里对回去。' +
+      '</div></details>' +
+    '</div>';
+
+  html += '<div class="kbSec">一、当下成立的判定（' + hits.length + '）</div>';
+  if (!hits.length) html += '<div class="kbEmpty">本曜当下未命中任何古籍规则（共核 ' + myRules.length + ' 条）。</div>';
+  const gujiKeys = [];
+  for (const r of hits.slice(0, 14)) {
+    var tg = r.kind === 'pattern' ? '<div class="tagp">成格</div>'
+      : (r.kind === 'rel' ? '<div class="tagp">星曜相涉</div>'
+        : (r.kind === 'gongwei' ? '<div class="tagp">宫位</div>' : ''));
+    /* 本条卡片的稳定键：id 在同一曜下会重复，故再带上出处与断语前缀 */
+    const gk = String(r.id || '') + '|' + String(r.src || '') + '|' + String(r.text || '').slice(0, 10);
+    const vw = (r.kind === 'pattern') ? 3 : (r.kind === 'gong' ? 2 : 1);
+    const vp = verdictScore(r.verdict) * vw;
+    html += '<div class="kbCard hit">' + tg +
+      '<div class="verdict">' + escHtml(r.verdict || '') + '<span class="vpt">' +
+        (vp > 0 ? '+' : '') + vp + ' 分</span></div>' +
+      '<div class="plain">' + escHtml(r.pl || r.text || '') + '</div>' +
+      (r.why ? '<div class="now">当下实况：' + escHtml(r.why) + '</div>' : '') +
+      (r.why0 ? '<details class="guji"' + (gujiOpen === gk ? ' open' : '') + '><summary>古籍原断</summary><div class="gq">' +
+        escHtml(r.why0) + '</div></details>' : '') +
+      (r.src ? '<div class="src">出处：' + escHtml(r.src) + '</div>' : '') +
+      '</div>';
+    if (r.why0) gujiKeys.push(gk);
+  }
+  if (miss.length) html += '<div class="kbNote">另有 ' + miss.length + ' 条规则因宫位/相位/顺逆/昼夜等条件不符，已隐去。</div>';
+
+  html += '<div class="kbSec">二、与当下盘面对得上的原文（' + shown.length + ' / ' + rows.length + '）</div>';
+  if (!shown.length) html += '<div class="kbEmpty">没有同时满足「提到本曜」与「提到当下宫位/同宫之曜/当下状态」的原文。</div>';
+  for (const s of shown) {
+    html += '<div class="kbCard">' + hlText(s.r.t, b, zhi) +
+      '<div class="src">' + escHtml(BOOK_FULL(s.r.b)) + '　第 ' + escHtml(String(s.r.p)) + ' 页　·　' + escHtml(s.f.join('　')) + '</div></div>';
+  }
+  kbListEl.innerHTML = html;
+  /* 记住用户展开的是哪一条「古籍原断」，供下一次重绘恢复。
+     面板在选中曜之后还会被强刷一次，重绘会丢掉展开状态，所以这里显式记状态：
+     summary 的 click 先于原生展开发生，可据点击前的 open 判定用户是展开还是收起。 */
+  if (kbListEl.querySelectorAll) {
+    const ds = kbListEl.querySelectorAll('details.guji');
+    for (let i = 0; i < ds.length; i++) {
+      const d = ds[i];
+      if (!d || d.__gkBound || !d.addEventListener) continue;
+      d.__gkBound = true;
+      const k = gujiKeys[i];
+      /* 「判定标准」同样要记住展开状态 */
+      (function () {
+        const sd = kbListEl.querySelector ? kbListEl.querySelector('details.std') : null;
+        if (!sd || sd.__stdBound || !sd.addEventListener) return;
+        sd.__stdBound = true;
+        const sm2 = sd.querySelector ? sd.querySelector('summary') : null;
+        if (sm2 && sm2.addEventListener) sm2.addEventListener('click', function () { stdOpen = !sd.open; renderKB(); });
+      })();
+      const sm = d.querySelector ? d.querySelector('summary') : null;
+      if (sm && sm.addEventListener) {
+        sm.addEventListener('click', function () {
+          gujiOpen = d.open ? null : k;
+          renderKB();
+        });
+      }
+      d.addEventListener('toggle', function () {
+        gujiOpen = this.open ? k : ((gujiOpen === k) ? null : gujiOpen);
+      });
+    }
+  }
+}
+
+/* ---------------- 选中与联动 ---------------- */
+function syncRows() {
+  if (!snap || !tbodyEl.querySelectorAll) return;
+  const trs = tbodyEl.querySelectorAll('tr');
+  for (let i = 0; i < trs.length && i < snap.bodies.length; i++) {
+    const id = snap.bodies[i].id;
+    if (sel === id) trs[i].classList.add('sel'); else trs[i].classList.remove('sel');
+  }
+}
+/* 行点击用 tbody 事件委托：updatePanel 每帧重建 tbody 的 innerHTML，
+   逐行绑定的监听器会随旧行一起被丢弃（几乎点不中）；委托绑一次就永久有效。 */
+tbodyEl.addEventListener('click', function (e) {
+  const tr = e.target && e.target.closest ? e.target.closest('tr') : null;
+  if (!tr || !snap) return;
+  const idx = Array.prototype.indexOf.call(tbodyEl.querySelectorAll('tr'), tr);
+  if (idx >= 0 && idx < snap.bodies.length) selectYao(snap.bodies[idx].id);
+});
+function selectYao(id) {
+  sel = (sel === id) ? null : id;
+  syncRows();
+  renderKB();
+  updatePickVisuals();
+  updateAspect3D();
+}
+function chartTick(force) {
+  if (!snap) return;
+  const now = Date.now();
+  if (!force && now - kbTickLast < 250) return;
+  kbTickLast = now;
+  syncRows();
+  updateStates();
+  updateStateVisuals();
+  refreshCampUI();
+  updateAspect3D();
+  const b = selBody();
+  const sig = sel + '|' + kbFilter + '|' + (b ? b.lon.toFixed(2) + '|' + b.rate.toFixed(4) : '');
+  if (force || sig !== kbSigLast) {
+    kbSigLast = sig;
+    renderKB();
+  }
+}
+
+btnChartEl.addEventListener('click', function () {
+  const hidden = String(chartWrap.className).indexOf('hide') >= 0;
+  chartWrap.className = hidden ? '' : 'hide';
+  btnChartEl.className = hidden ? 'on' : '';
+  /* 与「格局」面板同槽位，展开排盘时收起格局 */
+  if (hidden) closeGejuView();
+  if (hidden) chartTick(true);
+});
+chartCloseEl.addEventListener('click', function () {
+  chartWrap.className = 'hide';
+  btnChartEl.className = '';
+});
+
+/* ---------------- 3D 场景里直接点选星体 ---------------- */
+let pickables = [];
+(function buildPickables() {
+  const five = { mercury: 1, venus: 1, mars: 1, jupiter: 1, saturn: 1 };
+  pickables = [{ id: 'sun', mesh: sunMesh }, { id: 'moon', mesh: moonMesh }];
+  for (const po of planetObjects) {
+    if (five[po.data.key]) pickables.push({ id: po.data.key, mesh: po.mesh });
+  }
+  for (const id of ['rahu', 'jidu', 'ziqi', 'yuebo']) pickables.push({ id: id, mesh: xuyuMesh[id] });
+})();
+/* 地球本身不算「曜」（它是观测原点），但点它要能打开「成格局」视图，
+   故单独留一个拾取网格，见 pickAt。 */
+const earthPickMesh = planetObjects[2].mesh;
+
+const rayCaster = (typeof THREE.Raycaster === 'function') ? new THREE.Raycaster() : null;
+const ndcPoint = (typeof THREE.Vector2 === 'function') ? new THREE.Vector2(0, 0) : null;
+let hover3d = null;
+let hoverAt = 0;
+
+function pickAt(nx, ny) {
+  if (!rayCaster || !ndcPoint || !camera) return null;
+  ndcPoint.x = nx;
+  ndcPoint.y = ny;
+  rayCaster.setFromCamera(ndcPoint, camera);
+  const meshes = [];
+  for (const p of pickables) meshes.push(p.mesh);
+  meshes.push(earthPickMesh);   /* 地球也参与射线，命中判定与曜同一套（按距离取最近） */
+  const hits = rayCaster.intersectObjects(meshes, false);
+  /* 格局线单独再打一遍射线：线段比星体细得多，需要放宽 Line 阈值，故不与上面那批合并 */
+  let gejuHit = null;
+  if (gejuPersistGroup && gejuPersistGroup.visible && gejuPersistGroup.children.length) {
+    const lineP = rayCaster.params && rayCaster.params.Line;
+    const oldTh = lineP ? lineP.threshold : 1;
+    if (lineP) lineP.threshold = 2.4;
+    const gh = rayCaster.intersectObjects(gejuPersistGroup.children, false);
+    if (lineP) lineP.threshold = oldTh;
+    if (gh && gh.length) gejuHit = gh[0];
+  }
+  /* 星体优先：同时压线时以星体为准（点线只在没点到星体时生效，免得抢走选曜） */
+  if (hits && hits.length) {
+    const obj = hits[0].object;
+    if (obj === earthPickMesh) return 'earth';
+    for (const p of pickables) if (p.mesh === obj) return p.id;
+  }
+  if (gejuHit && gejuHit.object && gejuHit.object.userData && gejuHit.object.userData.gejuId) {
+    return 'geju:' + gejuHit.object.userData.gejuId;
+  }
+  return null;
+}
+function pickAtPointer(clientX, clientY) {
+  const dom = renderer && renderer.domElement;
+  let w = window.innerWidth || 1, h = window.innerHeight || 1, left = 0, top = 0;
+  if (dom && dom.getBoundingClientRect) {
+    const r = dom.getBoundingClientRect();
+    left = r.left;
+    top = r.top;
+    w = r.width || w;
+    h = r.height || h;
+  }
+  return pickAt(((clientX - left) / w) * 2 - 1, -(((clientY - top) / h) * 2 - 1));
+}
+function pickAndSelect(clientX, clientY) {
+  const id = pickAtPointer(clientX, clientY);
+  /* 点地球（画面中心原点）：视角转到当前大限宫的「面向自己」方位（见 focusDayunGong） */
+  if (id === 'earth') { focusDayunGong(); return id; }
+  /* 点格局线（严格成格常驻线）：打开右侧「成格局」面板并选中该格 */
+  if (id && id.indexOf('geju:') === 0) { openGejuById(id.slice(5)); return id; }
+  if (id) { selectYao(id); return id; }
+  /* 点在空白天空：取消曜选中，并收起宫位、格局、排盘面板与主面板 */
+  closeGongPanel();
+  closeGejuView();
+  if (sel) selectYao(sel);
+  if (chartWrap.className.indexOf('hide') < 0) {
+    chartWrap.className = 'hide';
+    btnChartEl.className = '';
+  }
+  const mp = el('panel'), mb = el('btnPanel');
+  if (mp.style.display !== 'none') {
+    mp.style.display = 'none';
+    mb.textContent = '展开面板';
+  }
+  return id;
+}
+/* 悬浮与选中：只加亮标签，不再放大星体本体（保持真实体积观感） */
+function updatePickVisuals() {
+  for (const p of pickables) {
+    const on = (p.id === sel || p.id === hover3d);
+    const lb = LBL[p.id];
+    if (lb && lb.classList) {
+      if (on) lb.classList.add('hot'); else lb.classList.remove('hot');
+    }
+  }
+  /* 标签正文里「状态(支度)」的收放也跟着悬浮即时变，不必等下一帧 updateAll */
+  updateStateVisuals();
+}
+if (renderer && renderer.domElement) {
+  const dom3d = renderer.domElement;
+  let downX = 0, downY = 0, downT = 0;
+  dom3d.addEventListener('pointerdown', function (e) {
+    if (e.button !== 0) return;
+    downX = e.clientX; downY = e.clientY; downT = Date.now();
+  });
+  /* 按下与抬起之间几乎没移动才算「点选」，否则是旋转视角 */
+  dom3d.addEventListener('pointerup', function (e) {
+    if (e.button !== 0) return;
+    const moved = Math.abs(e.clientX - downX) + Math.abs(e.clientY - downY);
+    if (moved <= 6 && Date.now() - downT < 800) pickAndSelect(e.clientX, e.clientY);
+  });
+  dom3d.addEventListener('pointermove', function (e) {
+    if (dragging) return;
+    const now = Date.now();
+    if (now - hoverAt < 60) return;
+    hoverAt = now;
+    const id = pickAtPointer(e.clientX, e.clientY);
+    if (id !== hover3d) {
+      hover3d = id;
+      if (dom3d.style) dom3d.style.cursor = id ? 'pointer' : '';
+      updatePickVisuals();
+    }
+  });
+  dom3d.addEventListener('pointerleave', function () {
+    if (hover3d) {
+      hover3d = null;
+      if (dom3d.style) dom3d.style.cursor = '';
+      updatePickVisuals();
+    }
+  });
+}
+/* 星体标签也可点（3D 里星体只有几个像素，标签好点得多） */
+for (const id of Object.keys(YAO)) {
+  const lb = LBL[id];
+  if (!lb || !lb.style) continue;
+  lb.style.pointerEvents = 'auto';
+  lb.style.cursor = 'pointer';
+  lb.addEventListener('click', function () { selectYao(id); });
+  lb.addEventListener('mouseenter', function () { hover3d = id; updatePickVisuals(); });
+  lb.addEventListener('mouseleave', function () {
+    if (hover3d === id) { hover3d = null; updatePickVisuals(); }
+  });
+}
+/* 地球标签同「点地球」一例：转到当前大限宫面向自己的方位（3D 里地球只有几个像素，
+   标签正压在地球上，若标签与网格行为不一致，点中间的命中结果就成了掷骰子）。 */
+if (LBL.earth && LBL.earth.style) {
+  LBL.earth.style.pointerEvents = 'auto';
+  LBL.earth.style.cursor = 'pointer';
+  LBL.earth.addEventListener('click', function () { focusDayunGong(); });
+}
+
+
+/* ---------------- 曜状态：由规则库综合判定 ---------------- */
+const ST_WORD = { good: '好', bad: '不好', mid: '平平' };
+const STATE_COLOR = { good: 0x8ed9a2, bad: 0xe08a8a, mid: 0x93a9c4 };
+/* 吉凶词表：**先扫负面、再扫正面**，任一侧命中即按该侧定号。
+   旧写法只按一张表顺序找第一个子串，有两个毛病：
+     · 「不美」「有力弱」「不作福」不在表内 → 计 0 分，负面判语被吞掉；
+     · 「父失利」含「利」→ 反而判成 +1。
+   未列入的断语（多为宫位类的「父有财」「母貌美」）不作吉凶论，计 0 分。 */
+const ST_NEG = ['最凶', '大凶', '小凶', '稍凶', '凶', '怒', '不美', '不利', '失利', '无力', '弱',
+  '不作福', '无福', '忌', '泄气', '脱气', '为奴', '衰', '顽', '受制', '三丘煞', '刻剥', '掩光',
+  '孤阳', '轻', '陷', '落', '劳碌'];
+const ST_POS = ['大吉', '受生', '朝斗', '朝天', '庙', '旺', '得地', '乐', '独行', '为生', '有生成',
+  '有情', '有力', '得局', '利', '吉', '贵', '富', '福', '寿'];
+const ST_TABLE = ST_NEG.concat(ST_POS);   /* 兼容旧引用 */
+
+function verdictScore(v) {
+  const s = String(v || '');
+  if (!s) return 0;
+  if (s.indexOf('相半') >= 0) return 0;
+  if (s.indexOf('平平') >= 0 && s.indexOf('凶') < 0 && s.indexOf('吉') < 0) return 0;
+  if (s.indexOf('大吉') >= 0) return 2;
+  if (s.indexOf('最凶') >= 0) return -2;
+  /* 「受制小吉」「朝天稍吉」这类复合断语，结论在「吉」上，先按正面处理 */
+  if (s.indexOf('小吉') >= 0 || s.indexOf('少吉') >= 0 || s.indexOf('稍吉') >= 0 || s.indexOf('中分吉') >= 0) return 1;
+  for (const w of ST_NEG) if (s.indexOf(w) >= 0) return -1;
+  for (const w of ST_POS) {
+    if (s.indexOf(w) < 0) continue;
+    return (w === '大吉' || w === '受生' || w === '朝斗' || w === '庙' || w === '旺') ? 2 : 1;
+  }
+  return 0;
+}
+
+function evalYaoState(char, ctx) {
+  let score = 0, gongV = '';
+  const parts = [];
+  for (const r of RULES.rules) {
+    if (r.yao !== char && (!r.ys || r.ys.indexOf(char) < 0)) continue;
+    if (!r.c) continue;
+    let ev;
+    try { ev = evalCond(r.c, ctx); } catch (e) { continue; }
+    if (!ev.ok) continue;
+    const w = (r.kind === 'pattern') ? 3 : (r.kind === 'gong' ? 2 : 1);
+    const c = verdictScore(r.verdict);
+    score += c * w;
+    if (r.kind === 'gong') gongV = r.verdict;
+    parts.push({ v: r.verdict, c: c, w: w, pts: c * w, k: r.kind });
+  }
+  /* 星辰庙旺与失垣（Moira 表）——不待条文，直接给分 */
+  const chen = ctx.zh(char);
+  const mw = miaoWang(char, chen);
+  if (mw) {
+    const cm = MIAO_SCORE[mw] || 0;
+    score += cm;
+    parts.push({ v: '庙旺·' + mw + '（' + chen + '宫）', c: cm, w: 2, pts: cm, k: 'miao' });
+  } else if (shiYuan(char, chen)) {
+    score += -2;
+    parts.push({ v: '失垣·落陷（' + chen + '宫）', c: -2, w: 2, pts: -2, k: 'miao' });
+  }
+  const cls = (score >= 1) ? 'good' : ((score <= -1) ? 'bad' : 'mid');
+  parts.sort(function (p, q) {
+    const ka = (Math.abs(p.c) ? 2 : 0) + p.w, kb2 = (Math.abs(q.c) ? 2 : 0) + q.w;
+    return (kb2 - ka) || (q.c - p.c);
+  });
+  return { score: score, cls: cls, gongV: gongV, parts: parts.slice(0, 6) };
+}
+
+let stateMap = {};
+function updateStates() {
+  if (!snap) return;
+  const ctx = chartCtx();
+  const m = {};
+  for (const b of snap.bodies) m[b.id] = evalYaoState(b.char, ctx);
+  stateMap = m;
+}
+function bodyById(id) {
+  if (!snap) return null;
+  for (const b of snap.bodies) if (b.id === id) return b;
+  return null;
+}
+
+/* ---------------- 营地图式：气息（阴／阳）、营地（水／火）、昼夜生 ----------------
+   古法出处详见报告：
+     · 阴阳气息——《七政四余古赋注（上册）》：「日木土气计水为阳星，月火金罗孛为阴曜」
+     · 昼夜生人——《古赋注》：「昼生从日，从阳。夜生从月，从阴。」
+                    《中册》：「昼生者喜太阳木土…夜生者爱太阴火金罗」；《下册》：「日生专用日木土，夜生却以金月火」
+     · 水／火营地——十一曜无「水火两阵营」之明文；此处取四余之五行属（气→木、罗→火、计→土、孛→水）
+       再按五行归水火：火营＝日火罗、水营＝月水孛，余者不入水火（见报告「依据与取舍」一节）。
+       「玄」即不入水火者。 */
+const CAMP_QI = { '日': '阳', '木': '阳', '土': '阳', '炁': '阳', '计': '阳', '水': '阳',
+                  '月': '阴', '火': '阴', '金': '阴', '罗': '阴', '孛': '阴' };
+const CAMP_SHUIHUO = { '日': '火', '火': '火', '罗': '火',
+                       '月': '水', '水': '水', '孛': '水' };
+/* 昼夜生人的两曜阵营（引自《古赋注》）：昼生＝日木土气计水，夜生＝月火金罗孛 */
+const DAY_NIGHT_CAMP = { day: '日木土气计水', night: '月火金罗孛' };
+const XUYU_WUXING = { '炁': '木', '罗': '火', '计': '土', '孛': '水' };
+/* 四余五行与营地的关系（用于面板小注） */
+const WUXING_OF = { '日': '', '月': '', '水': '水', '金': '金', '火': '火', '木': '木', '土': '土',
+                    '罗': '火', '计': '土', '炁': '木', '孛': '水' };
+
+function qiOf(ch) { return CAMP_QI[ch] || ''; }
+function shuiHuoOf(ch) { return CAMP_SHUIHUO[ch] || '玄'; }
+function campOf(ch) { return { qi: qiOf(ch), sh: shuiHuoOf(ch) }; }
+function campIsDay(ch) { return DAY_NIGHT_CAMP.day.indexOf(ch) >= 0; }
+
+/* ---------------- 3D 状态指示：细线语言（替代原先的粗色环） ----------------
+   三路编码，全部是线条，默认压到很低的亮度，悬浮／选中才提亮：
+     ① 半径 1.5r 的细圆环——吉／凶／平，只靠色相与线宽（不再用大面积填充）
+     ② 径向短线：向外＝阳曜、向内＝阴曜（长短不同，一望可别）
+     ③ 短线末端的短横：单横＝水营、双横＝火营（不入水火者无横，只留净线） */
+const RING_BASE_OP = { good: 0.42, bad: 0.46, mid: 0.24 };
+const RING_HOT_OP = { good: 0.9, bad: 0.95, mid: 0.66 };
+const TICK_OP = 0.5, TICK_HOT_OP = 0.92, CREST_OP = 0.7, CREST_HOT_OP = 1;
+
+function bodyRadius(mesh) {
+  const par = mesh && mesh.geometry && mesh.geometry.parameters;
+  let r = 2;
+  if (par) {
+    if (typeof par.radius === 'number' && par.radius > 0) r = par.radius;
+    else if (par.radiusTop !== undefined) r = par.radiusTop;
+    else if (par.width) r = par.width / 2;
+  }
+  return r;
+}
+/* 闭合圆环（THREE.LineLoop 在离线/在线两份 three 里都有；缺则退回 LineSegments 首尾相连） */
+function makeRingLine(radius, segs) {
+  const n = segs || 48, pts = new Float32Array((n + 1) * 3);
+  for (let i = 0; i <= n; i++) {
+    const a = (i % n) * TAU / n;
+    pts[i * 3] = Math.cos(a) * radius;
+    pts[i * 3 + 1] = Math.sin(a) * radius;
+    pts[i * 3 + 2] = 0;
+  }
+  const geo = new THREE.BufferGeometry();
+  geo.setAttribute('position', new THREE.BufferAttribute(pts, 3));
+  if (typeof geo.computeBoundingSphere === 'function') geo.computeBoundingSphere();
+  return (typeof THREE.LineLoop === 'function') ? new THREE.LineLoop(geo, null) : new THREE.Line(geo, null);
+}
+/* 径向短线：[0]气息（正 x 探出＝阳曜／-x 探入＝阴曜）+ [1]营地短横（水单横／火双横） */
+function makeTickLine(r) {
+  const yangR = r * 2.06, yinR = r * 1.34, refR = r * 1.72;
+  const arr = [
+    r * 1.14, 0, 0, yangR, 0, 0,
+    -r * 1.14, 0, 0, -yinR, 0, 0,
+    refR, 0, 0, refR + r * 0.42, 0, 0,
+  ];
+  const geo = new THREE.BufferGeometry();
+  geo.setAttribute('position', new THREE.BufferAttribute(new Float32Array(arr), 3));
+  if (typeof geo.computeBoundingSphere === 'function') geo.computeBoundingSphere();
+  return new THREE.LineSegments(geo, null);
+}
+/* 短横（营地记）：水＝单横，火＝双横；不入水火者不建此线 */
+function makeCrestLine(r) {
+  const yangRef = r * 2.06, yinRef = -r * 1.34;
+  const w = r * 0.13, s0 = r * 0.075;
+  const arr = [
+    yangRef, -w, 0, yangRef, w, 0,
+    yinRef, -w, 0, yinRef, w, 0,
+    yangRef - s0, -w, 0, yangRef - s0, w, 0,
+    yinRef + s0, -w, 0, yinRef + s0, w, 0,
+  ];
+  const geo = new THREE.BufferGeometry();
+  geo.setAttribute('position', new THREE.BufferAttribute(new Float32Array(arr), 3));
+  if (typeof geo.computeBoundingSphere === 'function') geo.computeBoundingSphere();
+  return new THREE.LineSegments(geo, null);
+}
+/* 把短线转到「本曜黄经的径向外」：短线画在本地 +x，绕黄道极转 -(90°+lon) */
+function orientTick(id, lon) {
+  const t = stateTicksReal[id], c = stateCrestsReal[id];
+  const rz = -(Math.PI / 2) - lon * DEG;
+  if (t) t.rotation.z = rz;
+  if (c) c.rotation.z = rz;
+}
+
+/* ---------------- 3D 状态环 + 标签状态 + 黄道指向 ---------------- */
+const LBL_BASE = {};
+for (const id of Object.keys(YAO)) if (LBL[id]) LBL_BASE[id] = LBL[id].className;
+
+/* 月相名：由「月黄经 − 日黄经」的距角定（0°朔、90°上弦、180°望、270°下弦），
+   距角来自当前模拟日期，故换日期月相即随之变化；八分界每档 45°。 */
+function moonPhaseName(d) {
+  if (d < 22.5 || d >= 337.5) return '朔月';
+  if (d < 67.5) return '蛾眉月';
+  if (d < 112.5) return '上弦月';
+  if (d < 157.5) return '盈凸月';
+  if (d < 202.5) return '望月';
+  if (d < 247.5) return '亏凸月';
+  if (d < 292.5) return '下弦月';
+  return '残月';
+}
+
+const stateRings = {};
+const CAMP_TICK = { '水': 0x7fbcd8, '火': 0xdfa878, '玄': 0x7f96b4 };
+const stateTicksReal = {}, stateCrestsReal = {};
+(function buildStateRings() {
+  for (const p of pickables) {
+    const mesh = p.mesh;
+    if (!mesh || !mesh.geometry) continue;
+    const ch = (YAO[p.id] && YAO[p.id].char) || '';
+    const r = bodyRadius(mesh);
+    const qi = qiOf(ch), sh = shuiHuoOf(ch);
+    /* ① 吉／凶／平原用半径 1.5r 的细圆环表示；用户要求「星星旁边的圈圈不要」，已取消。
+       吉凶改由曜名字色与亮度表达（见 updateStateVisuals 的标签、drawStrip 的标签亮度）。
+       makeRingLine / stateRings / RING_*_OP 保留但不再建环（stateRings 恒为空对象）。 */
+    /* ② 气息（向外的阳线／向内的阴线）与 ③ 营地（末端单横水／双横火）
+       短线初画在本地 +x（正对黄道外），每帧再按该曜黄经转到「径向外」，
+       这样「向外／向内」在两曜相邻时仍看得出方向，且始终沿半径而非四十五度斜线 */
+    const tk = makeTickLine(r);
+    tk.name = 'stateTick';
+    tk.rotation.x = -Math.PI / 2;
+    tk.material = new THREE.LineBasicMaterial({ color: CAMP_TICK[sh] || CAMP_TICK['玄'], transparent: true, opacity: TICK_OP, depthWrite: false });
+    mesh.add(tk);
+    stateTicksReal[p.id] = tk;
+    if (sh === '水' || sh === '火') {
+      const ct = makeCrestLine(r);
+      ct.name = 'stateCrest';
+      ct.rotation.x = -Math.PI / 2;
+      ct.material = new THREE.LineBasicMaterial({ color: CAMP_TICK[sh], transparent: true, opacity: CREST_OP, depthWrite: false });
+      mesh.add(ct);
+      stateCrestsReal[p.id] = ct;
+    }
+    void qi;
+  }
+})();
+
+const selLineGeo = new THREE.BufferGeometry();
+selLineGeo.setAttribute('position', new THREE.BufferAttribute(new Float32Array(6), 3));
+const selLine = new THREE.LineSegments(selLineGeo, new THREE.LineBasicMaterial({ color: 0xffe08a, transparent: true, opacity: 0.9 }));
+selLine.visible = false;
+geoFrame.add(selLine);
+
+function updateStateVisuals() {
+  for (const id of Object.keys(YAO)) {
+    const st = stateMap[id] || { cls: 'mid', score: 0 };
+    const ch = (YAO[id] && YAO[id].char) || '';
+    const qi = qiOf(ch), sh = shuiHuoOf(ch);
+    const isHot = (sel === id || hover3d === id);
+    const bd = bodyById(id);
+    if (bd) orientTick(id, bd.lon);
+    const lb = LBL[id];
+    if (lb) {
+      let txt = YAO[id].name;
+      if (id === 'moon' && bd) {
+        const sb = bodyById('sun');
+        if (sb) txt += ' ' + moonPhaseName(norm360(bd.lon - sb.lon));
+      }
+      if (show.state && bd && st.cls) {
+        /* 默认只给状态单字：十一曜同屏时标签短了约三分之一，不再互相压住星体；
+           支度与其后那行细解仍照旧——选中或悬浮（isHot）时才补出来。 */
+        /* 状态用与宫带一致的线描符号（◎／○／⊘），不写「吉／凶／平」汉字；
+           颜色仍由 stg-* 类承担，故符号淡、颜色显，两者互补。 */
+        txt += ' ' + (ST_SYM[st.cls] || ST_SYM.mid);
+        if (isHot) {
+          const inG = norm360(bd.lon) % 30;
+          txt += '(' + GONG[gongIndex(bd.lon)].chen + inG.toFixed(0) + '°)';
+        }
+      }
+      if (lb.textContent !== txt) lb.textContent = txt;
+      /* 重建 className 时必须原样保留 cull（标签避让）与 gejuHot（格局查看高亮），
+         否则本函数每帧都会把这两者冲掉。 */
+      const cls = (LBL_BASE[id] || 'lbl') + (show.state && st.cls ? ' stg-' + st.cls : '') + (isHot ? ' hot' : '') +
+        ((lb.classList && lb.classList.contains('cull')) ? ' cull' : '') +
+        ((lb.classList && lb.classList.contains('gejuHot')) ? ' gejuHot' : '');
+      if (lb.className !== cls) lb.className = cls;
+      /* 悬浮/选中才展开的一行细解：分数 · 气息 · 营地（默认 display:none，不占版面） */
+      if (!lb.__det) {
+        let sp = null;
+        if (lb.childNodes) {
+          for (let i = 0; i < lb.childNodes.length; i++) {
+            if (lb.childNodes[i] && lb.childNodes[i].nodeName === 'SPAN') { sp = lb.childNodes[i]; break; }
+          }
+        }
+        if (!sp) {
+          sp = document.createElement('span');
+          if (sp.setAttribute) sp.setAttribute('data-det', '');
+          if (lb.appendChild) lb.appendChild(sp);
+        }
+        lb.__det = sp;
+      }
+      const det = detailLine(st, qi, sh);
+      if (lb.__det.textContent !== det) lb.__det.textContent = det;
+    }
+    const ring = stateRings[id];
+    if (ring) {
+      ring.visible = !!show.state;
+      if (ring.material) {
+        if (ring.material.color && ring.material.color.setHex) ring.material.color.setHex(STATE_COLOR[st.cls] || STATE_COLOR.mid);
+        if (typeof st.cls === 'string' && ring.material.opacity !== undefined) {
+          const o = isHot ? (RING_HOT_OP[st.cls] || RING_HOT_OP.mid) : (RING_BASE_OP[st.cls] || RING_BASE_OP.mid);
+          if (ring.material.opacity !== o) ring.material.opacity = o;
+          ring.material.transparent = true;
+        }
+        if (ring.material.linewidth !== undefined && ring.material.linewidth !== (isHot ? 2 : 1)) {
+          ring.material.linewidth = isHot ? 2 : 1;
+        }
+      }
+    }
+    /* ②气息径向短线：阳曜向外、阴曜向内；③营地短横：水单横、火双横 */
+    const tk = stateTicksReal[id];
+    if (tk && tk.material) {
+      tk.visible = !!show.state;
+      if (tk.material.color && tk.material.color.setHex) tk.material.color.setHex(CAMP_TICK[sh] || CAMP_TICK['玄']);
+      tk.material.opacity = isHot ? TICK_HOT_OP : TICK_OP;
+    }
+    const ct = stateCrestsReal[id];
+    if (ct && ct.material) {
+      ct.visible = !!show.state;
+      if (ct.material.color && ct.material.color.setHex) ct.material.color.setHex(CAMP_TICK[sh] || CAMP_TICK['玄']);
+      ct.material.opacity = isHot ? CREST_HOT_OP : CREST_OP;
+    }
+  }
+  refreshCampUI();
+}
+/* 悬浮时显示的一行细解：只取前两项，避免长句淹掉标签 */
+function detailLine(st, qi, sh) {
+  const bits = [];
+  if (st && typeof st.score === 'number' && st.score) bits.push((st.score > 0 ? '+' : '') + st.score);
+  if (qi) bits.push(qi + '气');
+  if (sh && sh !== '玄') bits.push(sh + '营');
+  else if (sh === '玄') bits.push('不属水火');
+  if (st && st.parts && st.parts.length) {
+    const s = String(st.parts[0].v || '').replace(/（[^）]*）/g, '');
+    if (s) bits.push(s);
+  }
+  return bits.join(' · ');
+}
+
+/* ---------------- 昼夜生 · 营地小注（DOM，不改版式骨架） ---------------- */
+const campNoteEl = document.createElement('div');
+campNoteEl.className = 'campnote';
+campNoteEl.id = 'campNote';
+if (chartWrap && chartWrap.insertBefore && kbFilterEl && kbFilterEl.parentNode) {
+  kbFilterEl.parentNode.insertBefore(campNoteEl, kbFilterEl);
+} else if (chartWrap && chartWrap.appendChild) {
+  chartWrap.appendChild(campNoteEl);
+}
+const dyeMarkEl = document.createElement('i');
+dyeMarkEl.id = 'dyeMark';
+if (chartTop && chartTop.appendChild) chartTop.appendChild(dyeMarkEl);
+const hintEl = document.getElementById('hint');
+const campHintEl = document.createElement('div');
+campHintEl.className = 'hint2';
+campHintEl.id = 'campHint';
+if (hintEl && hintEl.parentNode && hintEl.parentNode.insertBefore) {
+  hintEl.parentNode.insertBefore(campHintEl, hintEl.nextSibling);
+}
+
+function refreshCampUI() {
+  const dn = dayNightNow();
+  const isDay = dn === 'day';
+  const cls = isDay ? 'dayC' : 'nightC';
+  if (dyeMarkEl) {
+    const t = (DYEWORD[dn] || '') + ' · 真太阳时 ' + trueHourNow().toFixed(1) + ' 时';
+    if (dyeMarkEl.textContent !== t) dyeMarkEl.textContent = t;
+    if (dyeMarkEl.className !== cls) dyeMarkEl.className = cls;
+  }
+  if (campNoteEl) {
+    const on = show.state;
+    const html =
+      '<span class="k">营地</span> ' +
+      '<span class="y">阳曜 日木土炁计水</span><span class="sep">│</span>' +
+      '<span class="n">阴曜 月火金罗孛</span>' +
+      '<span class="sep">│</span>' +
+      '<span class="w">水营 月水孛</span><span class="sep">│</span>' +
+      '<span class="f">火营 日火罗</span>' +
+      '<span class="sep">│</span>' +
+      '<span class="' + cls + '">' + (DYEWORD[dn] || '') + '</span>' +
+      (on ? '' : ' <span class="k">（状态指示已关）</span>');
+    if (campNoteEl.innerHTML !== html) campNoteEl.innerHTML = html;
+  }
+  if (campHintEl) {
+    const html = '线条读法　<span class="tickday">向外短线＝阳曜</span>' +
+      '<span class="sep">│</span><span class="ticknight">向内短线＝阴曜</span>' +
+      '<span class="sep">│</span><span class="w">单横＝水营</span>' +
+      '<span class="sep">│</span><span class="f">双横＝火营</span>' +
+      '<span class="sep">│</span>环色＝吉凶' +
+      '<span class="sep">│</span>宫带状态符：<span style="color:#8ed9a2">◎</span>得地／有情' +
+      ' <span style="color:#93a9c4">○</span>平常' +
+      ' <span style="color:#e08a8a">⊘</span>失地／受克' +
+      '<span class="sep">│</span><span class="' + cls + '">' + (DYEWORD[dn] || '') + '</span>';
+    if (campHintEl.innerHTML !== html) campHintEl.innerHTML = html;
+  }
+}
+
+
+/* 面板每次刷新后同步天盘与条文（限频，避免每帧重排） */
+/* ---------------- 3D 三方四正：选中一曜，在黄道面上连出三合与对宫 ---------------- */
+const ASPECT_R = ECL_RING - 6;
+const aspectGeo = new THREE.BufferGeometry();
+aspectGeo.setAttribute('position', new THREE.BufferAttribute(new Float32Array(18), 3));
+const aspectLine = new THREE.LineSegments(
+  aspectGeo,
+  new THREE.LineBasicMaterial({ color: 0xffe08a, transparent: true, opacity: 0.8 })
+);
+aspectLine.visible = false;
+geoFrame.add(aspectLine);
+
+function updateAspect3D() {
+  const b = selBody();
+  const clearGongHot = function () {
+    for (let i = 0; i < gongLabels.length; i++) if (gongLabels[i].classList) gongLabels[i].classList.remove('hot');
+  };
+  if (!b) {
+    aspectLine.visible = false;
+    selLine.visible = false;
+    clearGongHot();
+    return;
+  }
+  const arr = aspectGeo.attributes.position.array;
+  const base = norm360(b.lon);
+  let k = 0;
+  for (const off of [120, 240, 180]) {
+    const a1 = base * DEG, a2 = norm360(base + off) * DEG;
+    arr[k++] = Math.cos(a1) * ASPECT_R; arr[k++] = 0; arr[k++] = Math.sin(a1) * ASPECT_R;
+    arr[k++] = Math.cos(a2) * ASPECT_R; arr[k++] = 0; arr[k++] = Math.sin(a2) * ASPECT_R;
+  }
+  aspectGeo.attributes.position.needsUpdate = true;
+  const a0 = base * DEG;
+  const col = (stateMap[b.id] || {}).cls || 'mid';
+  const cc = STATE_COLOR[col] || STATE_COLOR.mid;
+  aspectLine.visible = true;
+  if (aspectLine.material && aspectLine.material.color && aspectLine.material.color.setHex) aspectLine.material.color.setHex(cc);
+  const arr2 = selLineGeo.attributes.position.array;
+  arr2[0] = 0; arr2[1] = 0; arr2[2] = 0;
+  arr2[3] = Math.cos(a0) * ASPECT_R; arr2[4] = 0; arr2[5] = Math.sin(a0) * ASPECT_R;
+  selLineGeo.attributes.position.needsUpdate = true;
+  selLine.visible = true;
+  if (selLine.material && selLine.material.color && selLine.material.color.setHex) selLine.material.color.setHex(cc);
+  const gi = gongIndex(b.lon);
+  for (let i = 0; i < gongLabels.length; i++) {
+    if (!gongLabels[i].classList) continue;
+    if (i === gi) gongLabels[i].classList.add('hot'); else gongLabels[i].classList.remove('hot');
+  }
+}
+updateAspect3D();
+
+/* ================= 生克／帮扶「能量线」：点一曜，看它为何吉、为何凶 =================
+   需求：点某一曜（如火星），要以视觉方式演示「它为什么到这个程度」——是别曜生助它、
+   还是别曜克夺它。线条只做缓慢闪烁（呼吸），不沿线跑任何光点小球；
+   每条线靠近作用端放一枚静态箭头，指示「能量来源 → 作用方向」。
+   关系全部取自本文件已有的五行表（YAO_WUXING / KE_OF / SHENG_OF / SHENG_ME / GONG_WUXING）：
+     · 生我者（他曜五行生我）→ 青绿线闪烁，箭头指向本曜　（得帮扶 → 加分）
+     · 同我者（比助）        → 青绿线闪烁，箭头指向本曜　（同类相助）
+     · 克我者（他曜五行克我）→ 暗红线闪烁，箭头指向本曜　（受克夺 → 减分）
+     · 我生者／我克者        → 灰蓝线闪烁，箭头自本曜指出　（输出、泄气）
+     · 宫位得地（所落宫五行同我）→ 青绿短线，自黄道环上该处射入本曜（因宫制而助我）
+   只画与「当前选中的这一曜」相关的线，不做十一曜两两全连——那既看不清也会拖性能。
+   与三方四正（aspectLine）、成格局动效线并列，互不干扰。开关：显示行的「生克能量线」。 */
+const ENERGY_SEG_MAX = 4;       /* 线段上限：帮扶 1 + 克夺 1 + 宫助 1（简练化后至多 3 条） */
+let energyLine = null, energyLineGeo = null, energyLineMat = null;
+let energyArrows = null;        /* 每条线一枚锥体箭头，指向作用端 */
+/* 三类关系的颜色：sheng 生助（青绿）· ke 受克（暗红）· out 输出（灰蓝）· gong 宫助 */
+const ENERGY_COLOR = { sheng: [0.45, 0.95, 0.66], ke: [1.0, 0.42, 0.40], out: [0.52, 0.64, 0.82], gong: [0.58, 0.92, 0.74] };
+const _UP3 = new THREE.Vector3(0, 1, 0);
+const _dir3 = new THREE.Vector3();
+
+function ensureEnergy() {
+  if (energyLine) return;
+  energyLineGeo = new THREE.BufferGeometry();
+  energyLineGeo.setAttribute('position', new THREE.BufferAttribute(new Float32Array(ENERGY_SEG_MAX * 6), 3));
+  energyLineGeo.setAttribute('color', new THREE.BufferAttribute(new Float32Array(ENERGY_SEG_MAX * 6), 3));
+  energyLineMat = new THREE.LineBasicMaterial({ vertexColors: true, transparent: true, opacity: 0.9, depthWrite: false });
+  energyLine = new THREE.LineSegments(energyLineGeo, energyLineMat);
+  energyLine.name = 'energyLine';
+  energyLine.visible = false;
+  geoFrame.add(energyLine);
+
+  /* 箭头：细锥体，锥尖朝作用端；本身不动画，只随线条一起缓慢明暗 */
+  energyArrows = new THREE.Group();
+  for (let i = 0; i < ENERGY_SEG_MAX; i++) {
+    const cone = new THREE.Mesh(
+      new THREE.ConeGeometry(0.5, 1.6, 10),
+      new THREE.MeshBasicMaterial({ transparent: true, opacity: 0.95, depthWrite: false })
+    );
+    cone.visible = false;
+    energyArrows.add(cone);
+  }
+  energyArrows.visible = false;
+  geoFrame.add(energyArrows);
+}
+
+/* 依五行算「与选中曜相关」的关系线（端点一律用世界坐标）。
+   简练化（用户 2026-10-17「太多了，尽可能简练」）：一次只留两条成因线——
+   「帮扶」取生我／比助里黄经最近的一曜，「克夺」取克我里黄经最近的一曜；
+   原先连「我生／我克」（泄气，五行五分里占两格）导致几乎曜曜有份，
+   一选就是十来条线与三方四正线叠着糊住盘面，故删。宫位得地线至多一条，保留。 */
+function energyLinks(bd) {
+  const out = [];
+  if (!snap || !bd) return out;
+  const wx = YAO_WUXING[bd.char];
+  if (!wx) return out;
+  const meMesh = meshOfChar(bd.char);
+  if (!meMesh || !meMesh.getWorldPosition) return out;
+  const mePos = meMesh.getWorldPosition(new THREE.Vector3());
+  const lon0 = norm360(bd.lon);
+  /* 在「五行属 want」的诸曜里取与本曜黄经差最小者（同一盘上下，线也最短最不乱） */
+  const pick = function (want) {
+    let best = null, bestD = 1e9;
+    for (const b of snap.bodies) {
+      if (b.char === bd.char) continue;
+      if (YAO_WUXING[b.char] !== want) continue;
+      const d = Math.abs(((norm360(b.lon) - lon0 + 540) % 360) - 180);
+      if (d < bestD) { bestD = d; best = b; }
+    }
+    if (!best) return null;
+    const m = meshOfChar(best.char);
+    if (!m || !m.getWorldPosition) return null;
+    return m.getWorldPosition(new THREE.Vector3());
+  };
+  const sh = pick(SHENG_ME[wx]);              /* 生我：帮扶（青绿） */
+  const same = sh ? null : pick(wx);          /* 无生我者时退作比助（同我） */
+  const kk = pick(KE_OF[wx]);                 /* 克我：受克（暗红） */
+  if (sh) out.push({ kind: 'sheng', a: sh, b: mePos });
+  else if (same) out.push({ kind: 'sheng', a: same, b: mePos });
+  if (kk) out.push({ kind: 'ke', a: kk, b: mePos });
+  /* 宫位得地：所落宫五行同我 → 自该处的黄道环射入本曜 */
+  const gi = gongIndex(bd.lon);
+  if (gi >= 0 && GONG[gi] && GONG_WUXING[GONG[gi].chen] === wx) {
+    const a = norm360(bd.lon) * DEG;
+    out.push({
+      kind: 'gong',
+      a: new THREE.Vector3(Math.cos(a) * ECL_RING, 0, Math.sin(a) * ECL_RING),
+      b: mePos
+    });
+  }
+  return out;
+}
+
+function updateEnergy3D(now) {
+  ensureEnergy();
+  const bd = selBody();
+  const on = !!(show.energy && bd);
+  energyLine.visible = on;
+  energyArrows.visible = on;
+  if (!on) { updateEnergyLegend(null, []); return; }
+  const links = energyLinks(bd);
+  const la = energyLineGeo.attributes.position.array;
+  const lc = energyLineGeo.attributes.color.array;
+  const pulse = 0.55 + 0.45 * Math.sin(now * 0.0016);   /* 缓慢闪烁：约 4 秒一次呼吸 */
+  let k = 0;
+  for (let i = 0; i < ENERGY_SEG_MAX; i++) {
+    const cone = energyArrows.children[i];
+    if (i < links.length) {
+      const L = links[i];
+      const col = ENERGY_COLOR[L.kind] || ENERGY_COLOR.out;
+      la[k] = L.a.x; la[k + 1] = L.a.y; la[k + 2] = L.a.z;
+      la[k + 3] = L.b.x; la[k + 4] = L.b.y; la[k + 5] = L.b.z;
+      lc[k] = col[0] * pulse; lc[k + 1] = col[1] * pulse; lc[k + 2] = col[2] * pulse;
+      lc[k + 3] = col[0] * pulse; lc[k + 4] = col[1] * pulse; lc[k + 5] = col[2] * pulse;
+      k += 6;
+      /* 箭头放在靠作用端 72% 处，锥尖指向 L.b：箭尾＝能量来源，箭头＝作用方向 */
+      _dir3.set(L.b.x - L.a.x, L.b.y - L.a.y, L.b.z - L.a.z);
+      const len = _dir3.length() || 1;
+      cone.position.set(L.a.x + _dir3.x * 0.72, L.a.y + _dir3.y * 0.72, L.a.z + _dir3.z * 0.72);
+      _dir3.divideScalar(len);
+      cone.quaternion.setFromUnitVectors(_UP3, _dir3);
+      cone.material.color.setRGB(col[0], col[1], col[2]);
+      cone.material.opacity = 0.55 + 0.4 * pulse;
+      cone.visible = true;
+    } else {
+      la[k] = la[k + 1] = la[k + 2] = la[k + 3] = la[k + 4] = la[k + 5] = 0;
+      k += 6;
+      cone.visible = false;
+    }
+  }
+  if (energyLineGeo.setDrawRange) energyLineGeo.setDrawRange(0, links.length * 2);
+  energyLineGeo.attributes.position.needsUpdate = true;
+  energyLineGeo.attributes.color.needsUpdate = true;
+  updateEnergyLegend(bd, links);
+}
+
+/* 图例：把「哪条线是什么关系、流向哪边」讲清楚；并附规则库算出的计分条目，
+   即「它为什么好／为什么不好」的原始依据（与排盘面板同源，不是另造一套说法）。 */
+const energyLegendEl = document.createElement('div');
+energyLegendEl.id = 'energyLegend';
+energyLegendEl.className = 'hide';
+document.body.appendChild(energyLegendEl);
+/* 图例放在左下、宫带上方（左上被主面板占、右侧被排盘/格局面板占） */
+const energyStyle = document.createElement('style');
+energyStyle.textContent = [
+  '#energyLegend{position:fixed;left:12px;bottom:186px;z-index:10;max-width:600px;',
+  'background:rgba(9,14,24,.78);border:1px solid #26374f;border-radius:8px;padding:5px 9px;',
+  'color:#c6d8ee;font:12px/1.65 var(--dsh-ui),"Source Han Sans SC","Microsoft YaHei",sans-serif;',
+  'pointer-events:none;backdrop-filter:blur(2px)}',
+  '#energyLegend.hide{display:none}',
+  '#energyLegend .eh{color:#dceaf8;font-weight:600;letter-spacing:.04em;margin-bottom:1px}',
+  '#energyLegend .esym{margin:0 4px;font-size:14px}',
+  '#energyLegend .er{display:flex;align-items:center;gap:5px;white-space:nowrap}',
+  '#energyLegend .er i{display:inline-block;width:14px;height:2px;border-radius:1px;flex:0 0 auto}',
+  '#energyLegend .er.sheng i{background:linear-gradient(90deg,#4ff0a8,#2fd08a)}',
+  '#energyLegend .er.ke i{background:linear-gradient(90deg,#ff6a66,#d94844)}',
+  '#energyLegend .er.out i{background:linear-gradient(90deg,#89a4cf,#5d7699)}',
+  '#energyLegend .er.gong i{background:linear-gradient(90deg,#7fe6b4,#3fae86)}',
+  '#energyLegend .ep{color:#9fb6d2;margin-top:2px;max-width:598px;white-space:normal}',
+  '#energyLegend .er.none{color:#8299b6}'
+].join('');
+document.body.appendChild(energyStyle);
+function updateEnergyLegend(bd, links) {
+  const showIt = !!(show.energy && bd);
+  if (!showIt) {
+    if (energyLegendEl.className !== 'hide') energyLegendEl.className = 'hide';
+    return;
+  }
+  const cnt = { sheng: 0, ke: 0, out: 0, gong: 0 };
+  for (const L of links) if (cnt[L.kind] !== undefined) cnt[L.kind]++;
+  const st = stateMap[bd.id] || { cls: 'mid', score: 0 };
+  const wx = YAO_WUXING[bd.char] || '—';
+  const sc = st.cls === 'good' ? '#8ed9a2' : (st.cls === 'bad' ? '#e08a8a' : '#93a9c4');
+  const rows = [];
+  rows.push('<div class="eh">' + YAO[bd.id].name + '　五行属' + wx + '　'
+    + '<span class="esym">' + (ST_SYM[st.cls] || ST_SYM.mid) + '</span>'
+    + '<span style="color:' + sc + '">计分 ' + (st.score > 0 ? '+' : '') + st.score + '</span></div>');
+  if (cnt.sheng) rows.push('<div class="er sheng"><i></i>生我／比助 ' + cnt.sheng + ' 路：青绿线缓闪，箭头指向本曜（得助）</div>');
+  if (cnt.ke) rows.push('<div class="er ke"><i></i>克我 ' + cnt.ke + ' 路：暗红线缓闪，箭头指向本曜（受克）</div>');
+  if (cnt.out) rows.push('<div class="er out"><i></i>我生／我克 ' + cnt.out + ' 路：灰蓝线缓闪，箭头自本曜指出（泄气）</div>');
+  if (cnt.gong) rows.push('<div class="er gong"><i></i>宫位得地 ' + cnt.gong + ' 路：自黄道环射入，箭头指向本曜（因宫助我）</div>');
+  if (!links.length) rows.push('<div class="er none">五行与诸曜不牵连，无生克线</div>');
+  const parts = (st.parts || []).slice(0, 4);
+  if (parts.length) {
+    rows.push('<div class="ep">' + parts.map(function (p) {
+      const c = p.c > 0 ? '#8ed9a2' : (p.c < 0 ? '#e08a8a' : '#93a9c4');
+      return '<span style="color:' + c + '">' + (p.pts > 0 ? '+' : '') + p.pts + '</span> ' + escHtml(String(p.v || ''));
+    }).join('　·　') + '</div>');
+  }
+  const html = rows.join('');
+  if (energyLegendEl.innerHTML !== html) energyLegendEl.innerHTML = html;
+  if (energyLegendEl.className !== '') energyLegendEl.className = '';
+}
+/* ================= 十二宫·宫位详情：点黄道环上的宫名展开 =================
+   点地球旁十二宫刻度环上的地支宫名（或古十二次名）→ 右侧展开实质性内容：
+   该宫五行、十二宫位次（落在哪一宫，如「夫妻宫」）、所主何事、
+   此刻入驻该宫的诸曜及其庙旺／失垣。
+   宫序规则：命宫取「本日所居之宫」（设生辰后定盘；未设则取太阳当前所居之宫，动态盘），
+   宫自命宫逆布、限顺行（古法须以生时上升度定命宫，此处以日宫代替并在面板中注明）。
+   宫名与所主依七政四余传统「星命术十二宫」。排布从古法：宫自命宫起、按地支顺行（午→未→申…，
+   即本盘中黄经递减方向）依次排 命→相貌→福德→官禄→迁移→疾厄→夫妻→奴弍→男女→田宅→财帛→兄弟，
+   这正是洞微大限的行限次序（限顺行，每宫管年数见 DX_YEARS）。
+   xi ＝ 该宫在 YAO_GONG_XIANG 十二句数组中的下标（该数组仍按 命/财帛/兄弟/… 的宫义次序排列）。 */
+const GONG_SHIER = [
+  { name: '命宫',   xi: 0,  zhu: '主自身：性格、形貌、生命力与一生总体格局' },
+  { name: '相貌宫', xi: 11, zhu: '主容颜、仪表与性情流露' },
+  { name: '福德宫', xi: 10, zhu: '主福分厚薄、心境享乐与贵人缘分' },
+  { name: '官禄宫', xi: 9,  zhu: '主事业、升迁、地位与功名' },
+  { name: '迁移宫', xi: 8,  zhu: '主出行、迁移、改业与四方发展' },
+  { name: '疾厄宫', xi: 7,  zhu: '主疾病、伤害与灾厄' },
+  { name: '夫妻宫', xi: 6,  zhu: '主婚姻、配偶与情感缘分之顺逆' },
+  { name: '奴弍宫', xi: 5,  zhu: '主奴仆、下属与供驱使之人' },
+  { name: '男女宫', xi: 4,  zhu: '主子女、后代与传承' },
+  { name: '田宅宫', xi: 3,  zhu: '主家宅、田土、产业与居住' },
+  { name: '财帛宫', xi: 2,  zhu: '主正财与物质资源：赚钱能力、用度盈亏' },
+  { name: '兄弟宫', xi: 1,  zhu: '主兄弟姐妹与同辈朋友：往来助力' }
+];
+/* 星曜入宫释义：每曜十二句，下标次序为 命0·财帛1·兄弟2·田宅3·男女4·奴弍5·
+   夫妻6·疾厄7·迁移8·官禄9·福德10·相貌11（经 GONG_SHIER[].xi 映射到宫位）。
+   取义于星命术诸曜性情与所主，结合该宫分野；庙旺／失垣的强弱增减在渲染时另行标注。 */
+const YAO_GONG_XIANG = {
+  '日': [
+    '日临本命，性情刚明有贵气，好胜喜领袖，一生光明磊落',
+    '正财光明，进财坦荡，亦主为体面名声而耗财',
+    '主长上有靠，兄友刚强，往来中多一分较量',
+    '家宅光明堂宇，产业贵重，居处喜向阳之地',
+    '子女贵显聪明，然性傲早离膝下，子缘先厚后疏',
+    '下属端方可用，但各有主张，不易驱策',
+    '配偶高大明亮、能干有地位；昼生尤吉，夜生主迟聚多争',
+    '防心脾、眼目之疾，病发急而去亦速',
+    '出行光显，四方多得贵人扶持，宜向外发展',
+    '官禄逢日照，上位提携、功名显达，宜文职显职',
+    '福厚心明，享衣食之禄，性喜施予',
+    '面目晴亮、仪表尊严，目光有摄受力'
+  ],
+  '月': [
+    '月临本命，性情温柔细腻，多情富直觉，夜生者福力尤全',
+    '主生活财，财源随潮涨落，积聚细水长流',
+    '同胞缘深，往来频密，情谊如月之盈亏有消长',
+    '宅舍清幽近水，产业易迁动，置产宜静地',
+    '子女缘厚、尤利女儿，家内情致细腻',
+    '下属体贴善解，然意志稍柔，宜抚不宜督',
+    '夜生最吉，配偶温柔多情；昼生则感情易潮涌波动',
+    '肾水、湿气之疾，病势缠绵反复',
+    '往来频仍、迁移多变，宜近水行旅商途',
+    '官禄清静不显，宜财赋庶务之职，升迁缓而稳',
+    '福出静中，内心丰盈，情感即其福亦其累',
+    '眉目清秀、姿态温柔，容色如水'
+  ],
+  '水': [
+    '水星临命，聪慧口才、学习敏捷，机变多能',
+    '财由智巧言语而来，细进细出、流转灵活',
+    '同辈多商议往来，以言交、以辩合',
+    '宅舍小巧整饬，近道路市集，居处善转圜',
+    '子女聪颖利口，教读早慧，然性情稍浮',
+    '下属能言善办，然防其取巧搬弄',
+    '配偶善沟通、多商谈，情缘在言语往来，防心意游移',
+    '呼吸、神经之疾，小恙无大碍',
+    '适四方、善应对，宜商旅通信之行',
+    '宜言语文字、幕僚书记之职，功名以渐而进',
+    '好学叩问，心境灵动，福在智识',
+    '额阔语清，身形偏瘦，神情机敏'
+  ],
+  '金': [
+    '金星临命，性质温柔可爱，审美雅致，身带风情',
+    '金星本财星，财来自丰、善营生计，珍物围绕',
+    '同辈情谊温厚，多得姊妹女友之助',
+    '宅舍华美，多妆饰陈设，所居雅致',
+    '子女美貌聪慧、尤利女儿，养育宜宽柔',
+    '下属柔顺悦目，然主仆间宜防骄纵',
+    '金临夫妻，姻缘情深、配偶可人，防妒忌风月之缠',
+    '肺、皮肤之疾，防酒色过度成隐疾',
+    '出行多喜乐，途中得女性贵人',
+    '官禄清贵，宜艺术审美、财务之职',
+    '一生安乐喜乐，福自天来，好音乐文饰',
+    '肤白貌美、姿态妩媚，气质动人'
+  ],
+  '火': [
+    '火星临命，性质刚果敢为，有魄力，然易躁急',
+    '财上多竞争、大进大出，防因争致耗',
+    '同辈多摩擦争执，往来易伤和气',
+    '宅舍防争端、近炉火，或主迁动不安',
+    '子女顽健难制，防小灾小伤',
+    '下属勇悍，然有反骨，御下宜恩威并施',
+    '火临夫妻，配偶刚强有魄力，感情易热易冷、多口舌',
+    '防刀火外伤、心血之疾，病来凶猛',
+    '行路多辛劳，防途中争执官非，宜谨慎远行',
+    '宜武职技术，权威可用，然功名多起伏',
+    '心气急、好争斗，福从拼搏中来，防怒伤身',
+    '目光锐利、眉发飞扬，形貌雄悍'
+  ],
+  '木': [
+    '木星临命，性质仁慈宽厚，器量恢宏，多逢贵人',
+    '财帛丰饶有余，以仁德用财则福愈厚',
+    '兄姊可恃、同辈得力，往来皆益',
+    '宅舍宽宏，田宅之喜，门庭仁和',
+    '子女端方有教，日后成器',
+    '下属忠厚，堪为家室之助',
+    '配偶宽厚有德，得妻家之力，婚姻安稳',
+    '肝胆湿热之疾，然大都轻缓',
+    '出行多喜乐，他乡得贵人扶持',
+    '木临官禄，宜文教官职，功名多得上位器重',
+    '福厚灾少，好读书远游，心境宽和',
+    '面阔和善、体态微丰，气象端雅'
+  ],
+  '土': [
+    '土星临命，性质厚重端凝，晚成多劳，自律自持',
+    '财由积累而来，俭约持家，晚景渐丰',
+    '同辈情谊淡而相敬，往来少助亦少争',
+    '好置田土产业，宅舍坚固耐久',
+    '子女缘迟、期望甚重，养育宜宽',
+    '下属朴实可靠，宜久任',
+    '婚姻迟而稳，配偶年长持重，相敬多于相爱',
+    '脾胃、湿寒之疾，缠绵缓愈',
+    '行旅迟缓劳顿，宜静守不宜远涉',
+    '官禄迟得，宜田土边守之职，晚成功名',
+    '性喜静、福来迟，安分即福',
+    '身形敦厚、貌古容肃，仪表持重'
+  ],
+  '罗': [
+    '罗睺临命，志向宏大、性带偏锋，多异才奇技',
+    '财上多横发横破，防因财惹讼',
+    '同辈间多竞争暗算，往来防小人',
+    '产业多变动，旧宅产权防纠葛',
+    '子女聪慧难制，缘份稍薄',
+    '下属狡黠能干，然多操纵之态',
+    '夫妻宫见罗，情缘深缠多闹，聚散无常',
+    '防暗疾、眼心之患，亦防灾祸所侵',
+    '途中多劳多争，防异端是非缠身',
+    '权柄反重，功名易掀波，宜偏门异路之职',
+    '心绪不宁，多异梦奇缘，福从险中求',
+    '相貌稍异、目光逼人，气带威煞'
+  ],
+  '计': [
+    '计都临命，性质孤静，玄缘深厚，别世出尘之想',
+    '财趋安静，多有暗入之财，防暗耗',
+    '同胞缘薄，聚少离多',
+    '宅舍清幽，近寺观园圃，门庭冷落',
+    '子女缘薄，晚年防子息劳心',
+    '下属去留频繁，久任者少',
+    '夫妻宫静，缘分淡薄，聚散随缘',
+    '防暗疾沉疴、脾肾之患',
+    '孤旅艰辛，反与异域玄门有缘',
+    '官禄趋静，宜监察玄门清职',
+    '心境空寂，好道修省，福在清静',
+    '容色沉暗、相貌清癯，神带孤气'
+  ],
+  '炁': [
+    '紫炁临身，性质清高，灵性聪慧，多艺数之才',
+    '财帛清贵，得文人之助，不为财役',
+    '同辈多方正之人，互相提携',
+    '宅舍清雅，有林园之趣',
+    '子女灵慧向学，文艺出色',
+    '下属忠谨，无巧言令色',
+    '配偶清雅有德，情致高洁相敬',
+    '肝胆之疾轻缓，多能自愈',
+    '雅人远游，多得高士贵人',
+    '宜文翰清职，官禄清誉',
+    '福自静来，好道尚德',
+    '眉目清疏、气质闲雅'
+  ],
+  '孛': [
+    '月孛临命，性质灵秀多欲，一生多变动波澜',
+    '财来去如水，防因情欲而耗散',
+    '同辈情缘纠缠，往来多摇摆',
+    '宅舍多闹，居处屡迁',
+    '子女多忧，缘分纠缠难理',
+    '下属滑黠多欲，防其扰事',
+    '孛照夫妻，感情波澜多欲缠，防外遇风波',
+    '肾、血液之疾，防湿热隐疾',
+    '途中多波折，计划屡变',
+    '功名易因感情用事而摇摆',
+    '心绪不宁，欲多福薄，知足则安',
+    '眼波含情、姿态撩人，貌带桃花'
+  ]
+};
+let gongPanelOpen = -1, gongPanelSig = '';
+let birthJD = null;                    /* 生辰定盘后：命宫取本命日所居之宫（固定）；未设则随太阳当前宫动态 */
+const gongPanel = document.createElement('div');
+gongPanel.id = 'gongPanel';
+gongPanel.className = 'hide';
+document.body.appendChild(gongPanel);
+function mingGongIdx() {
+  if (birthJD !== null) return gongIndex(sunApparentLon(birthJD));
+  if (!snap) return 0;
+  for (const b of snap.bodies) if (b.id === 'sun') return gongIndex(b.lon);
+  return 0;
+}
+/* 位次下标＝自命宫起地支顺行数到宫 i 的步数（地支顺行在本盘＝GONG 数组下标递减方向） */
+function gongShiIndex(i) { return (mingGongIdx() - i + 12) % 12; }
+/* 宫主星字符：宫主五行 → 主曜（丑宫土→土、午宫日→日、未宫月→月……，《全》23页三十四） */
+function gongZhuChar(chen) { return WX_MAIN_YAO[GONG_ZHU[chen]]; }
+/* 三方四正宫下标：三合 ±120°（±4 宫）、对宫 180°（6 宫），与 aspectLine 的 120/240/180 同口径 */
+function gongSanFang(i) { return [(i + 4) % 12, (i + 8) % 12, (i + 6) % 12]; }
+/* 入驻之曜与本宫的五行关系一句话（宫＝本宫五行，曜＝入驻之曜五行） */
+function gongRelPhrase(ch, gwx) {
+  const ywx = YAO_WUXING[ch];
+  if (!ywx) return '';
+  if (ywx === gwx) return '（同气比和）';
+  if (SHENG_OF[ywx] === gwx) return '（' + ch + '生宫·宫得生助）';
+  if (SHENG_OF[gwx] === ywx) return '（宫生' + ch + '·泄宫之气）';
+  if (KE_OF[ywx] === gwx) return '（' + ch + '克宫·宫受其克）';
+  if (KE_OF[gwx] === ywx) return '（宫克' + ch + '·宫制其曜）';
+  return '';
+}
+/* 宫位详情：不再只报「此处无曜」，而是给出本盘该宫的完整诊断——
+   宫位次、宫主（宫主星）今居何宫与吉凶分、命/身/大限/小限/月限标记、
+   入驻诸曜（分·庙旺·角色）、三方四正拱照之曜、涉及本宫的成格局、自动断语。
+   数据全部复用既有源：chartCtx／stateMap／pingceCalc（roles·dayun·giM）／gejuLastList，不新起规则引擎。 */
+function renderGongPanel() {
+  const i = gongPanelOpen;
+  if (i < 0) return;
+  const GG = GONG[i];
+  const shi = gongShiIndex(i);
+  const ctx = chartCtx();
+  const stOf = ch => { const b = ctx.m[ch]; return stateMap[b.id] || evalYaoState(ch, ctx); };
+  const clsCol = st => st.cls === 'good' ? '#8ed9a2' : (st.cls === 'bad' ? '#e08a8a' : '#93a9c4');
+  const clsTxt = st => st.cls === 'good' ? '吉' : (st.cls === 'bad' ? '凶' : '平');
+  const P = birthJD !== null ? pingceCalc() : null;
+  const roles = P ? P.roles : {};
+  const giM = P ? P.giM : mingGongIdx();
+  const d = P ? P.dayun : null;
+  const gwx = GONG_WUXING[GG.chen];
+  const zhuCh = gongZhuChar(GG.chen);
+  const occ = snap ? snap.bodies.filter(function (b) { return gongIndex(b.lon) === i; }) : [];
+  const sfIdx = gongSanFang(i);
+  const roleTag = ch => roles[ch] ? '<span class="gpRole">[' + roles[ch].join('/') + ']</span>' : '';
+
+  let html = '<div class="gpTop"><b>' + GG.chen + '宫</b>'
+    + '<span class="gpSub">' + GG.ci + ' · 五行属' + gwx + '</span>'
+    + '<button id="btnGongClose" title="关闭">×</button></div>';
+  html += '<div class="gpShi">本盘宫位次：<em>' + GONG_SHIER[shi].name + '</em></div>';
+  html += '<div class="gpZhu">' + GONG_SHIER[shi].zhu + '</div>';
+
+  /* 命/身/行限标记：本宫在本盘担当什么 */
+  const marks = [];
+  if (i === giM) marks.push('命宫');
+  if (P && i === P.shenGi) marks.push('身宫');
+  if (d) {
+    if (i === d.dxIdx) marks.push('大限宫');
+    if (i === d.xxIdx) marks.push('小限宫');
+    if (i === d.yueIdx) marks.push('月限宫');
+  }
+  html += '<div class="gpSec">本宫于本盘所在</div><div class="gpKey">'
+    + (marks.length ? '<span class="gpMark">' + marks.join(' · ') + '</span>' : '非命/身宫，亦非今大限·小限·月限宫')
+    + (birthJD === null ? '　<span class="gpNone">（未定盘：命宫随太阳所居动态）</span>' : '') + '</div>';
+
+  /* 宫主：此宫之主曜今居何处、状态几分（宫主星本盘实况） */
+  const zSt = stOf(zhuCh);
+  html += '<div class="gpSec">宫主（宫主星）</div><div class="gpKey">'
+    + GG.chen + '宫主' + GONG_ZHU[GG.chen] + '（《全》23页三十四）＝<b>' + yaoName(GONG_ZHU[GG.chen]) + '</b>'
+    + '，今居<b>' + ctx.zh(zhuCh) + '宫</b>（' + GONG_SHIER[(giM - ctx.gi(zhuCh) + 12) % 12].name + '），'
+    + '吉凶分 <b style="color:' + clsCol(zSt) + '">' + zSt.score + '（' + clsTxt(zSt) + '）</b>——'
+    + (zSt.cls === 'good' ? '宫主得地，本宫之事有主、可用。'
+      : (zSt.cls === 'bad' ? '宫主失陷，本宫之事少力，须恩用诸曜扶之。' : '宫主平平，本宫吉凶多随行限引动。'))
+    + '</div>';
+
+  /* 所临诸曜：分／庙旺／失垣／角色（命主·身主·恩·用·财·难·余奴）＋入宫释义＋与宫五行关系 */
+  html += '<div class="gpOcc">所临诸曜（本宫）</div>';
+  if (!occ.length) html += '<div class="gpNone">本宫空，无曜入居——看宫主与三方四正（下），依古法「空宫借三方」断之</div>';
+  for (const b of occ) {
+    const mw = miaoWang(b.char, GG.chen);
+    const sy = shiYuan(b.char, GG.chen);
+    const st = stOf(b.char);
+    html += '<div class="gpRow"><span style="color:' + b.color + '">' + b.name + '</span>'
+      + '　黄经 ' + norm360(b.lon).toFixed(2) + '°'
+      + '　<b style="color:' + clsCol(st) + '">' + st.score + '</b>'
+      + (mw ? '　<b class="mw">' + mw + '</b>' : '')
+      + (sy ? '　<b class="sy">失垣</b>' : '')
+      + '　' + roleTag(b.char) + '</div>';
+    const xg = YAO_GONG_XIANG[b.char] ? YAO_GONG_XIANG[b.char][GONG_SHIER[shi].xi] : '';
+    if (xg) {
+      const tag = mw ? '（' + mw + '地，影响增力）' : (sy ? '（失垣，吉减凶增）' : '');
+      html += '<div class="gpXiang">' + xg + (tag ? '<span class="gpTag">' + tag + '</span>' : '')
+        + '<span class="gpTag">' + gongRelPhrase(b.char, gwx) + '</span></div>';
+    }
+  }
+
+  /* 三方四正：三合二宫＋对宫所临之曜（拱夹照会），空宫即赖此论 */
+  html += '<div class="gpSec">三方四正（拱夹照会）</div>';
+  const sfChars = [];
+  for (let k = 0; k < sfIdx.length; k++) {
+    const j = sfIdx[k];
+    const sfOcc = snap ? snap.bodies.filter(function (b) { return gongIndex(b.lon) === j; }) : [];
+    html += '<div class="gpSfRow">' + (k === 2 ? '对宫' : '三合') + ' ' + GONG[j].chen + '宫（' + GONG_SHIER[(giM - j + 12) % 12].name + '）：'
+      + (sfOcc.length ? sfOcc.map(function (b) {
+          sfChars.push({ ch: b.char, j: j });
+          return '<span style="color:' + b.color + '">' + b.char + '</span>' + roleTag(b.char);
+        }).join('　') : '<span class="gpNone">空</span>') + '</div>';
+  }
+
+  /* 格局涉及：今盘成格中，参与曜落本宫或落三方四正者 */
+  const gAll = gejuLastList || [];
+  const gjIn = [], gjSf = [];
+  for (const g of gAll) {
+    const chs = gejuChars(g.yao);
+    if (chs.some(function (c) { return ctx.gi(c) === i; })) gjIn.push(g);
+    else if (chs.some(function (c) { return sfIdx.indexOf(ctx.gi(c)) >= 0; })) gjSf.push(g);
+  }
+  html += '<div class="gpSec">格局涉及</div>';
+  if (gjIn.length) html += '<div class="gpKey">本宫参与成格：' + gjIn.map(function (g) {
+    return '<b style="color:' + (g.bad ? '#e08a8a' : '#8ed9a2') + '">' + esc(g.ge) + '</b>（参与曜 '
+      + gejuChars(g.yao).filter(function (c) { return ctx.gi(c) === i; }).join('') + '）';
+  }).join('；') + '</div>';
+  if (gjSf.length) html += '<div class="gpKey">三方四正参与成格：' + gjSf.map(function (g) { return esc(g.ge); }).join('、') + '</div>';
+  if (!gjIn.length && !gjSf.length) html += '<div class="gpKey gpNone">本宫及其三方四正未涉严格成格'
+    + (gAll.length ? '（今盘成格：' + gAll.map(function (g) { return esc(g.ge); }).join('、') + '，参与曜皆在他宫）'
+      : '（今盘无一格局全部条件匹配）') + '</div>';
+
+  /* 本宫断语：结合宫主·入驻·拱照·行限自动成句，杜绝「无星此处」式空话 */
+  const duan = [];
+  if (occ.length) {
+    duan.push('本宫属' + gwx + '，入驻' + occ.map(function (b) { return b.char; }).join('、') + '：'
+      + occ.map(function (b) { return '<b>' + b.char + '</b>'
+        + gongRelPhrase(b.char, gwx).replace(/[（）]/g, '') + '。'; }).join('　'));
+  } else {
+    duan.push('本宫空（无曜入居）：三合' + GONG[sfIdx[0]].chen + '宫、' + GONG[sfIdx[1]].chen + '宫与对宫'
+      + GONG[sfIdx[2]].chen + '宫' + (sfChars.length ? '有<b>' + sfChars.map(function (x) { return x.ch; }).join('、')
+        + '</b>拱照' : '亦无曜') + '，故本宫之事借三方四正之曜与宫主（' + yaoName(GONG_ZHU[GG.chen]) + '）论断。');
+  }
+  if (d) {
+    const pos = [];
+    if (i === d.dxIdx) pos.push('今为<b>大限宫</b>（第' + (d.xian + 1) + '限·' + GONG_SHIER[d.xian].name + '限 '
+      + d.startAge + '–' + d.endAge + '岁，已行 ' + d.xianDeg.toFixed(1) + '°）');
+    if (i === d.xxIdx) pos.push('今为<b>小限宫</b>');
+    if (i === d.yueIdx) pos.push('今为<b>月限宫</b>');
+    duan.push(pos.length ? '行限：' + pos.join('；') + '。'
+      : '行限：本宫非今之限宫（大限在' + GONG[d.dxIdx].chen + '宫·小限在' + GONG[d.xxIdx].chen + '宫·月限在' + GONG[d.yueIdx].chen + '宫）。');
+    if (occ.some(function (b) { return P.nanStars.indexOf(b.char) >= 0; }))
+      duan.push('本宫有<b>难星</b>入居' + (i === d.dxIdx ? '，又当限宫，宜守不宜进' : '') + '。');
+    if (occ.some(function (b) { return P.enStars.indexOf(b.char) >= 0; }))
+      duan.push('本宫有<b>恩星</b>入居，得生扶之力。');
+  } else if (birthJD === null) {
+    duan.push('未定盘：设生辰后可见本宫宫主之今居吉凶、行限与大限·小限·月限是否落此宫。');
+  }
+  html += '<div class="gpSec">本宫断语</div>' + duan.map(function (t) { return '<div class="gpDuan">· ' + t + '</div>'; }).join('');
+
+  html += '<div class="gpNote">命宫取' + (birthJD !== null ? '本命日所居之宫（已定盘）' : '太阳当前所居之宫') +
+    '，宫自命宫逆布、限顺行（简化；古法须以生时上升度定命宫）。宫主／角色／格局参与与「评测」面板同源。</div>';
+  gongPanel.innerHTML = html;
+  document.getElementById('btnGongClose').addEventListener('click', closeGongPanel);
+}
+function openGongPanel(i) {
+  if (gongPanelOpen === i) { closeGongPanel(); return; }
+  gongPanelOpen = i;
+  gongPanelSig = '';
+  if (gejuOpen) toggleGejuView(false);   /* 与格局面板同槽位，互斥 */
+  if (pingceOpen) closePingce();         /* 与评测面板同槽位，互斥 */
+  gongPanel.className = '';
+  for (let j = 0; j < 12; j++) {
+    gongLabels[j].classList.remove('gongSel');
+    gongCiLabels[j].classList.remove('gongSel');
+  }
+  gongLabels[i].classList.add('gongSel');
+  gongCiLabels[i].classList.add('gongSel');
+  renderGongPanel();
+}
+function closeGongPanel() {
+  gongPanelOpen = -1;
+  gongPanel.className = 'hide';
+  for (let j = 0; j < 12; j++) {
+    gongLabels[j].classList.remove('gongSel');
+    gongCiLabels[j].classList.remove('gongSel');
+  }
+}
+/* 盘面随时间推进时，宫位内容（入驻曜／命宫位次）跟着刷新 */
+function gongPanelFrame() {
+  if (gongPanelOpen < 0 || !snap) return;
+  const sig = gongPanelOpen + '|' + gongShiIndex(gongPanelOpen) + '|'
+    + snap.bodies.map(function (b) { return gongIndex(b.lon); }).join(',');
+  if (sig !== gongPanelSig) { gongPanelSig = sig; renderGongPanel(); }
+}
+for (let j = 0; j < 12; j++) {
+  (function (i) {
+    gongLabels[i].addEventListener('click', function (e) { e.stopPropagation(); openGongPanel(i); });
+    gongCiLabels[i].addEventListener('click', function (e) { e.stopPropagation(); openGongPanel(i); });
+  })(j);
+}
+
+/* ================= 大运 · 洞微百六限 =================
+   依据本地数据库《七政四余（全）》第188–189页（起大限法·十二宫行大限表·大限行度诀·十二宫年分歌·推年月运法）：
+   · 出童限：「以当生日时，逆数至太阳交中气时，以三日为一年，一日为四个月，一时为十日，
+     外加十年，即是出童限年数」——生日（无生时取正午）逆数至最近一次太阳过中气（黄经30°整倍数），
+     三日折一年外加十年，虚岁约10–20，此岁即命宫限起（童限寓于命限之中）。
+   · 十二宫行限：限自命宫地支顺行逐宫，各宫管年数依十二宫年分歌——
+     「命宫十五貌宫十。福德妻宫十一详。官禄十五最高位。迁移止有八年粮。疾厄七兮…
+     财帛兄弟五年强。田宅子孙并奴仆。四年之半定毫芒」；命宫管年行度诀云「命宫行度随浅深」，
+     以本命日躔宫之度定（10–20）。名义命宫十五合计约106，故称「百六」。
+   · 行度：限内按管年均匀行宫三十度（行度诀：相貌一年三度·官禄一年两度·疾厄一年四度等，
+     与 30°÷管年 的均速相符）。
+   · 小限（推年运法）：「以生年支加在命宫，逆数至本年太岁宫，是为小限」。
+   · 月限（推月运法）：「以小限宫起生月，按月逆寻，是为月限」（月以节气月计，寅为正）。
+   设生辰定盘后：命宫＝本命日太阳所居之宫（固定），大限小限月限随之起；
+   未设生辰则本区仅提示，盘面宫位仍随太阳动态。 */
+const DX_YEARS = [null, 10, 11, 15, 8, 7, 11, 4.5, 4.5, 4.5, 5, 5];  /* 下标＝限次（0命宫·1相貌·2福德…） */
+/* 年支：与盘面太岁同例（ganzhiYearOf 以立春定年，北京时间） */
+function yearZhi(jd) { return ZHI.indexOf(ganzhiYearOf(jd).charAt(1)); }
+/* 节气月支：寅＝正月，自立春（黄经315°）起月 —— 供月限「按月逆寻」用 */
+function jieMonthZhi(jd) { return (Math.floor(norm360(sunApparentLon(jd) - 315) / 30) + 2) % 12; }
+let dayunPreBirth = false;   /* dayunCalc 因「时间早于生辰（尚未出生）」返 null 时置真，供 dayunFrame 出提示文案 */
+function dayunCalc() {
+  dayunPreBirth = false;
+  if (birthJD === null || !snap) return null;
+  /* 时间早于生辰＝尚未出生，行限无意义，直接返 null（各消费端已有的 if (d) 判定自然不画大限/小限宫与宫带青格）。
+     不可放任它静默回落：2026-10-17 实测把时间拨到 1983 而生辰仍 1990-06-15 时，虚岁算出 −6，
+     行限循环落到第 1 限（童限），于是显示成「今虚岁 -6 今行 1限·申宫（命宫限）1–18 岁」，看着像算错。 */
+  if (simJD < birthJD) { dayunPreBirth = true; return null; }
+  const sunB = norm360(sunApparentLon(birthJD));
+  const giM = gongIndex(sunB);
+  /* 出童限（起大限法·《七政四余（全）》188页）：生日逆数至太阳交中气（黄经30°整倍数），
+     三日为一年、一日为四个月、一时为十日，外加十年。中气即宫界，本式以真实太阳时精确折算。 */
+  const prevQi = findTermJD(birthJD, Math.floor(sunB / 30) * 30);
+  const chuXian = 10 + Math.floor(Math.max(0, birthJD - prevQi) / 3);
+  const YEARS = DX_YEARS.map(function (v, j) { return v === null ? chuXian : v; });
+  const cB = jdToCalendar(birthJD), cN = jdToCalendar(simJD);
+  const age = cN.y - cB.y + 1;                          /* 虚岁 */
+  let acc = 1, xian = 11;
+  for (let j = 0; j < 12; j++) {
+    if (age < acc + YEARS[j] || j === 11) { xian = j; break; }
+    acc += YEARS[j];
+  }
+  const dxIdx = (giM - xian + 12) % 12;                 /* 限宫：自命宫地支顺行每限进一步（本盘＝下标递减） */
+  const prog = Math.min(1, Math.max(0, (age - acc) / YEARS[xian]));
+  const gzN = ganzhiYearOf(simJD);
+  const xxIdx = ((giM + yearZhi(simJD) - yearZhi(birthJD)) % 12 + 12) % 12;     /* 小限宫：命宫起生年支「逆」数至太岁（＝下标递增方向） */
+  const yueIdx = ((xxIdx + jieMonthZhi(simJD) - jieMonthZhi(birthJD)) % 12 + 12) % 12;  /* 月限宫：小限宫起生月「按月逆寻」（＝下标递增方向） */
+  const occ = snap.bodies.filter(function (b) { return gongIndex(b.lon) === dxIdx; });
+  return { giM: giM, chuXian: chuXian, age: age, xian: xian, dxIdx: dxIdx, xxIdx: xxIdx, yueIdx: yueIdx,
+    startAge: acc, endAge: acc + YEARS[xian] - 1, xianDeg: prog * 30, gz: gzN, occ: occ };
+}
+const dayunInfoEl = document.getElementById('dayunInfo');
+function dayunFrame() {
+  const d = dayunCalc();
+  let txt;
+  if (!d) {
+    txt = dayunPreBirth
+      ? '当前时间早于生辰（尚未出生），行限无意义：本盘不推大限·小限·月限，宫带亦不画限格。请把时间拨到出生之后，或点「回到现在」。'
+      : '未设生辰：宫位以太阳当前所居之宫为命宫（动态盘）。设生辰定盘后，命宫定为本日所居之宫，起洞微大限与太岁小限。';
+  } else {
+    const G = GONG[d.dxIdx], GX = GONG[d.xxIdx], GY = GONG[d.yueIdx];
+    const names = d.occ.map(function (b) { return '<span style="color:' + b.color + '">' + b.name + '</span>'; }).join('、') || '—';
+    txt = '命宫定 <b class="hl">' + GONG[d.giM].chen + '宫</b>（日躔宫内，中气起算 ' + d.chuXian + ' 岁出童限）· 今虚岁 ' + d.age +
+      '<br />今行 <b class="hl">' + (d.xian + 1) + '限 · ' + G.chen + '宫（' + GONG_SHIER[d.xian].name + '限）</b> ' +
+      d.startAge + '–' + d.endAge + ' 岁 · 限度 ' + G.chen + '宫 ' + d.xianDeg.toFixed(1) + '°' +
+      '<br />今年 ' + d.gz + ' 太岁 · 小限宫 <b class="hl">' + GX.chen + '宫</b> · 本月月限宫 <b class="hl">' + GY.chen + '宫</b> · 流年星入限宫：' + names +
+      '<br /><span style="color:#7fe0c8">▮</span> 大限宫＝盘面青色宫名＋底部宫带青格（淡＝整宫 · 亮＝已行 · 线＝限度） · <span style="color:#ffb0d8">▮</span> 小限宫＝粉色宫名';
+  }
+  if (dayunInfoEl.innerHTML !== txt) dayunInfoEl.innerHTML = txt;
+  for (let j = 0; j < 12; j++) {
+    gongLabels[j].classList.remove('gongDX', 'gongXX');
+    gongCiLabels[j].classList.remove('gongDX', 'gongXX');
+  }
+  if (d) {
+    gongLabels[d.dxIdx].classList.add('gongDX'); gongCiLabels[d.dxIdx].classList.add('gongDX');
+    gongLabels[d.xxIdx].classList.add('gongXX'); gongCiLabels[d.xxIdx].classList.add('gongXX');
+  }
+}
+/* 点击地球：视角转到「当前大限宫面向自己」的方位。
+   做法＝相机方位角取大限宫宫格中心黄经（宫界 i*30 + 15°），仰角 25°，距离取「地心近景」
+   预设 118（与「视野」按钮同一档，不引魔数）；controls.target 恒为地心原点不产生平移，
+   故大限宫必然落在视线近侧、宫名贴带指示（gongDX 青框）正对镜头。
+   未设生辰时无大限，退用「太阳所居之宫」（动态盘命宫，与 #dayunInfo 文案一致）。 */
+function focusDayunGong() {
+  const d = dayunCalc();
+  const idx = d ? d.dxIdx : gongIndex(norm360(sunApparentLon(simJD)));
+  const a = (idx * 30 + 15) * DEG;                       /* 大限宫中心黄经 */
+  setView(118, Math.PI / 2 - a, Math.PI / 2 - 0.44);     /* 0.44 rad ≈ 25° 仰角 */
+}
+
+/* 生辰与时间设置合一：时间栏填好后点「设为生辰」，即用同一组年月日时分秒定盘。
+   未填的月/日取当前盘面，时/分/秒缺省取当日正午 12:00（与古法「当日」精度一致）。 */
+const bStatusEl = el('bStatus');
+function birthStatusText() {
+  if (birthJD === null) return '未设生辰 · 填好上方时间后点「设为生辰」即后台自动定盘、起大运';
+  const c = jdToCalendar(birthJD);
+  const p2 = function (n) { return (n < 10 ? '0' : '') + n; };
+  return '生辰 ' + c.y + '-' + p2(c.m) + '-' + p2(c.d) + ' ' + p2(c.h) + ':' + p2(c.mi) + '（UTC）· 已自动定盘';
+}
+function applyBirth() {
+  bStatusEl.textContent = birthStatusText();
+  if (gongPanelOpen >= 0) { gongPanelSig = ''; renderGongPanel(); }
+  if (pingceOpen) { pingceSig = ''; pingceRender(); }
+}
+el('btnSetB').addEventListener('click', function () {
+  const num = function (id) { return parseInt(el(id).value, 10); };
+  const cur = jdToCalendar(simJD);
+  const y = num('inYear');
+  if (!isFinite(y) || y < 1 || y > 9999) { bStatusEl.textContent = '请先在时间栏填写年份（例：1990），再点「设为生辰」'; return; }
+  const m = Math.min(12, Math.max(1, isFinite(num('inMonth')) ? num('inMonth') : cur.m));
+  const d0 = Math.min(daysInMonth(y, m), Math.max(1, isFinite(num('inDay')) ? num('inDay') : cur.d));
+  const hasHMS = isFinite(num('inHour')) || isFinite(num('inMin')) || isFinite(num('inSec'));
+  const hh = hasHMS ? Math.min(23, Math.max(0, isFinite(num('inHour')) ? num('inHour') : 12)) : 12;
+  const mi = hasHMS ? Math.min(59, Math.max(0, isFinite(num('inMin')) ? num('inMin') : 0)) : 0;
+  const ss = hasHMS ? Math.min(59, Math.max(0, isFinite(num('inSec')) ? num('inSec') : 0)) : 0;
+  birthJD = dateToJD(y, m, d0, hh, mi, ss);
+  saveBirth(birthJD);
+  applyBirth();
+});
+el('btnBClr').addEventListener('click', function () {
+  birthJD = null;
+  saveBirth(null);
+  applyBirth();
+});
+
+/* 生辰持久化（localStorage）：刷新或 HMR 重载后自动恢复定盘。
+   此前生辰只存在内存里，页面一重载 birthJD 就回到 null，dayunCalc() 返回 null，
+   底部宫带的青格／限度线随之不画——「大限不显示」的根因即此，非渲染缺陷。 */
+const BIRTH_KEY = 'qz.birthJD';
+function saveBirth(jd) {
+  try {
+    if (jd === null) localStorage.removeItem(BIRTH_KEY);
+    else localStorage.setItem(BIRTH_KEY, String(jd));
+  } catch (e) { /* 隐私模式／存储受限：写不进就算了，不影响本次定盘 */ }
+}
+function restoreBirth() {
+  try {
+    const v = parseFloat(localStorage.getItem(BIRTH_KEY));
+    if (isFinite(v) && v > 0) birthJD = v;
+  } catch (e) { /* 读不到则维持未设生辰 */ }
+}
+
+/* ---------------- 成格局：识别 + 动效（大字 + 地心白蓝连线） ----------------
+   数据来自 RULES.rules 里 kind==='pattern' 的条目（各带 ge=格局名，yao=参与曜）。
+   触发：盘面重算后若出现「上一次没有」的格局，就排队播一次动效；连线自地球出发连到参与曜，
+   白蓝色 + 呼吸式闪烁，播完自动收。开关：显示行的「成格局」按钮（show.geju）。 */
+const gejuBigEl = document.createElement('div');
+gejuBigEl.id = 'gejuBig';
+document.body.appendChild(gejuBigEl);
+
+const GEJU_MAX = 14;
+let gejuLine = null, gejuLineGeo = null, gejuLineMat = null;
+let gejuQueue = [], gejuCur = null, gejuUntil = 0, gejuBorn = 0, gejuPrevIds = '', gejuLastCheck = 0, gejuSeeded = false;
+/* 最近一次算出的成立格局清单，供「点地球」的格局面板复用（避免重复 eval 规则库） */
+let gejuLastList = [];
+
+function ensureGejuLine() {
+  if (gejuLine) return gejuLine;
+  gejuLineGeo = new THREE.BufferGeometry();
+  gejuLineGeo.setAttribute('position', new THREE.BufferAttribute(new Float32Array(GEJU_MAX * 6), 3));
+  gejuLineMat = new THREE.LineBasicMaterial({ color: 0xbfe4ff, transparent: true, opacity: 0.9, depthWrite: false });
+  gejuLine = new THREE.LineSegments(gejuLineGeo, gejuLineMat);
+  gejuLine.name = 'gejuLine';
+  gejuLine.visible = false;
+  geoFrame.add(gejuLine);
+  return gejuLine;
+}
+
+function meshOfChar(ch) {
+  for (const p of pickables) { const y = YAO[p.id]; if (y && y.char === ch) return p.mesh; }
+  return null;
+}
+function gejuChars(yao) {
+  const out = [];
+  for (const c of String(yao || '')) if (YAO_ALL.indexOf(c) >= 0 && out.indexOf(c) < 0) out.push(c);
+  return out;
+}
+function gejuIsBad(r) {
+  const v = String(r.verdict || '');
+  if (/大吉|贵|得局|吉/.test(v) && !/不美|凶|忌/.test(v)) return false;
+  return /凶|不美|忌|抱死鬼|掩光|截断/.test(v + String(r.ge || '') + String(r.text || ''));
+}
+/* 当前盘面成立的格局（按 kind==='pattern' 过滤） */
+function gejuList() {
+  const out = [];
+  let ctx = null;
+  try { ctx = chartCtx(); } catch (e) { return out; }
+  for (const r of RULES.rules) {
+    if (r.kind !== 'pattern' || !r.c) continue;
+    let ev;
+    try { ev = evalCond(r.c, ctx); } catch (e) { continue; }
+    if (ev.ok) out.push({
+      id: r.id, ge: r.ge || String(r.text || '').slice(0, 4),
+      verdict: r.verdict || '', yao: r.yao || '', why: ev.why, bad: gejuIsBad(r)
+    });
+  }
+  return out;
+}
+function gejuPlay(item, durMs) {
+  gejuCur = item;
+  gejuBorn = performance.now();
+  gejuUntil = gejuBorn + (durMs || 3600);
+  gejuBigEl.className = 'on' + (item.bad ? ' bad' : '');
+  gejuBigEl.innerHTML = '<div class="nm">' + item.ge + '</div>' +
+    '<div class="sub">' + (item.bad ? (/疑似/.test(item.verdict || '') ? '疑似凶格' : '凶格') : '吉格') + '　' + gejuChars(item.yao).join(' ') +
+    '　' + (item.ge && item.verdict ? item.verdict : '') + '</div>';
+  ensureGejuLine().visible = true;
+  setTimeout(function () {
+    if (gejuCur !== item) return;
+    gejuCur = null;
+    if (gejuQueue.length) gejuPlay(gejuQueue.shift());
+    else { gejuBigEl.className = ''; if (gejuLine) gejuLine.visible = false; }
+  }, gejuUntil - performance.now() + 80);
+}
+function gejuFrame() {
+  const now = performance.now();
+  /* 关掉「成格局」只是停掉大字与连线；格局清单仍照常刷新，供点地球查看 */
+  const gejuOff = (show.geju === false);
+  if (gejuOff) {
+    if (gejuCur) { gejuCur = null; gejuQueue = []; }
+    if (gejuBigEl.className) gejuBigEl.className = '';
+    if (gejuLine) gejuLine.visible = false;
+  }
+  if (now - gejuLastCheck > 320) {
+    gejuLastCheck = now;
+    const list = gejuList();
+    gejuLastList = list;
+    const ids = list.map(function (x) { return x.id; }).sort().join(',');
+    if (ids !== gejuPrevIds) {
+      if (gejuOff) {
+        /* 关闭时只登记名单：这样重新打开也不会把「本来就已经成立」的格局补播一遍 */
+        gejuPrevIds = ids;
+        gejuSeeded = true;
+      } else {
+        /* 首帧只登记、不播：否则一进页面就会把「本来就已经成立」的格局全播一遍。
+           只有用户改了时间/盘面之后新成立的格局才触发动效（见 m03442 需求）。 */
+        const prev = gejuSeeded ? gejuPrevIds.split(',') : ids.split(',');
+        if (gejuSeeded) for (const it of list) if (prev.indexOf(it.id) < 0 && gejuCur !== it) gejuQueue.push(it);
+        gejuPrevIds = ids;
+        gejuSeeded = true;
+      }
+    }
+    if (!gejuOff && !gejuCur && gejuQueue.length) gejuPlay(gejuQueue.shift());
+  }
+  if (gejuOff) return;
+  const l = ensureGejuLine();
+  if (!gejuCur || now > gejuUntil) { l.visible = false; return; }
+  const blink = 0.5 + 0.5 * Math.sin((now - gejuBorn) * 0.0055);
+  if (l.material) l.material.opacity = 0.42 + 0.5 * blink;
+  const arr = gejuLineGeo.attributes.position.array;
+  const chars = gejuChars(gejuCur.yao);
+  const _wv = new THREE.Vector3();
+  let k = 0;
+  for (let i = 0; i < GEJU_MAX; i++) {
+    const m = (i < chars.length) ? meshOfChar(chars[i]) : null;
+    if (m && m.getWorldPosition) {
+      /* 端点必须用世界坐标：日与五星挂 solarFrame（局部是日心坐标），
+         月与四余挂 geoFrame（局部即地心坐标），只有世界坐标才是同一系。 */
+      m.getWorldPosition(_wv);
+      arr[k++] = 0; arr[k++] = 0; arr[k++] = 0;
+      arr[k++] = _wv.x; arr[k++] = _wv.y; arr[k++] = _wv.z;
+    } else { for (let j = 0; j < 6; j++) arr[k++] = 0; }
+  }
+  gejuLineGeo.attributes.position.needsUpdate = true;
+  l.visible = true;
+}
+
+const updatePanelOrig = updatePanel;
+updatePanel = function () {
+  updatePanelOrig();
+  chartTick(false);
+};
+if (snap) chartTick(true);
+
+/* ================= 格局查看接口：点地球展开 =================
+   点画面中心的地球（或它的标签）→ 右侧展开「成格局」面板：
+     · 列出当前盘面成立的全部格局（吉／凶、参与曜、缘由、古法断语）；
+     · 选中或悬停某一格时，把「地心 → 各参与曜」画成发散线，并把参与曜按顺序
+       用发光线条串成一串（吉格青白、凶格偏红，只呼吸明暗，不跑流光点）。
+   与上面 gejuFrame 的瞬时动效互不干扰：那是新格局出现时自动播一次，
+   这里是用户手动打开的常驻视图。名单取自 gejuLastList，不重复跑规则库。 */
+let gejuOpen = false, gejuActiveId = null, gejuPanelSig = '', gejuPanelTick = 0, gejuHotIds = [];
+let gejuViewLine = null, gejuViewLineGeo = null, gejuViewLineMat = null;
+const GEJU_SEG_MAX = 24;     /* 线段上限：发散 ≤11 + 串联 ≤10 */
+
+/* 曜字 → 曜 id / 曜名 */
+const CH2ID = {}, CH2NAME = {};
+for (const id of Object.keys(YAO)) { CH2ID[YAO[id].char] = id; CH2NAME[YAO[id].char] = YAO[id].name; }
+
+/* —— 面板样式（与「排盘」面板同槽位、同色系） —— */
+const gejuStyle = document.createElement('style');
+gejuStyle.textContent = [
+  '#gejuPanel{position:fixed;right:12px;top:46px;bottom:196px;width:380px;z-index:11;',
+  'background:rgba(10,16,28,.9);border:1px solid #2c4160;border-radius:10px;display:flex;flex-direction:column;',
+  'overflow:hidden;color:#cfe0f5;font:13px/1.6 var(--dsh-ui),sans-serif}',
+  '#gejuPanel.hide{display:none}',
+  '#gejuTop{display:flex;align-items:center;gap:8px;padding:7px 10px;border-bottom:1px solid #24354f}',
+  '#gejuTop b{color:#9ecbff}',
+  '#gejuTop .gejuSub{flex:1;color:#8aa6c8;font-size:12px}',
+  '#btnGejuClose{background:none;border:0;color:#8aa6c8;font-size:17px;line-height:1;cursor:pointer}',
+  '#gejuList{flex:1;overflow-y:auto;padding:6px 8px 10px}',
+  '.gejuCard{border-left:2px solid #3a5a85;background:#121d30;border-radius:5px;padding:6px 8px;margin:5px 0;cursor:pointer}',
+  '.gejuCard:hover{background:#16243a}',
+  '.gejuCard.on{border-left-color:#bfe4ff;background:#1a2c47;box-shadow:0 0 12px rgba(120,190,255,.20) inset}',
+  '.gejuCard .nm{color:#eaf6ff;font-weight:600;font-size:13.5px;letter-spacing:.06em}',
+  '.gejuCard .tag{float:right;font-size:11px;padding:0 6px;border-radius:9px;margin-left:6px}',
+  '.gejuCard .tag.good{background:#1d3b2c;color:#9ff0a8}',
+  '.gejuCard .tag.bad{background:#3b2020;color:#ff9a9a}',
+  '.gejuCard .who{color:#ffd98a;font-size:12px;margin-top:2px}',
+  '.gejuCard .why{color:#8fabc9;font-size:11.5px;margin-top:2px}',
+  '.gejuCard .vd{color:#bcd2ee;font-size:11.5px;margin-top:1px}',
+  '.gejuEmpty{color:#7d94b3;font-size:12px;padding:10px 4px;line-height:1.8}',
+  '.lbl.gejuHot{color:#f4faff !important;text-shadow:0 0 5px #9fd8ff,0 0 14px rgba(150,215,255,.95),0 0 26px rgba(110,180,255,.6) !important}'
+].join('');
+document.body.appendChild(gejuStyle);
+
+/* —— 面板 DOM —— */
+const gejuPanel = document.createElement('div');
+gejuPanel.id = 'gejuPanel'; gejuPanel.className = 'hide';
+document.body.appendChild(gejuPanel);
+const gejuTop = document.createElement('div');
+gejuTop.id = 'gejuTop';
+gejuPanel.appendChild(gejuTop);
+const gejuTitleEl = document.createElement('b');
+gejuTitleEl.textContent = '成格局';
+gejuTop.appendChild(gejuTitleEl);
+const gejuSubEl = document.createElement('span');
+gejuSubEl.className = 'gejuSub';
+gejuSubEl.textContent = '—';
+gejuTop.appendChild(gejuSubEl);
+const btnGejuClose = document.createElement('button');
+btnGejuClose.id = 'btnGejuClose'; btnGejuClose.textContent = '×';
+gejuTop.appendChild(btnGejuClose);
+const gejuListEl = document.createElement('div');
+gejuListEl.id = 'gejuList';
+gejuPanel.appendChild(gejuListEl);
+
+/* —— 3D 发光线条（挂在 geoFrame，与十二宫环同系） —— */
+function ensureGejuView() {
+  if (gejuViewLine) return;
+  gejuViewLineGeo = new THREE.BufferGeometry();
+  gejuViewLineGeo.setAttribute('position', new THREE.BufferAttribute(new Float32Array(GEJU_SEG_MAX * 6), 3));
+  gejuViewLineMat = new THREE.LineBasicMaterial({ color: 0xbfe4ff, transparent: true, opacity: 0.9, depthWrite: false });
+  gejuViewLine = new THREE.LineSegments(gejuViewLineGeo, gejuViewLineMat);
+  gejuViewLine.name = 'gejuViewLine';
+  gejuViewLine.visible = false;
+  geoFrame.add(gejuViewLine);
+}
+
+function gejuHasId(id) { for (const it of (gejuLastList || [])) if (it.id === id) return true; return false; }
+function gejuActiveItem() {
+  for (const it of (gejuLastList || [])) if (it.id === gejuActiveId) return it;
+  return null;
+}
+function gejuIdOfChar(c) { return CH2ID[c] || null; }
+function gejuHotList(yao) {
+  return gejuChars(yao).map(gejuIdOfChar).filter(Boolean);
+}
+/* 参与曜的标签加发光，其余复原 */
+function syncGejuHot(ids) {
+  for (const id of gejuHotIds) { const lb = LBL[id]; if (lb && lb.classList) lb.classList.remove('gejuHot'); }
+  gejuHotIds = ids.slice();
+  for (const id of gejuHotIds) { const lb = LBL[id]; if (lb && lb.classList) lb.classList.add('gejuHot'); }
+}
+function setGejuActive(id) {
+  if (id === gejuActiveId) return;
+  gejuActiveId = id;
+  const list = gejuLastList || [];
+  const rows = gejuListEl.querySelectorAll('.gejuCard');
+  for (let i = 0; i < rows.length && i < list.length; i++) {
+    rows[i].className = (list[i].id === id) ? 'gejuCard on' : 'gejuCard';
+  }
+  const it = gejuActiveItem();
+  syncGejuHot(it ? gejuHotList(it.yao) : []);
+}
+
+function renderGejuPanel() {
+  const list = gejuLastList || [];
+  if (!gejuHasId(gejuActiveId)) gejuActiveId = list.length ? list[0].id : null;
+  gejuSubEl.textContent = list.length
+    ? ('当前盘面 ' + list.length + ' 格' + (show.geju === false ? '（「成格局」动效开关已关，线不显示）' : ''))
+    : '当前盘面没有成格';
+  if (!list.length) {
+    gejuListEl.innerHTML = '<div class="gejuEmpty">这一时刻没有识别到格局。<br />'
+      + '可用左侧面板的「±1日／±1月」或直接改时间来试探；格局一旦成立会自动播出大字与连线。</div>';
+    syncGejuHot([]);
+    gejuPanelSig = '';
+    return;
+  }
+  let html = '';
+  for (const it of list) {
+    const who = gejuChars(it.yao).map(function (c) { return CH2NAME[c] || c; }).join('　');
+    html += '<div class="gejuCard' + (it.id === gejuActiveId ? ' on' : '') + '">'
+      + '<span class="tag ' + (it.bad ? 'bad' : 'good') + '">' + (it.bad ? '凶' : '吉') + '</span>'
+      + '<span class="nm">' + escHtml(it.ge) + '</span>'
+      + (who ? '<div class="who">因　' + escHtml(who) + '</div>' : '')
+      + (it.why ? '<div class="why">' + escHtml(it.why) + '</div>' : '')
+      + (it.verdict ? '<div class="vd">' + escHtml(it.verdict) + '</div>' : '')
+      + '</div>';
+  }
+  gejuListEl.innerHTML = html;
+  const rows = gejuListEl.querySelectorAll('.gejuCard');
+  for (let i = 0; i < rows.length && i < list.length; i++) {
+    const id = list[i].id;
+    rows[i].addEventListener('mouseenter', function () { setGejuActive(id); });
+    rows[i].addEventListener('click', function () { setGejuActive(id); });
+  }
+  syncGejuHot(gejuActiveItem() ? gejuHotList(gejuActiveItem().yao) : []);
+  gejuPanelSig = list.map(function (x) { return x.id; }).join(',');
+}
+
+function closeGejuView() { if (gejuOpen) toggleGejuView(false); }
+function toggleGejuView(force) {
+  const want = (typeof force === 'boolean') ? force : !gejuOpen;
+  gejuOpen = want;
+  gejuPanel.className = want ? '' : 'hide';
+  if (want) {
+    /* 「排盘」「宫位详情」与它同槽位，互斥 */
+    chartWrap.className = 'hide';
+    btnChartEl.className = '';
+    closeGongPanel();
+    if (pingceOpen) closePingce();   /* 与评测面板同槽位，互斥 */
+    ensureGejuView();
+    gejuPanelSig = '';
+    renderGejuPanel();
+    updateGejuView(performance.now());
+  } else {
+    if (gejuViewLine) gejuViewLine.visible = false;
+    syncGejuHot([]);
+  }
+}
+btnGejuClose.addEventListener('click', function () { toggleGejuView(false); });
+
+function updateGejuView(now) {
+  if (!gejuViewLine) return;
+  const it = gejuActiveItem();
+  const on = !!(gejuOpen && it && show.geju !== false);
+  gejuViewLine.visible = on;
+  if (!on) return;
+
+  const bad = !!it.bad;
+  if (gejuViewLineMat.color && gejuViewLineMat.color.setHex) gejuViewLineMat.color.setHex(bad ? 0xff9a9a : 0xbfe4ff);
+  const jit = 0.5 + 0.5 * Math.sin(now * 0.0025);        /* 缓慢呼吸 */
+  gejuViewLineMat.opacity = 0.62 + 0.38 * jit;
+
+  /* 端点取世界坐标（日与五星在 solarFrame、月与四余在 geoFrame，只有世界坐标同系） */
+  const pts = [];
+  for (const c of gejuChars(it.yao)) {
+    const m = meshOfChar(c);
+    if (m && m.getWorldPosition) pts.push(m.getWorldPosition(new THREE.Vector3()));
+  }
+  const zero = new THREE.Vector3(0, 0, 0);
+  const segs = [];
+  for (const p of pts) segs.push([zero, p]);                       /* 地心 → 参与曜，发散 */
+  for (let i = 0; i + 1 < pts.length; i++) segs.push([pts[i], pts[i + 1]]);   /* 参与曜依次串联 */
+
+  const la = gejuViewLineGeo.attributes.position.array;
+  let k = 0;
+  for (let i = 0; i < GEJU_SEG_MAX; i++) {
+    if (i < segs.length) {
+      const a = segs[i][0], b = segs[i][1];
+      la[k++] = a.x; la[k++] = a.y; la[k++] = a.z;
+      la[k++] = b.x; la[k++] = b.y; la[k++] = b.z;
+    } else { for (let j = 0; j < 6; j++) la[k++] = 0; }
+  }
+  /* 只画有效的段，其余占位保持在原点（退化，不可见） */
+  if (gejuViewLineGeo.setDrawRange) gejuViewLineGeo.setDrawRange(0, segs.length * 2);
+  gejuViewLineGeo.attributes.position.needsUpdate = true;
+}
+
+/* 每帧：刷新面板（名单变了才重建）＋ 更新发光线条 */
+function gejuViewFrame() {
+  const now = performance.now();
+  if (gejuOpen && now - gejuPanelTick > 600) {
+    gejuPanelTick = now;
+    const sig = (gejuLastList || []).map(function (x) { return x.id; }).join(',');
+    if (sig !== gejuPanelSig) renderGejuPanel();
+  }
+  if (gejuOpen) updateGejuView(now);
+}
+
+/* ============== 严格成格常驻线：白色呼吸闪烁 + 离子特效，点线看是哪个格局 ==============
+   依据：用户 2026-10-17「如果确证已经是真真正正的格局了则出现一条线 曲线直线都可以
+   要白色闪烁带离子特效的来连接表示 点这个线会显示是什么具体格局」。
+   与已有两套线条的分工：
+     · gejuFrame/gejuLine   —— 新格局出现时「自动播一次」的瞬时动效（大字＋地心连线）；
+     · gejuViewLine         —— 右侧面板里选中某格时的发散＋串联线（手动、仅一条）；
+     · 本组 gejuPersistGroup —— 常驻：当前盘面凡严格成格者各画一条白色呼吸线串联其参与曜。
+   名单严格取自 gejuLastList（全部条件匹配才算成格，与评测面板／右侧面板同源），
+   不另跑规则库，杜绝「假成格也画线」。参与曜 ≥2 → 依次串联；仅 1 曜（如某些刑忌格
+   只含一曜）→ 退化为「地心 → 该曜」一段。点线：射线命中线对象 → 打开右侧「成格局」面板。 */
+const GEJU_LINE_MAX = 12;      /* 同时常驻的格局线上限 */
+const GEJU_ION_MAX = 160;      /* 离子点上限（加法混合点云） */
+const GEJU_ION_PER_SEG = 3;    /* 每段撒几个离子 */
+let gejuPersistGroup = null, gejuPersistMat = null, gejuPersistSig = '';
+let gejuIon = null, gejuIonGeo = null, gejuIonTex = null;
+const gejuIonPhase = new Float32Array(GEJU_ION_MAX);   /* 每个离子的闪烁相位 */
+const gejuIonJit = new Float32Array(GEJU_ION_MAX);     /* 段内位置抖动，免规则排布 */
+for (let i = 0; i < GEJU_ION_MAX; i++) {
+  gejuIonPhase[i] = Math.random() * Math.PI * 2;
+  gejuIonJit[i] = Math.random() * 0.7 + 0.15;
+}
+const _GJ_ORIGIN = new THREE.Vector3(0, 0, 0);
+
+/* 离子贴图：白色→浅蓝→透明的径向渐变（加色混合下即一枚枚小光点） */
+function makeIonTexture() {
+  const s = 64, cv = document.createElement('canvas');
+  cv.width = cv.height = s;
+  const g = cv.getContext('2d');
+  const rad = g.createRadialGradient(s / 2, s / 2, 0, s / 2, s / 2, s / 2);
+  rad.addColorStop(0.00, 'rgba(255,255,255,1)');
+  rad.addColorStop(0.28, 'rgba(214,238,255,0.85)');
+  rad.addColorStop(0.62, 'rgba(150,205,255,0.30)');
+  rad.addColorStop(1.00, 'rgba(120,180,255,0)');
+  g.fillStyle = rad;
+  g.fillRect(0, 0, s, s);
+  const t = new THREE.CanvasTexture(cv);
+  t.needsUpdate = true;
+  return t;
+}
+
+function ensureGejuPersist() {
+  if (gejuPersistGroup) return;
+  gejuPersistGroup = new THREE.Group();
+  gejuPersistGroup.name = 'gejuPersistGroup';
+  gejuPersistGroup.visible = false;
+  geoFrame.add(gejuPersistGroup);
+  /* 共享白色材质：全部格局线一起呼吸（用户要「白色闪烁」） */
+  gejuPersistMat = new THREE.LineBasicMaterial({ color: 0xffffff, transparent: true, opacity: 0.8, depthWrite: false });
+  /* 离子点云：加法混合 + 径向渐变贴图 + 逐点亮度（vertexColors 做闪烁，不必写 shader） */
+  gejuIonGeo = new THREE.BufferGeometry();
+  gejuIonGeo.setAttribute('position', new THREE.BufferAttribute(new Float32Array(GEJU_ION_MAX * 3), 3));
+  gejuIonGeo.setAttribute('color', new THREE.BufferAttribute(new Float32Array(GEJU_ION_MAX * 3), 3));
+  gejuIonGeo.setDrawRange(0, 0);
+  gejuIonTex = makeIonTexture();
+  gejuIon = new THREE.Points(gejuIonGeo, new THREE.PointsMaterial({
+    size: 2.6, map: gejuIonTex, transparent: true, depthWrite: false,
+    blending: THREE.AdditiveBlending, vertexColors: true, sizeAttenuation: true
+  }));
+  gejuIon.name = 'gejuIon';
+  gejuIon.frustumCulled = false;
+  gejuIon.visible = false;
+  geoFrame.add(gejuIon);
+}
+
+/* 名单变了才重建：每个格局一条 LineSegments（一格一 object，射线拾取据此认出是谁） */
+function rebuildGejuPersist() {
+  ensureGejuPersist();
+  while (gejuPersistGroup.children.length) {
+    const c = gejuPersistGroup.children.pop();
+    if (c.geometry && c.geometry.dispose) c.geometry.dispose();
+  }
+  for (const it of (gejuLastList || []).slice(0, GEJU_LINE_MAX)) {
+    const n = gejuChars(it.yao).length;        /* 参与曜数 */
+    const segs = (n >= 2 ? n - 1 : 1);         /* ≥2 依次串联；1 曜则地心→该曜 */
+    const geo = new THREE.BufferGeometry();
+    geo.setAttribute('position', new THREE.BufferAttribute(new Float32Array(segs * 6), 3));
+    geo.setDrawRange(0, 0);
+    const ln = new THREE.LineSegments(geo, gejuPersistMat);
+    ln.name = 'gejuLine:' + it.id;
+    ln.userData.gejuId = it.id;
+    ln.frustumCulled = false;
+    gejuPersistGroup.add(ln);
+  }
+}
+
+/* 一个格局的端点段（世界坐标）：端点必须用世界坐标——日与五星挂 solarFrame（局部是日心
+   坐标），月与四余挂 geoFrame，只有世界坐标才是同一系。返回共享数组，逐线处理即可。 */
+const _gjPts = [], _gjSegs = [];
+function gejuItemSegs(it) {
+  const pts = _gjPts; pts.length = 0;
+  for (const c of gejuChars(it.yao)) {
+    const m = meshOfChar(c);
+    if (m && m.getWorldPosition) pts.push(m.getWorldPosition(new THREE.Vector3()));
+  }
+  const segs = _gjSegs; segs.length = 0;
+  if (pts.length >= 2) {
+    for (let i = 0; i + 1 < pts.length; i++) segs.push([pts[i], pts[i + 1]]);
+  } else if (pts.length === 1) {
+    segs.push([_GJ_ORIGIN, pts[0]]);
+  }
+  return segs;
+}
+
+/* 每帧：名单变了才重建线组；端点随星体世界坐标实时更新；线呼吸 + 离子吞吐闪烁 */
+function gejuPersistFrame(now) {
+  ensureGejuPersist();
+  const list = (gejuLastList || []).slice(0, GEJU_LINE_MAX);
+  const on = (show.geju !== false) && list.length > 0;
+  gejuPersistGroup.visible = on;
+  if (!on) { gejuIon.visible = false; return; }
+  const sig = list.map(function (x) { return x.id; }).join(',');
+  if (sig !== gejuPersistSig) { rebuildGejuPersist(); gejuPersistSig = sig; }
+  gejuIon.visible = true;
+
+  /* 白色呼吸：约 4.5 秒一次（与其它线同气质），不跑流光点 */
+  const pulse = 0.5 + 0.5 * Math.sin(now * 0.0014);
+  gejuPersistMat.opacity = 0.32 + 0.6 * pulse;
+
+  const ipa = gejuIonGeo.attributes.position.array;
+  const ica = gejuIonGeo.attributes.color.array;
+  let ion = 0;
+  const kids = gejuPersistGroup.children;
+  for (let li = 0; li < kids.length && li < list.length; li++) {
+    const ln = kids[li], it = list[li];
+    const segs = gejuItemSegs(it);
+    const la = ln.geometry.attributes.position.array;
+    let k = 0;
+    for (const sg of segs) {
+      const a = sg[0], b = sg[1];
+      la[k++] = a.x; la[k++] = a.y; la[k++] = a.z;
+      la[k++] = b.x; la[k++] = b.y; la[k++] = b.z;
+      /* 沿线撒离子：段内固定位置 + 微幅吞吐（不沿线飞跑，符合项目「无流动光点」气质） */
+      for (let s = 0; s < GEJU_ION_PER_SEG && ion < GEJU_ION_MAX; s++, ion++) {
+        let t = (s + 0.5) / GEJU_ION_PER_SEG;
+        t += (gejuIonJit[ion] - 0.5) * 0.6;
+        t += 0.05 * Math.sin(now * 0.0022 + gejuIonPhase[ion]);
+        if (t < 0) t = 0;
+        if (t > 1) t = 1;
+        ipa[ion * 3] = a.x + (b.x - a.x) * t;
+        ipa[ion * 3 + 1] = a.y + (b.y - a.y) * t;
+        ipa[ion * 3 + 2] = a.z + (b.z - a.z) * t;
+        /* 逐点亮度＝离子闪烁（加色混合下亮度即光晕强弱，不必逐点改 position 之外的属性） */
+        const bri = 0.25 + 0.75 * (0.5 + 0.5 * Math.sin(now * 0.006 + gejuIonPhase[ion]));
+        ica[ion * 3] = bri; ica[ion * 3 + 1] = bri; ica[ion * 3 + 2] = bri;
+      }
+    }
+    ln.geometry.attributes.position.needsUpdate = true;
+    ln.geometry.setDrawRange(0, segs.length * 2);
+  }
+  const used = ion;
+  for (; ion < GEJU_ION_MAX; ion++) {          /* 余下离子退到原点、亮度归零（不显示） */
+    ipa[ion * 3] = 0; ipa[ion * 3 + 1] = 0; ipa[ion * 3 + 2] = 0;
+    ica[ion * 3] = 0; ica[ion * 3 + 1] = 0; ica[ion * 3 + 2] = 0;
+  }
+  gejuIonGeo.attributes.position.needsUpdate = true;
+  gejuIonGeo.attributes.color.needsUpdate = true;
+  gejuIonGeo.setDrawRange(0, used);
+}
+
+/* 点格局线：打开右侧「成格局」面板并选中该格（即此前被「点地球」改义取代的成格局面板
+   的入口——格局名／参与曜／缘由／古法断语都在那一格卡片里） */
+function openGejuById(gid) {
+  if (!gejuHasId(gid)) return;
+  toggleGejuView(true);
+  setGejuActive(gid);
+  const list = gejuLastList || [];
+  let idx = -1;
+  for (let i = 0; i < list.length; i++) if (list[i].id === gid) { idx = i; break; }
+  const rows = gejuListEl.querySelectorAll('.gejuCard');
+  if (idx >= 0 && rows[idx] && rows[idx].scrollIntoView) rows[idx].scrollIntoView({ block: 'nearest' });
+}
+
+/* ---------------- 赤道面阴阳气息测地积分（预设模型·数显小窗） ----------------
+   表现方式参考「赤道面零测地线积分（RK4 GEODESICS）」Inset 面板：在地球赤道面俯视图上
+   以 RK4 积分一簇「气息线」，用曲线的偏折／缠旋／坠入展现盘中阴阳气息强弱如何作用于地球。
+   象征性预设（非真实物理，参数经数值调参定稿）：
+     · 气息强度 s = 0.18 + 0.82·min(1,|吉凶分|/6) + min(0.15,|日行度|/80)
+       （吉凶分＝evalYaoState 的 score：庙旺得地则气盛；日行越快气机越动，太阴最疾）
+     · 阴阳＝CAMP_QI（日木土炁计水为阳，月火金罗孛为阴）：阳曜顺缠（逆时针）、阴曜逆缠（镜像入射）
+     · 入射方向＝该曜当前黄经；碰撞参数 b = 0.10 + 0.45(1−s)（气愈盛愈近地）
+     · 力场 a = −(k1·s/r² + k2·s/r⁴)·r̂，1/r⁴ 项类比 GR 测地线方程 3αu²；r<0.55 内按类加阻尼
+     · 分档：s≥0.75 红·入地吸收；0.4≤s<0.75 金·缠地旋进；s<0.4 蓝·掠地偏折
+     · 金线慢呼吸闪烁（项目约定：无流动粒子） */
+const QG = { k1: 0.010, k2: 0.016, rc: 0.055, r0: 1.05, dt: 0.004, dragZone: 0.55 };
+const qiGeoEl = document.getElementById('qiGeo');
+const qiGeoCanvas = document.getElementById('qiGeoCanvas');
+const qiGeoStatEl = document.getElementById('qiGeoStat');
+const qiGeoCtx = qiGeoCanvas.getContext('2d');
+let qgCurves = null, qgLastMs = 0, qgLastSig = '';
+
+function qgAcc(x, y, s) {
+  const r2 = x * x + y * y;
+  const f = -(QG.k1 * s / r2 + QG.k2 * s / (r2 * r2)) / Math.sqrt(r2);
+  return [f * x, f * y];
+}
+/* RK4 积分一条气息线（局部系：+x 为入射方向，原点在地球），返回采样点与分档 */
+function qgTrace(s, dir) {
+  const cls = s >= 0.75 ? 2 : (s >= 0.4 ? 1 : 0);           /* 0蓝 1金 2红 */
+  const drag = cls === 1 ? 1.3 : (cls === 2 ? 1.1 : 0);
+  const b = 0.10 + 0.45 * (1 - s);
+  let x = -QG.r0, y = b, vx = 1, vy = 0;
+  const pts = [x, y];
+  const dt = QG.dt;
+  for (let i = 0; i < 3000; i++) {
+    const a1 = qgAcc(x, y, s);
+    const a2 = qgAcc(x + vx * dt / 2, y + vy * dt / 2, s);
+    const a3 = qgAcc(x + (vx + a2[0] * dt / 2) * dt / 2, y + (vy + a2[1] * dt / 2) * dt / 2, s);
+    const a4 = qgAcc(x + (vx + a3[0] * dt) * dt, y + (vy + a3[1] * dt) * dt, s);
+    x += (vx + 2 * (vx + a2[0] * dt / 2) + 2 * (vx + a3[0] * dt / 2) + (vx + a4[0] * dt)) * dt / 6;
+    y += (vy + 2 * (vy + a2[1] * dt / 2) + 2 * (vy + a3[1] * dt / 2) + (vy + a4[1] * dt)) * dt / 6;
+    vx += (a1[0] + 2 * a2[0] + 2 * a3[0] + a4[0]) * dt / 6;
+    vy += (a1[1] + 2 * a2[1] + 2 * a3[1] + a4[1]) * dt / 6;
+    const r = Math.hypot(x, y);
+    if (r < QG.dragZone && drag > 0) { const f = Math.max(0, 1 - drag * dt); vx *= f; vy *= f; }
+    if ((i & 1) === 0) { pts.push(x, y); }
+    if (r < QG.rc) { pts.push(x, y); break; }
+    if (r > QG.r0 * 1.25 && x < -0.2) break;
+  }
+  return { pts: pts, cls: cls, dir: dir };
+}
+function qiGeoCalc() {
+  if (!snap) return null;
+  const out = [];
+  for (const bd of snap.bodies) {
+    const st = stateMap[bd.id];
+    const score = st ? Math.abs(st.score) : 0;
+    const s = Math.min(1, 0.18 + 0.82 * Math.min(1, score / 6) + Math.min(0.15, Math.abs(bd.rate) / 80));
+    const dir = qiOf(bd.char) === '阳' ? 1 : -1;
+    const tr = qgTrace(s, dir);
+    tr.lon = bd.lon; tr.ch = bd.char; tr.s = s; tr.yang = dir > 0;
+    out.push(tr);
+  }
+  return out;
+}
+function qiGeoDraw(now) {
+  const c = qiGeoCtx, W = qiGeoCanvas.width, H = qiGeoCanvas.height;
+  const cx = W / 2, cy = H / 2, S = 92;
+  c.clearRect(0, 0, W, H);
+  /* 参考圈：金＝气息环半径（阻尼界），红＝吸收半径 */
+  c.setLineDash([3, 3]);
+  c.strokeStyle = 'rgba(255,210,122,.35)'; c.beginPath(); c.arc(cx, cy, QG.dragZone * S, 0, TAU); c.stroke();
+  c.strokeStyle = 'rgba(224,112,122,.5)'; c.beginPath(); c.arc(cx, cy, QG.rc * S, 0, TAU); c.stroke();
+  c.setLineDash([]);
+  /* 地球 */
+  c.fillStyle = '#3f7fae'; c.beginPath(); c.arc(cx, cy, 5, 0, TAU); c.fill();
+  c.fillStyle = '#9fc4ff'; c.font = '9.5px sans-serif'; c.textAlign = 'center'; c.fillText('地球', cx, cy + 15);
+  if (!qgCurves) return;
+  const COLS = ['111,159,224', '255,210,122', '224,112,122'];
+  for (let i = 0; i < qgCurves.length; i++) {
+    const cv = qgCurves[i];
+    const th = cv.lon * DEG;
+    /* 局部系→屏幕：局部 -x 轴指向该曜黄经方向；dir 决定顺/逆缠（镜像 y） */
+    const ux = Math.cos(th), uy = Math.sin(th);
+    const vx2 = -uy * cv.dir, vy2 = ux * cv.dir;
+    let alpha = 0.30 + 0.62 * cv.s;
+    if (cv.cls === 1) alpha *= 0.78 + 0.22 * Math.sin(now / 1500 + i * 1.7);   /* 金线慢呼吸 */
+    c.strokeStyle = 'rgba(' + COLS[cv.cls] + ',' + alpha.toFixed(3) + ')';
+    c.lineWidth = 1 + 1.6 * cv.s;
+    c.beginPath();
+    const p = cv.pts;
+    for (let k = 0; k < p.length; k += 2) {
+      const wx = -ux * p[k] + vx2 * p[k + 1], wy = -uy * p[k] + vy2 * p[k + 1];
+      const sx = cx + wx * S, sy = cy - wy * S;
+      if (k === 0) c.moveTo(sx, sy); else c.lineTo(sx, sy);
+    }
+    c.stroke();
+    /* 入射端曜名（阳＝暖色 阴＝冷色） */
+    c.fillStyle = cv.yang ? '#ffd9a0' : '#a9c0e6';
+    c.font = '10px sans-serif'; c.textAlign = 'center';
+    const lx = cx + (ux * QG.r0 * S) * 0.98, ly = cy - (uy * QG.r0 * S) * 0.98;
+    c.fillText(cv.ch, Math.max(8, Math.min(W - 8, lx)), Math.max(10, Math.min(H - 4, ly)));
+  }
+}
+function qiGeoFrame(now) {
+  qiGeoEl.classList.toggle('hide', !show.qiGeo);
+  if (!show.qiGeo) return;
+  if (qiGeoMin) return;   /* 已最小化：canvas 隐藏，不必积分重绘 */
+  if (!snap) return;
+  if (now - qgLastMs > 500) {
+    qgLastMs = now;
+    const sig = snap.bodies.map(function (b) { return b.char + Math.round(b.lon) + (stateMap[b.id] ? stateMap[b.id].score : 0); }).join('|');
+    if (sig !== qgLastSig) { qgLastSig = sig; qgCurves = qiGeoCalc(); }
+    if (qgCurves) {
+      const names = [[], [], []];
+      let sum = 0;
+      for (const cv of qgCurves) { names[cv.cls].push(cv.ch); sum += cv.s * (cv.cls === 2 ? 1 : cv.cls === 1 ? 0.55 : 0.2); }
+      qiGeoStatEl.innerHTML =
+        '<span style="color:#e0707a">吸收</span>：' + (names[2].join('') || '—') +
+        ' · <span style="color:#ffd27a">缠环</span>：' + (names[1].join('') || '—') +
+        ' · <span style="color:#6f9fe0">偏折</span>：' + (names[0].join('') || '—') +
+        ' · 地气强度 Σ <b class="hl">' + Math.round(100 * sum / qgCurves.length) + '%</b>';
+    }
+  }
+  qiGeoDraw(now);
+}
+
+/* ================= 评测（命盘评估） =================
+   把「命主 · 宿度命度主 · 身度主 · 恩星 · 用星 · 财星 · 余奴 · 难星」与十一曜
+   状态、十二宫状态、严格化格局、行限结合当下盘给出结论；右上「评测」面板展示。
+   古法出处（本地数据库）：
+   · 恩用仇难及躔次得失——《七政四余（全）》13页(十九)：水星喜金、金喜土、土喜火、火喜木、木喜水，
+     「日喜金水辅从，月喜火罗侍卫，以所喜者为恩」；「金星怕火，火星怕水，水星怕土，土星怕木，木星怕金，
+     日怕木（原文缺字存疑，网络文献照录「日怕木」；《古赋注》另有「日怕火罗」异说），月怕土计，以所怕者为难」；
+     「诸星躔恩度入喜宫为得次，躔难度入怕宫为失次」。我生者为用、我克者为财、生我者为恩、克我者为难
+     （《网络文献续编·果老星宗格局》243-246页，与《（全）》23页「生」「克」条合）。
+   · 宫主者／度度主——《（全）》23页(三十四)：子宫土·丑宫土·寅亥宫木·卯戌宫火·辰酉宫金·巳申宫水·午宫日·未宫月；
+     角斗奎井度木·亢牛娄鬼度金·氐女胃柳度土·房虚昴星度日·心危毕张度月·尾室觜翼度火·箕壁参轸度水。
+   · 安命度——《（全）》22页(三十)「以出生之度，对在命宫之度，即是命度」；投影法依《七政四余择日》
+     「命度太阳所之度，量天尺一行直下，到命宫之度即是命度」：日躔宫内之度直下命宫。
+   · 安身宫——《（全）》22页(三十一)「月为身宫。即太阴所躔之宫为身宫。宫主星即为身主星」。
+   · 余奴犯主——《（全）》18页(三十三)「十二宫主，第一怕余奴犯主」；《网络文献续编》649：
+     「如木为主，气为奴…余奴犯主，纵吉为凶」。余奴＝与命度主同行之四余（木主炁·火主罗·土主计·水主孛，金无余）。
+   · 格局——严格化：同名格局全部条件成立才算成格（见 RULES pattern 各条 c），本面板直接复用 gejuLastList。 */
+const GONG_ZHU = { '子': '土', '丑': '土', '寅': '木', '卯': '火', '辰': '金', '巳': '水', '午': '日', '未': '月', '申': '水', '酉': '金', '戌': '火', '亥': '木' };
+const WX_MAIN_YAO = { '木': '木', '火': '火', '土': '土', '金': '金', '水': '水', '日': '日', '月': '月' };
+const XUYU_OF_WX = { '木': '炁', '火': '罗', '土': '计', '水': '孛' };  /* 金无余 */
+function wxStars(wx) { const out = []; for (const ch of '水金火木土罗计炁孛') if (YAO_WUXING[ch] === wx) out.push(ch); return out; }
+function yaoName(ch) { for (const k in YAO) if (YAO[k].char === ch) return YAO[k].name; return ch; }
+
+function pingceCalc() {
+  if (!snap || birthJD === null) return null;
+  const ctx = chartCtx();
+  const stOf = ch => { const b = ctx.m[ch]; return stateMap[b.id] || evalYaoState(ch, ctx); };
+  const clsTxt = st => st.cls === 'good' ? '吉' : (st.cls === 'bad' ? '凶' : '平');
+  const clsCol = st => st.cls === 'good' ? '#8ed9a2' : (st.cls === 'bad' ? '#e08a8a' : '#93a9c4');
+  /* —— 命宫·命度·命度主 —— */
+  const sunB = norm360(sunApparentLon(birthJD));
+  const giM = gongIndex(sunB);
+  const mingZhi = GONG[giM].chen;
+  const mingDuLon = giM * 30 + (sunB % 30);
+  const mingSu = suOf(simJD, mingDuLon);
+  const duZhu = mingSu.attr;                       /* 度度主五行（或日/月） */
+  const mdzYao = WX_MAIN_YAO[duZhu];               /* 命度主星 */
+  /* —— 身宫·身度主·身主 —— */
+  const moonBLon = norm360(moonGeocentric((birthJD - J2000_JD) / 36525).lon);
+  const shenGi = gongIndex(moonBLon);
+  const shenZhi = GONG[shenGi].chen;
+  const shenSu = suOf(simJD, moonBLon);
+  const shendzYao = WX_MAIN_YAO[shenSu.attr];
+  const mingZhuYao = WX_MAIN_YAO[GONG_ZHU[mingZhi]];
+  const shenZhuYao = WX_MAIN_YAO[GONG_ZHU[shenZhi]];
+  /* —— 恩·用·财·难（以命度主五行推；日月用《全》13页(十九)特殊条文） —— */
+  let enStars, yongStars, caiStars, nanStars, enWx = null, nanWx = null, enanNote = '';
+  if (duZhu === '日') {
+    enStars = ['金', '水']; yongStars = ['土']; caiStars = ['金']; nanStars = ['木'];
+    enanNote = '日喜金水辅从为恩、怕木为难（《全》13页十九；《古赋注》另存「日怕火罗」异说）；金兼财恩';
+  } else if (duZhu === '月') {
+    enStars = ['火', '罗']; yongStars = ['木']; caiStars = ['火']; nanStars = ['土', '计'];
+    enanNote = '月喜火罗侍卫为恩、怕土计为难（《全》13页十九）；火兼财恩';
+  } else {
+    enWx = SHENG_ME[duZhu]; yongStars = wxStars(SHENG_OF[duZhu]); caiStars = wxStars(KE_ME_OF[duZhu]);
+    nanStars = wxStars(KE_OF[duZhu]); enStars = wxStars(enWx); nanWx = KE_OF[duZhu];
+    enanNote = '以命度主「' + duZhu + '」行生克：生我(' + enWx + ')恩·我生(' + SHENG_OF[duZhu] + ')用·我克(' + KE_ME_OF[duZhu] + ')财·克我(' + nanWx + ')难';
+  }
+  const yuYao = XUYU_OF_WX[(duZhu === '日' ? '火' : duZhu === '月' ? '水' : duZhu)] || '';
+  /* —— 诸曜角色标签 —— */
+  const roles = {};
+  const tag = (chs, t) => { for (const ch of chs) if (ch) (roles[ch] = roles[ch] || []).push(t); };
+  tag(enStars, '恩'); tag(yongStars, '用'); tag(caiStars, '财'); tag(nanStars, '难');
+  tag([yuYao], '余奴'); tag([mingZhuYao], '命主'); tag([shenZhuYao], '身主');
+  tag([mdzYao], '命度主'); tag([shendzYao], '身度主');
+  /* —— 断语（结合当下盘） —— */
+  const duan = [];
+  const smd = stOf(mdzYao);
+  duan.push('命度主<b>' + yaoName(duZhu) + '（' + duZhu + '）</b>今躔<b>' + mingSu.name + '</b>之<b>' + mdzYao + '</b>居<b>' + ctx.zh(mdzYao) + '宫</b>' +
+    '（' + GONG_SHIER[(giM - ctx.gi(mdzYao) + 12) % 12].name + '），吉凶分 <b style="color:' + clsCol(smd) + '">' + smd.score + '（' + clsTxt(smd) + '）</b>' +
+    (smd.cls === 'good' ? '——命基得地，一生格局稳固。' : (smd.cls === 'bad' ? '——命度主失陷受伤，命基不足，须恩用诸曜扶之。' : '——命度主平平，看行限恩难引之。')));
+  /* 得次·失次（《全》13页十九） */
+  const suNow = suOf(simJD, ctx.m[mdzYao].lon);
+  if (enWx && suNow.attr === enWx) duan.push('命度主躔<b>' + suNow.name + '</b>度，度属' + suNow.attr + '＝生我之<b>恩度</b>' + (smd.cls !== 'bad' ? '，又入喜宫，<b>「躔恩度入喜宫为得次」</b>——吉。' : '，但宫位失陷，得次不全。'));
+  if (nanWx && suNow.attr === nanWx) duan.push('命度主躔<b>' + suNow.name + '</b>度，度属' + suNow.attr + '＝克我之<b>难度</b>，<b>「躔难度入怕宫为失次」</b>——忌，限至尤紧。');
+  for (const ch of enStars) {
+    const st = stOf(ch);
+    duan.push('恩星<b>' + yaoName(ch) + '</b>居' + ctx.zh(ch) + '宫，分 <b style="color:' + clsCol(st) + '">' + st.score + '</b>' +
+      (st.cls === 'good' ? '——生我有力，护命度主，吉。' : (st.cls === 'bad' ? '——恩星失陷，恩力减，逢之未必得力。' : '——恩星平平，生扶有限。')));
+  }
+  for (const ch of nanStars) {
+    const st = stOf(ch);
+    const inMing = ctx.gi(ch) === giM;
+    duan.push('难星<b>' + yaoName(ch) + '</b>居' + ctx.zh(ch) + '宫，分 <b style="color:' + clsCol(st) + '">' + st.score + '</b>' +
+      (inMing ? '——<b>难星临命宫</b>，克我之急，忌（若入垣受制则凶减）。' : (st.cls === 'bad' ? '——难星受制，难轻，不为大害。' : (st.cls === 'good' ? '——难星得地（难猖），克命有力，须忌。' : '——难星平平。'))));
+  }
+  if (yuYao) {
+    const sepY = Math.abs(norm180(ctx.m[yuYao].lon - ctx.m[mdzYao].lon));
+    if (ctx.gi(yuYao) === ctx.gi(mdzYao) || sepY <= 12) {
+      duan.push('<b>余奴犯主</b>：' + yaoName(yuYao) + '（奴）与命度主' + yaoName(mdzYao) + '同宫/近度' + sepY.toFixed(1) + '°，<b>「纵吉为凶」</b>（《全》18页三十三·续编649），不享福发财之命，慎之。');
+    } else duan.push('余奴' + yaoName(yuYao) + '不与命度主同宫犯度（距 ' + sepY.toFixed(1) + '°），奴不反主，吉。');
+  } else duan.push('命度主属金，四余无金之余，<b>无余奴</b>可犯（金无余）。');
+  const ssd = stOf(shendzYao);
+  duan.push('身宫在<b>' + shenZhi + '</b>（太阴生时所躔之宫），身主<b>' + yaoName(GONG_ZHU[shenZhi]) + '</b>今居' + ctx.zh(shenZhuYao) + '宫；' +
+    '身度主<b>' + yaoName(shenSu.attr) + '（' + shenSu.attr + '）</b>＝<b>' + shendzYao + '</b>居' + ctx.zh(shendzYao) + '宫，分 <b style="color:' + clsCol(ssd) + '">' + ssd.score + '</b>' +
+    (ssd.cls === 'good' ? '——身得其所，作为有力。' : (ssd.cls === 'bad' ? '——身度主失陷，劳而少功。' : '——身度平平。')));
+  const smz = stOf(mingZhuYao);
+  duan.push('命主（命宫宫主）<b>' + yaoName(GONG_ZHU[mingZhi]) + '</b>＝<b>' + mingZhuYao + '</b>飞居<b>' + ctx.zh(mingZhuYao) + '宫</b>（' +
+    GONG_SHIER[(giM - ctx.gi(mingZhuYao) + 12) % 12].name + '），分 <b style="color:' + clsCol(smz) + '">' + smz.score + '</b>——' +
+    (smz.cls === 'good' ? '命主得地，管库丰盈。' : (smz.cls === 'bad' ? '命主失陷，库空之叹。' : '命主平平。')));
+  /* 行限 */
+  const d = dayunCalc();
+  if (d) {
+    const xianZhi = GONG[d.dxIdx].chen;
+    const xianZhuYao = WX_MAIN_YAO[GONG_ZHU[xianZhi]];
+    const sxz = stOf(xianZhuYao);
+    const occTxt = d.occ.map(b => b.char + (roles[b.char] ? '（' + roles[b.char].join('/') + '）' : '')).join('、') || '空宫';
+    duan.push('今行<b>' + (d.xian + 1) + '限·' + xianZhi + '宫</b>（' + GONG_SHIER[d.xian].name + '限 ' + d.startAge + '–' + d.endAge + '岁，已行' + d.xianDeg.toFixed(1) + '°），' +
+      '限宫主<b>' + yaoName(GONG_ZHU[xianZhi]) + '</b>分 <b style="color:' + clsCol(sxz) + '">' + sxz.score + '</b>；入限宫之曜：' + occTxt + '。' +
+      (d.occ.some(b => nanStars.indexOf(b.char) >= 0) ? '<b>难星入限</b>，此限宜守。' : (d.occ.some(b => enStars.indexOf(b.char) >= 0) ? '恩星入限，此限得荫。' : '')));
+  }
+  /* 格局（严格化清单） */
+  const goodG = gejuLastList.filter(g => !g.bad), badG = gejuLastList.filter(g => g.bad);
+  if (goodG.length) duan.push('成格（全部条件匹配）：<b style="color:#8ed9a2">' + goodG.map(g => g.ge).join('、') + '</b>。');
+  if (badG.length) duan.push('犯格（全部条件匹配）：<b style="color:#e08a8a">' + badG.map(g => g.ge).join('、') + '</b>。');
+  if (!gejuLastList.length) duan.push('当下盘无一格局全部条件匹配成立（严格判定：缺一条件即不成格）。');
+  return {
+    ctx: ctx, giM: giM, mingZhi: mingZhi, mingSu: mingSu, mingDuLon: mingDuLon, duZhu: duZhu, mdzYao: mdzYao,
+    shenGi: shenGi, shenZhi: shenZhi, shenSu: shenSu, shendzYao: shendzYao,
+    mingZhuYao: mingZhuYao, shenZhuYao: shenZhuYao,
+    enStars: enStars, yongStars: yongStars, caiStars: caiStars, nanStars: nanStars, yuYao: yuYao,
+    enanNote: enanNote, roles: roles, duan: duan, dayun: d,
+    clsTxt: clsTxt, clsCol: clsCol, stOf: stOf
+  };
+}
+
+/* —— 评测面板 DOM 与刷新 —— */
+const pingcePanel = document.getElementById('pingcePanel');
+const btnPingce = document.getElementById('btnPingce');
+let pingceOpen = false, pingceSig = '';
+function esc(s) { return String(s == null ? '' : s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;'); }
+function pingceRender() {
+  const P = pingceCalc();
+  if (!P) {
+    pingcePanel.innerHTML = '<div class="pcTop"><b>评测</b><button id="btnPingceClose">×</button></div>' +
+      '<div class="note">未设生辰：评测须先定盘（命宫·命度·身宫皆以本命日/月所躔起）。填好时间后点「设为生辰」。</div>';
+    document.getElementById('btnPingceClose').addEventListener('click', closePingce);
+    return;
+  }
+  const ctx = P.ctx;
+  const p2 = n => (n < 10 ? '0' : '') + n;
+  const cB = jdToCalendar(birthJD);
+  let h = '<div class="pcTop"><b>评测</b><span class="pcSub">命主·命度主·身度主·恩用财难余奴·星宫状态·严格格局</span><button id="btnPingceClose">×</button></div>';
+  h += '<div class="pcSec"><div class="pcH">定盘</div><div class="pcTx">生辰 ' + cB.y + '-' + p2(cB.m) + '-' + p2(cB.d) + ' ' + p2(cB.h) + ':' + p2(cB.mi) +
+    '（UTC）· 命宫<b class="hl">' + P.mingZhi + '</b>· 身宫<b class="hl">' + P.shenZhi + '</b>· ' + (isNightNow() ? '夜生' : '昼生') + '（盘时真太阳时）</div></div>';
+  h += '<div class="pcSec"><div class="pcH">核心判定</div><table class="pcTb">' +
+    '<tr><th>项</th><th>取法</th><th>主曜</th><th>今居</th><th>分</th></tr>' +
+    '<tr><td>命主（宫主者）</td><td>' + P.mingZhi + '宫主' + GONG_ZHU[P.mingZhi] + '（《全》23页三十四）</td><td>' + P.mingZhuYao + '</td><td>' + ctx.zh(P.mingZhuYao) + '宫</td><td style="color:' + P.clsCol(P.stOf(P.mingZhuYao)) + '">' + P.stOf(P.mingZhuYao).score + '</td></tr>' +
+    '<tr><td>宿度命度主</td><td>命度' + P.mingSu.name + P.mingSu.deg.toFixed(1) + '°属' + P.duZhu + '（《全》22页三十·择日量天尺法）</td><td>' + P.mdzYao + '</td><td>' + ctx.zh(P.mdzYao) + '宫</td><td style="color:' + P.clsCol(P.stOf(P.mdzYao)) + '">' + P.stOf(P.mdzYao).score + '</td></tr>' +
+    '<tr><td>身度主</td><td>生月躔' + P.shenSu.name + P.shenSu.deg.toFixed(1) + '°属' + P.shenSu.attr + '</td><td>' + P.shendzYao + '</td><td>' + ctx.zh(P.shendzYao) + '宫</td><td style="color:' + P.clsCol(P.stOf(P.shendzYao)) + '">' + P.stOf(P.shendzYao).score + '</td></tr>' +
+    '</table><div class="pcTx pcNote">' + esc(P.enanNote) + '</div></div>';
+  const rowOf = (label, chs) => {
+    const cells = chs.length ? chs.map(ch => '<b>' + ch + '</b>' + ctx.zh(ch) + '宫<span style="color:' + P.clsCol(P.stOf(ch)) + '">' + P.stOf(ch).score + '</span>').join('　') : '—';
+    return '<tr><td>' + label + '</td><td>' + cells + '</td></tr>';
+  };
+  h += '<div class="pcSec"><div class="pcH">恩·用·财·难·余奴（以命度主' + P.duZhu + '推）</div><table class="pcTb">' +
+    rowOf('恩星（生我/所喜）', P.enStars) + rowOf('用星（我生）', P.yongStars) + rowOf('财星（我克）', P.caiStars) +
+    rowOf('难星（克我/所怕）', P.nanStars) + rowOf('余奴（同行之余）', P.yuYao ? [P.yuYao] : []) + '</table></div>';
+  /* 十一曜总表 */
+  h += '<div class="pcSec"><div class="pcH">十一曜状态总表</div><table class="pcTb"><tr><th>曜</th><th>黄经</th><th>宫</th><th>行度</th><th>状态</th><th>分</th><th>角色</th></tr>';
+  for (const b of snap.bodies) {
+    const st = stateMap[b.id] || evalYaoState(b.char, ctx);
+    const mw = miaoWang(b.char, ctx.zh(b.char));
+    const sy = shiYuan(b.char, ctx.zh(b.char));
+    const dir = b.rate < -0.0055 ? '逆' : (b.rate < 0 ? '留' : '顺');
+    h += '<tr><td style="color:' + b.color + '">' + b.char + '</td><td>' + norm360(b.lon).toFixed(1) + '°</td><td>' + ctx.zh(b.char) + '</td><td>' +
+      dir + b.rate.toFixed(2) + '</td><td>' + (mw || (sy ? '失垣' : '—')) + '</td><td style="color:' + P.clsCol(st) + '">' + st.score + '</td><td>' +
+      (P.roles[b.char] ? P.roles[b.char].join('/') : '') + '</td></tr>';
+  }
+  h += '</table></div>';
+  /* 十二宫入驻 */
+  h += '<div class="pcSec"><div class="pcH">十二宫状态</div><table class="pcTb"><tr><th>宫</th><th>位次</th><th>入驻</th><th>标记</th></tr>';
+  for (let i = 0; i < 12; i++) {
+    const occ = snap.bodies.filter(b => gongIndex(b.lon) === i);
+    const shier = GONG_SHIER[(P.giM - i + 12) % 12].name;
+    const marks = [];
+    if (i === P.giM) marks.push('命宫');
+    if (i === P.shenGi) marks.push('身宫');
+    if (P.dayun) { if (i === P.dayun.dxIdx) marks.push('大限'); if (i === P.dayun.xxIdx) marks.push('小限'); if (i === P.dayun.yueIdx) marks.push('月限'); }
+    h += '<tr><td>' + GONG[i].chen + '</td><td>' + shier + '</td><td>' + (occ.map(b => b.char + (P.roles[b.char] ? '·' + P.roles[b.char][0] : '')).join(' ') || '空') +
+      '</td><td>' + marks.join('＋') + '</td></tr>';
+  }
+  h += '</table></div>';
+  /* 格局（严格化） */
+  h += '<div class="pcSec"><div class="pcH">成格清单（严格：全部条件匹配才算）</div>';
+  if (!gejuLastList.length) h += '<div class="pcTx">无格局成立。</div>';
+  for (const g of gejuLastList) {
+    h += '<div class="pcGj"><b style="color:' + (g.bad ? '#e08a8a' : '#8ed9a2') + '">' + esc(g.ge) + '</b>（' + esc(g.verdict || '') + '）　' +
+      esc(gejuChars(g.yao).join(' ')) + '<div class="pcWhy">' + esc(g.why) + '</div></div>';
+  }
+  h += '</div>';
+  /* 断语 */
+  h += '<div class="pcSec"><div class="pcH">评测结论（结合当下盘）</div>' +
+    P.duan.map(t => '<div class="pcDuan">· ' + t + '</div>').join('') + '</div>';
+  h += '<div class="pcSec"><div class="pcNote">出处：《七政四余（全）》13页(十九)恩用仇难躔次得失·22页(三十)(三十一)安命度安身宫·23页(三十四)宫主度度主·18页(三十三)余奴犯主；《七政四余择日》量天尺命度法；《网络文献续编·果老星宗格局》243-246·641-649。命度取日躔宫度直下命宫（简化口径），古法全式须生时上升度。</div></div>';
+  pingcePanel.innerHTML = h;
+  document.getElementById('btnPingceClose').addEventListener('click', closePingce);
+}
+function openPingce() {
+  pingceOpen = true;
+  if (gongPanelOpen >= 0) closeGongPanel();
+  if (gejuOpen) toggleGejuView(false);
+  pingcePanel.className = '';
+  pingceSig = '';
+  pingceRender();
+  btnPingce.classList.add('on');
+}
+function closePingce() {
+  pingceOpen = false;
+  pingcePanel.className = 'hide';
+  btnPingce.classList.remove('on');
+}
+function pingceFrame() {
+  if (!pingceOpen || !snap) return;
+  const sig = Math.round(simJD * 100) + '|' + birthJD + '|' + gejuLastList.map(g => g.id).join(',') + '|' +
+    snap.bodies.map(b => b.char + Math.round(gongIndex(b.lon))).join(',');
+  if (sig !== pingceSig) { pingceSig = sig; pingceRender(); }
+}
+btnPingce.addEventListener('click', function () { pingceOpen ? closePingce() : openPingce(); });
+
+/* 气息测地积分小窗的最小化开关（用户指定：与「评测」按钮同置时间行）。
+   收起＝窗口只留标题行；展开＝恢复 canvas／图例／数显。 */
+const btnQiGeoMin = document.getElementById('btnQiGeoMin');
+let qiGeoMin = false;
+function qiGeoMinApply() {
+  qiGeoEl.classList.toggle('min', qiGeoMin);
+  btnQiGeoMin.textContent = qiGeoMin ? '展开气息窗' : '收起气息窗';
+  btnQiGeoMin.classList.toggle('on', !qiGeoMin);
+}
+btnQiGeoMin.addEventListener('click', function () {
+  qiGeoMin = !qiGeoMin;
+  /* 展开时若该窗已被「显示」行的开关关掉，顺带打开，避免点了没反应 */
+  if (!qiGeoMin && !show.qiGeo) { show.qiGeo = true; el('btnQiGeo').classList.add('on'); }
+  qiGeoMinApply();
+});
+qiGeoMinApply();
+
+/* 上次的生辰若已存于本地，开机即自动定盘（宫带大限指示随之出现） */
+restoreBirth();
+if (birthJD !== null) applyBirth();
+
+setSpeed(1);
+setPaused(false);
+animate();

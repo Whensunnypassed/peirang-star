@@ -1,0 +1,350 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>七政四余 · 太阳系天盘（地心）</title>
+<style>
+  :root {
+    /* 字体链：思源黑体（Source Han Sans SC）优先，逐级回退到系统已装 CJK 字体。
+       ① 全部为本地字体族名，不含 @font-face / 网络请求 → 离线版与在线版表现一致；
+       ② "Source Han Sans SC VF" 是可变字重版族名，"思源黑体" 是中文族名，二者都列上，
+          因为不同安装方式注册的族名不同（本机 224 个族里两种都命中）；
+       ③ 末尾保留 Segoe UI：它带 ⁻⁶ / ϖ 等数学符号，覆盖 4×10⁻⁶ 这类排印字符。
+       ④ 首位 "DSH Qizheng" 是为**离线版内嵌字体**预留的独有族名：离线构建时才注入
+          对应的 @font-face（思源黑体 SC 子集，仅含本页用到的字），未注入时该族名不存在，
+          浏览器自动跳到后面家族，因此在线版与任何未内嵌场景行为不变。 */
+    --dsh-ui: "DSH Qizheng", "Source Han Sans SC", "Source Han Sans SC VF", "Source Han Sans",
+              "思源黑体", "Microsoft YaHei", "微软雅黑", "PingFang SC",
+              "Noto Sans CJK SC", system-ui, "Segoe UI", sans-serif;
+    /* 度数与时辰用等宽数字，但汉字仍走黑体（Consolas 无汉字，会整串回退） */
+    --dsh-mono: "DSH Qizheng", Consolas, "Cascadia Mono", "Source Han Sans SC", "Microsoft YaHei", monospace;
+    --dsh-scan: "Source Han Serif SC", "思源宋体", "Source Han Serif", "Noto Serif CJK SC",
+                "SimSun", "宋体", serif;
+
+    /* ── 曜状态指示色（低饱和，仅作细线着色，不再做大面积色块） ── */
+    --st-good: #8ed9a2;
+    --st-bad:  #e08a8a;
+    --st-mid:  #93a9c4;
+    /* ── 营地色：水／火 ── */
+    --st-water: #7fbcd8;
+    --st-fire:  #dfa878;
+    --st-plain: #7f96b4;
+  }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; padding: 0; height: 100%; overflow: hidden; background: #04060c; }
+  body { font-family: var(--dsh-ui); color: #dbe4f0; }
+  canvas { display: block; }
+
+  /* 右上按钮栏：收起面板／评测／气息窗，常驻（不随 #panel 收起而隐藏） */
+  #topbar { position: fixed; top: 10px; right: 12px; z-index: 12; display: flex; align-items: center; gap: 6px; }
+  #topbar > button { background: rgba(21, 34, 56, 0.94); padding: 4px 10px; }
+  #topbar > button:hover { background: #1e3252; }
+
+  #panel {
+    position: fixed; top: 10px; left: 10px; width: 470px;
+    max-height: calc(100vh - 132px); overflow-y: auto;
+    background: rgba(9, 14, 25, 0.88); border: 1px solid #22334c; border-radius: 10px;
+    padding: 10px 12px 12px; font-size: 12px; line-height: 1.5; z-index: 10;
+    backdrop-filter: blur(5px); box-shadow: 0 6px 28px rgba(0,0,0,.6);
+  }
+  #panel::-webkit-scrollbar { width: 8px; }
+  #panel::-webkit-scrollbar-thumb { background: #24344d; border-radius: 4px; }
+  #panel h1 { font-size: 13.5px; margin: 0 0 7px; font-weight: 600; color: #9fc4ff; letter-spacing: .6px; }
+  .row { display: flex; flex-wrap: wrap; gap: 5px; align-items: center; margin-bottom: 6px; }
+  .row > label { color: #8fa3bd; }
+  input[type=number] {
+    width: 60px; background: #0c1424; color: #e6eefb; border: 1px solid #2b3f5c;
+    border-radius: 4px; padding: 2px 4px; font-size: 12px; font-family: var(--dsh-mono);
+  }
+  input[type=number].wide { width: 76px; }
+  button {
+    background: #152238; color: #cfe0f5; border: 1px solid #2b3f5c; border-radius: 5px;
+    padding: 3px 8px; font-size: 12px; cursor: pointer; font-family: inherit;
+  }
+  button:hover { background: #1e3252; }
+  button.on { background: #2b5c9c; border-color: #4a86d8; color: #fff; }
+  .sec { border-top: 1px solid #1b2a41; margin-top: 7px; padding-top: 7px; }
+  .sec > .h { color: #7fa8de; font-size: 11.5px; letter-spacing: .5px; margin-bottom: 5px; }
+  table.grid { border-collapse: collapse; width: 100%; font-family: var(--dsh-mono); font-size: 11.5px; }
+  table.grid th { color: #6f8bab; font-weight: normal; text-align: left; padding: 1px 4px; border-bottom: 1px solid #22334c; }
+  table.grid td { padding: 1px 4px; border-bottom: 1px solid #131f33; white-space: nowrap; }
+  table.grid td.nm { color: #eaf2ff; }
+  table.grid td.lon { color: #ffd9a0; text-align: right; }
+  table.grid td.pos { color: #8fb8e8; }
+  table.grid td.rate { text-align: right; color: #9fd8b0; }
+  table.grid tr.retro td.rate { color: #ff9f8f; }
+  table.grid tr.stat  td.rate { color: #ffe27a; }
+  .dot { display: inline-block; width: 7px; height: 7px; border-radius: 50%; margin-right: 4px; vertical-align: middle; }
+  .note { color: #8194ad; font-size: 11px; line-height: 1.55; }
+  .note b { color: #a8bdd6; font-weight: 600; }
+  .mono { font-family: var(--dsh-mono); color: #b8cbe4; }
+  .hl { color: #ffd9a0; }
+
+  #labels { position: fixed; inset: 0; pointer-events: none; overflow: hidden; z-index: 5; }
+  .lbl {
+    position: absolute; transform: translate(-50%, -50%); font-family: var(--dsh-mono);
+    font-size: 11.5px; font-weight: 500; letter-spacing: .4px; color: #d6e4f6; white-space: nowrap;
+    /* 三层黑描边保证任何背景下字缘清晰，末层 currentColor 让辉光跟随各曜本色 */
+    text-shadow: 0 0 3px #000, 0 0 7px #000, 0 0 13px rgba(0, 0, 0, .85), 0 0 5px currentColor;
+    transition: opacity .14s linear;
+  }
+  /* 被更高优先级的标签压住时淡出（不是删除，转一下视角就回来）；淡出时也不可点 */
+  .lbl.cull { opacity: 0; pointer-events: none; }
+  .lbl.planet { color: #a8d0ff; }
+  .lbl.xuyu { color: #ffb0d8; }
+  .lbl.gong { color: #6f89a8; font-size: 10.5px; }
+  /* 十二宫宫名／十二次名：可点击，展开宫位详情面板 */
+  .lbl.gong, .lbl.gongci { pointer-events: auto; cursor: pointer; padding: 2px 4px; }
+  .lbl.gong:hover, .lbl.gongci:hover { color: #ffd9a0; }
+  .lbl.gongSel {
+    color: #ffe27a !important;
+    text-shadow: 0 0 3px #000, 0 0 8px #000, 0 0 14px rgba(255, 210, 120, .75), 0 0 5px currentColor;
+  }
+  /* 大限宫＝青色描边 · 小限宫＝粉色描边（设生辰定盘后随时间推进高亮） */
+  .lbl.gongDX {
+    color: #7fe0c8 !important;
+    border: 1px solid rgba(127, 224, 200, .55); border-radius: 4px;
+    text-shadow: 0 0 3px #000, 0 0 8px #000, 0 0 13px rgba(127, 224, 200, .6), 0 0 5px currentColor;
+  }
+  .lbl.gongXX {
+    color: #ffb0d8 !important;
+    border: 1px solid rgba(255, 176, 216, .5); border-radius: 4px;
+    text-shadow: 0 0 3px #000, 0 0 8px #000, 0 0 13px rgba(255, 176, 216, .55), 0 0 5px currentColor;
+  }
+  /* 宫位详情面板：与格局面板同槽位（右上） */
+  #gongPanel {
+    position: fixed; right: 12px; top: 46px; width: 340px; z-index: 11;
+    max-height: calc(100vh - 230px); overflow-y: auto;
+    background: rgba(10, 16, 28, .92); border: 1px solid #2c4160; border-radius: 10px;
+    padding: 8px 11px 10px; color: #cfe0f5; font: 12.5px/1.65 var(--dsh-ui);
+    backdrop-filter: blur(3px); box-shadow: 0 6px 24px rgba(0,0,0,.55);
+  }
+  #gongPanel.hide { display: none; }
+  #gongPanel::-webkit-scrollbar { width: 8px; }
+  #gongPanel::-webkit-scrollbar-thumb { background: #24344d; border-radius: 4px; }
+  #gongPanel .gpTop { display: flex; align-items: center; gap: 8px; border-bottom: 1px solid #24354f; padding-bottom: 5px; margin-bottom: 6px; }
+  #gongPanel .gpTop b { color: #9ecbff; font-size: 14px; letter-spacing: .05em; }
+  #gongPanel .gpSub { flex: 1; color: #8aa6c8; font-size: 11.5px; }
+  #gongPanel #btnGongClose { background: none; border: 0; color: #8aa6c8; font-size: 17px; line-height: 1; cursor: pointer; padding: 0 2px; }
+  #gongPanel .gpShi { color: #eaf2ff; }
+  #gongPanel .gpShi em { color: #ffd9a0; font-style: normal; font-weight: 600; }
+  #gongPanel .gpZhu { color: #9fb6d2; margin: 2px 0 6px; }
+  #gongPanel .gpOcc { color: #7fa8de; font-size: 11.5px; letter-spacing: .4px; border-top: 1px solid #1b2a41; padding-top: 5px; }
+  #gongPanel .gpRow { color: #d6e4f6; font-family: var(--dsh-mono); }
+  #gongPanel .gpRow .mw { color: #9ff0a8; }
+  #gongPanel .gpRow .sy { color: #ff9a9a; }
+  /* 星曜入宫影响释义：紧跟该曜一行之后，浅色小字 */
+  #gongPanel .gpXiang { color: #b9cbe2; font-size: 11.5px; line-height: 1.55; margin: 1px 0 6px 1.2em; padding-left: 8px; border-left: 2px solid #24354f; }
+  #gongPanel .gpXiang .gpTag { color: #8fd0a0; margin-left: 4px; }
+  #gongPanel .gpNone { color: #7d94b3; }
+  /* 本盘诊断新增段落：宫位次/宫主/行限/三方四正/格局涉及/断语 */
+  #gongPanel .gpSec { color: #7fa8de; font-size: 11.5px; letter-spacing: .4px; border-top: 1px solid #1b2a41; padding-top: 5px; margin-top: 5px; }
+  #gongPanel .gpKey { color: #d6e4f6; font-size: 11.5px; line-height: 1.6; }
+  #gongPanel .gpKey b { color: #ffd9a0; font-weight: 600; }
+  #gongPanel .gpMark { color: #7fe0c8; letter-spacing: .3px; }
+  #gongPanel .gpRole { color: #ffd9a0; font-size: 10.5px; }
+  #gongPanel .gpSfRow { color: #c3d4ea; font-family: var(--dsh-mono); font-size: 11.5px; }
+  #gongPanel .gpDuan { color: #b9cbe2; font-size: 11.5px; line-height: 1.55; margin: 1px 0; }
+  #gongPanel .gpDuan b { color: #ffd9a0; font-weight: 600; }
+  #gongPanel .gpNote { color: #6f89a8; font-size: 11px; margin-top: 6px; border-top: 1px solid #1b2a41; padding-top: 4px; }
+  .lbl.sun { color: #ffe27a; }
+  .lbl.moon { color: #e6efff; }
+  /* 悬浮/选中才展开的一行细解：吉凶、气息、营地。默认 display:none，不占版面。 */
+  .lbl [data-det] { display: none; }
+  .lbl.hot [data-det] {
+    display: block; font-size: 9.5px; color: #8ea6c4; letter-spacing: .2px; margin-top: 1px;
+  }
+  /* 3D 提示条上的营地小字与昼夜标识 */
+  .hint2 { color: #647c9b; font-size: 11px; margin-top: 3px; }
+  .dyemark { font-style: normal; font-weight: 600; padding: 0 2px; }
+  .dyemark.dayC { color: #ffd98a; }
+  .dyemark.nightC { color: #a9c0e6; }
+  .tickday { color: #ffd98a; }
+  .ticknight { color: #a9c0e6; }
+  /* 十一曜表：按昼夜阵营轻微区分（昼生项偏暖、夜生项偏冷，不加图标不占列宽） */
+  table.grid tr.dayc td.nm { color: #ffe6b8; }
+  table.grid tr.nightc td.nm { color: #bcd0ee; }
+
+  #skyStrip {
+    position: fixed; left: 0; right: 0; bottom: 0; height: 172px;
+    background: rgba(6, 10, 19, 0.94); border-top: 1px solid #2b405e; z-index: 8;
+  }
+  #stripCanvas { width: 100%; height: 100%; display: block; }
+  #hint {
+    position: fixed; right: 12px; top: 42px; color: #6f89a8; font-size: 11.5px; z-index: 9;
+    /* 原为 Consolas, monospace：Consolas 无汉字，中文会退回系统宋体，与全页黑体不一致。
+       改用 --dsh-mono（拉丁走等宽，汉字走思源黑体），保持等宽观感同时不再缺字。 */
+    font-family: var(--dsh-mono); text-align: right;
+  }
+
+  /* 赤道面气息测地积分数显小窗（右下，宫带上方） */
+  #qiGeo {
+    position: fixed; right: 12px; bottom: 182px; width: 348px; z-index: 9;
+    background: rgba(8, 13, 24, .93); border: 1px solid #2c4160; border-radius: 10px;
+    padding: 7px 11px 8px; color: #cfe0f5; font: 11.5px/1.5 var(--dsh-ui);
+    backdrop-filter: blur(3px); box-shadow: 0 6px 24px rgba(0,0,0,.55);
+  }
+  #qiGeo.hide { display: none; }
+  #qiGeo .qgTop { display: flex; align-items: baseline; gap: 8px; flex-wrap: wrap; margin-bottom: 3px; }
+  #qiGeo .qgTop b { color: #9ecbff; font-size: 12.5px; letter-spacing: .04em; }
+  #qiGeo canvas { display: block; width: 324px; height: 236px; }
+  #qiGeo .qgLeg { color: #8194ad; font-size: 10.5px; margin-top: 2px; }
+  #qiGeo .qgStat { color: #b8cbe4; font-size: 11px; margin-top: 3px; }
+  /* 最小化：只留标题行（canvas／图例／数显收起），由时间行「收起气息窗」按钮控制 */
+  #qiGeo.min { width: auto; }
+  #qiGeo.min canvas, #qiGeo.min .qgLeg, #qiGeo.min .qgStat { display: none; }
+  #qiGeo.min .qgTop { margin-bottom: 0; }
+  /* 评测面板：右上（与宫位/格局面板同槽位互斥），内容较长可滚动 */
+  #pingcePanel {
+    position: fixed; right: 12px; top: 46px; width: 448px; z-index: 13;
+    max-height: calc(100vh - 230px); overflow-y: auto;
+    background: rgba(10, 16, 28, .95); border: 1px solid #2c4160; border-radius: 10px;
+    padding: 8px 11px 10px; color: #cfe0f5; font: 12px/1.6 var(--dsh-ui);
+    backdrop-filter: blur(4px); box-shadow: 0 6px 24px rgba(0,0,0,.6);
+  }
+  #pingcePanel.hide { display: none; }
+  #pingcePanel::-webkit-scrollbar { width: 8px; }
+  #pingcePanel::-webkit-scrollbar-thumb { background: #24344d; border-radius: 4px; }
+  #pingcePanel .pcTop { display: flex; align-items: center; gap: 8px; border-bottom: 1px solid #24354f; padding-bottom: 5px; margin-bottom: 6px; }
+  #pingcePanel .pcTop b { color: #9ecbff; font-size: 14px; letter-spacing: .05em; }
+  #pingcePanel .pcSub { flex: 1; color: #7d94b3; font-size: 10.5px; }
+  #pingcePanel #btnPingceClose { background: none; border: 0; color: #8aa6c8; font-size: 17px; line-height: 1; cursor: pointer; padding: 0 2px; }
+  #pingcePanel .pcSec { border-top: 1px solid #1b2a41; margin-top: 6px; padding-top: 5px; }
+  #pingcePanel .pcH { color: #7fa8de; font-size: 11.5px; letter-spacing: .5px; margin-bottom: 3px; }
+  #pingcePanel .pcTx { color: #c3d4ea; font-size: 11.5px; }
+  #pingcePanel .pcNote { color: #6f89a8; font-size: 10.5px; line-height: 1.5; }
+  #pingcePanel table.pcTb { border-collapse: collapse; width: 100%; font-family: var(--dsh-mono); font-size: 11px; }
+  #pingcePanel table.pcTb th { color: #6f8bab; font-weight: normal; text-align: left; padding: 1px 4px; border-bottom: 1px solid #22334c; }
+  #pingcePanel table.pcTb td { padding: 1px 4px; border-bottom: 1px solid #131f33; }
+  #pingcePanel .pcGj { margin-bottom: 4px; }
+  #pingcePanel .pcWhy { color: #8aa6c8; font-size: 10.5px; margin-left: 1.2em; padding-left: 8px; border-left: 2px solid #24354f; }
+  #pingcePanel .pcDuan { color: #d6e4f6; font-size: 11.5px; margin-bottom: 3px; }
+  #pingcePanel .pcDuan b { color: #ffd9a0; font-weight: 600; }
+</style>
+</head>
+<body>
+
+<div id="panel">
+  <h1>七政四余 · 太阳系天盘（地心 · 回归黄道）</h1>
+
+  <div class="sec" style="border-top:none;margin-top:0;padding-top:0;">
+    <div class="h">时间（UTC）</div>
+    <div class="row mono"><span id="timeNow">—</span></div>
+    <div class="row">
+      <input id="inYear" class="cal" type="number" step="1" /><label>年</label>
+      <input id="inMonth" class="cal" type="number" min="1" max="12" step="1" /><label>月</label>
+      <input id="inDay" class="cal" type="number" min="1" max="31" step="1" /><label>日</label>
+      <input id="inHour" class="cal" type="number" min="0" max="23" step="1" /><label>时</label>
+      <input id="inMin" class="cal" type="number" min="0" max="59" step="1" /><label>分</label>
+      <input id="inSec" class="cal" type="number" min="0" max="59" step="1" /><label>秒</label>
+    </div>
+    <div class="row">
+      <button id="btnJump">跳转</button>
+      <button id="btnNow">回到现在</button>
+      <button id="btnSetB" title="把上方时间栏填好的日期时间设为生辰，后台自动定盘起大运">设为生辰</button>
+      <button id="btnYm">−1年</button><button id="btnMm">−1月</button><button id="btnDm">−1日</button>
+      <button id="btnDp">+1日</button><button id="btnMp">+1月</button><button id="btnYp">+1年</button>
+    </div>
+    <div class="row">
+      <button id="btnPause">暂停</button>
+      <button class="spd" data-s="1">1×</button>
+      <button class="spd" data-s="100">100×</button>
+      <button class="spd" data-s="1000">1000×</button>
+      <button class="spd" data-s="10000">1万×</button>
+      <button class="spd" data-s="60000">6万×</button>
+      <button class="spd" data-s="300000">30万×</button>
+    </div>
+    <div class="row note">
+      <label style="color:#8194ad;"><input type="checkbox" id="chkPauseJump" checked /> 跳转后暂停</label>
+      <span id="julianOut" class="mono"></span>
+    </div>
+    <div class="row">
+      <button id="btnBClr">清除生辰</button>
+      <span class="note" id="bStatus">未设生辰 · 填好上方时间后点「设为生辰」即后台自动定盘、起大运</span>
+    </div>
+    <div class="row note" id="dayunInfo" style="display:block">—</div>
+  </div>
+
+  <div class="sec">
+    <div class="h">地方时 / 真太阳时 / 节气 / 干支</div>
+    <div class="row">
+      <label>经度(°E)</label><input id="inLon" type="number" step="0.01" value="120" class="wide" />
+      <span class="note">用于地方平时与真太阳时（东经为正）</span>
+    </div>
+    <div id="timeInfo" class="note mono"></div>
+  </div>
+
+  <div class="sec">
+    <div class="h">十一曜黄经（地心 · 回归黄道）</div>
+    <table class="grid" id="tbl">
+      <thead><tr><th>曜</th><th style="text-align:right">黄经</th><th>宫位</th><th style="text-align:right">行度/日</th></tr></thead>
+      <tbody id="tbody"></tbody>
+    </table>
+  </div>
+
+  <div class="sec">
+    <div class="h">虚星参数</div>
+    <div class="row">
+      <label>紫炁定例</label>
+      <select id="selZiqi" class="wide">
+        <option value="moira">Moira 定例（28 恒星年 · 10227.1792 日）</option>
+        <option value="ming">明史稿行度（1/28 度/日 · 10080 日）</option>
+      </select>
+      <span class="note">历元 1975-03-13 16:00 UT 在 230.5°</span>
+      <label>紫炁历元微调</label>
+      <input id="inZiqi" type="number" step="0.1" value="0" class="wide" />
+      <span class="note">° — 古籍仅载行度、未载历元；Moira 给出定例，此处仅作微调</span>
+    </div>
+  </div>
+
+  <div class="sec">
+    <div class="h">显示</div>
+    <div class="row">
+      <button id="btnLabels" class="on">名称标签</button>
+      <button id="btnRing" class="on">十二宫刻度环</button>
+      <button id="btnOrbits" class="on">行星轨道</button>
+      <button id="btnMoon" class="on">白道与交点线</button>
+      <button id="btnXuyu" class="on">四余</button>
+      <button id="btnStars" class="on">星空</button>
+      <button id="btnState" class="on">状态</button>
+      <button id="btnGeju" class="on">成格局</button>
+      <button id="btnSpin" class="on">自转与月相</button>
+      <button id="btnEnergy" class="on">生克能量线</button>
+      <button id="btnQiGeo" class="on">气息测地积分</button>
+      <button id="btnStrip" class="on">黄道宫带</button>
+    </div>
+    <div class="row">
+      <label>视野</label>
+      <button id="btnV1">地心近景</button>
+      <button id="btnV2">内行星</button>
+      <button id="btnV3">七政</button>
+      <button id="btnV4">全系</button>
+      <button id="btnReset">复位视角</button>
+    </div>
+    <div class="row note">行星表面纹理：Solar System Scope（solarsystemscope.com/textures）· 许可 CC BY 4.0</div>
+  </div>
+
+</div>
+
+<div id="topbar">
+  <button id="btnPanel">收起面板</button>
+  <button id="btnPingce" title="命盘评测：命主·宿度命度主·身度主·恩用财难余奴·星体宫位状态·严格格局·断语">评测</button>
+  <button id="btnQiGeoMin" title="最小化／展开右下「赤道面阴阳气息测地积分」小窗">收起气息窗</button>
+</div>
+<div id="labels"></div>
+<div id="skyStrip"><canvas id="stripCanvas"></canvas></div>
+
+<!-- 赤道面阴阳气息测地积分（预设模型）：表现方式参考「赤道面零测地线积分（RK4 GEODESICS）」Inset 面板 -->
+<div id="qiGeo" class="hide">
+  <div class="qgTop"><b>赤道面阴阳气息测地积分</b></div>
+  <canvas id="qiGeoCanvas" width="324" height="236"></canvas>
+  <div class="qgLeg"><span style="color:#6f9fe0">蓝线</span>弱气掠地偏折 · <span style="color:#ffd27a">金线</span>强气缠地成环 · <span style="color:#e0707a">红线</span>极盛入地吸收；顺缠＝阳曜 · 逆缠＝阴曜</div>
+  <div class="qgStat mono" id="qiGeoStat">—</div>
+</div>
+
+<div id="pingcePanel" class="hide"></div>
+
+<script type="module" src="./src/main.js"></script>
+</body>
+</html>

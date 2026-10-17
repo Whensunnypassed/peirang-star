@@ -1,0 +1,17 @@
+# 本地工具链与依赖
+.tools/
+node_modules/
+solar-system-app/node_modules/
+
+# 构建产物（由 GitHub Actions 构建发布，不入源码库）
+solar-system-app/dist/
+
+# 工具缓存与备份
+.trae-html-share-packages/
+.backup-original-*/
+
+# 系统与编辑器
+.DS_Store
+Thumbs.db
+.vscode/
+*.log

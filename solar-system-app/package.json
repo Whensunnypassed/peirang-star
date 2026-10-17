@@ -1,0 +1,18 @@
+{
+  "name": "qzs-solar-system",
+  "private": true,
+  "version": "1.0.0",
+  "type": "module",
+  "description": "七政四余 · 太阳系天盘（地心）— Three.js + Vite",
+  "scripts": {
+    "dev": "vite",
+    "build": "vite build",
+    "preview": "vite preview"
+  },
+  "dependencies": {
+    "three": "0.160.1"
+  },
+  "devDependencies": {
+    "vite": "5.4.11"
+  }
+}
