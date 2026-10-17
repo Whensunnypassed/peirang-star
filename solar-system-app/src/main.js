@@ -4,6 +4,14 @@ import { EffectComposer } from 'three/addons/postprocessing/EffectComposer.js';
 import { RenderPass } from 'three/addons/postprocessing/RenderPass.js';
 import { UnrealBloomPass } from 'three/addons/postprocessing/UnrealBloomPass.js';
 import { OutputPass } from 'three/addons/postprocessing/OutputPass.js';
+/* 中国省级省界 GeoJSON（阿里 DataV 公开数据 100000_full），内联进包 → 离线可用、无跨域请求 */
+import chinaGeo from './assets/china.json';
+
+/* 地面视图（点地球 →「跳转至地面」的中国分野分区图）是否铺满全屏。
+   必须在此提前声明：animate() 在模块末尾被顶层调用，而地面视图那一整节在文件后段才定义，
+   那时 groundOpen 仍处暂时性死区 → animate() 首帧就抛 ReferenceError 并中断，天盘整帧不刷新。
+   groundFlying／groundFading 同理前置——animate() 的早退判断要读它们。 */
+let groundOpen = false, groundFlying = false, groundFading = false;
 
 /* ===== ASTRO-BEGIN =====
    纯函数天文核：不依赖 THREE / DOM，可整段抽出做数值自检。
@@ -1031,10 +1039,18 @@ function updateAll() {
 const el = id => document.getElementById(id);
 const timeNowEl = el('timeNow'), timeInfoEl = el('timeInfo'), julianEl = el('julianOut'), tbodyEl = el('tbody');
 const calInputs = Array.prototype.slice.call(document.querySelectorAll('input.cal'));
-/* 用户一旦改动过时间输入框，就停止用当前盘时回填，直到点「跳转/回到现在/±步进」——
-   否则运行中会被逐帧覆盖成当下时刻，点「跳转」读到的仍是现在，看起来「跳了没反应」 */
+/* 用户一旦改动过时间输入框，就停止用当前盘时回填，直到点「回到现在/设为生辰/±步进」——
+   否则运行中会被逐帧覆盖成当下时刻，此时点按钮读到的仍是现在，看起来「点了没反应」 */
 let calDirty = false;
 for (const inp of calInputs) inp.addEventListener('input', () => { calDirty = true; });
+
+/* 面板分区折叠：点分区标题即收展。默认只展开「时间」区（其余 .sec 在 index.html 里带 fold），
+   以缓解面板文字过多、一眼看不清的问题。 */
+const secHeads = Array.prototype.slice.call(document.querySelectorAll('#panel .sec > .h'));
+for (const h of secHeads) {
+  h.setAttribute('role', 'button');
+  h.addEventListener('click', function () { h.parentNode.classList.toggle('fold'); });
+}
 
 function updatePanel() {
   const c = jdToCalendar(simJD);
@@ -1328,6 +1344,10 @@ const ST_SYM = { good: '◎', mid: '○', bad: '\u2298' };
 /* ---------------- 主循环 ---------------- */
 function animate() {
   requestAnimationFrame(animate);
+  /* 地面视图（中国 3D 地形）铺满全屏时，天盘不必再画：省下泛光通道的开销，
+     时间也一并冻结（回来时 lastRealMs 已更新，不会一次跳进一大段）。
+     淡出途中（groundFading）例外——那 0.5s 要让天盘照常渲染，才与渐隐的地面形成交叉过渡。 */
+  if (groundOpen && !groundFading) { lastRealMs = performance.now(); return; }
   const now = performance.now();
   const dt = (now - lastRealMs) / 86400000;
   lastRealMs = now;
@@ -1343,6 +1363,7 @@ function animate() {
   updateAll();
   qiGeoFrame(now);
   pingceFrame();
+  yaoPanelFrame();
   composer.render();
 }
 
@@ -1377,22 +1398,8 @@ function setPaused(v) {
 el('btnPause').addEventListener('click', () => setPaused(!paused));
 el('btnNow').addEventListener('click', () => { simJD = nowJD(); calDirty = false; setPaused(false); updateAll(); });
 
-el('btnJump').addEventListener('click', () => {
-  const num = id => parseInt(el(id).value, 10);
-  const cur = jdToCalendar(simJD);
-  const y = num('inYear'), m = num('inMonth'), d = num('inDay');
-  /* 只填了年份也能跳；缺的月/日/时/分/秒取当前盘面，不再静默失败 */
-  if (!isFinite(y)) { timeNowEl.textContent = '请先填写年份（例：1900）'; return; }
-  const mm = Math.min(12, Math.max(1, isFinite(m) ? m : cur.m));
-  const dd = Math.min(daysInMonth(y, mm), Math.max(1, isFinite(d) ? d : cur.d));
-  const hh = Math.min(23, Math.max(0, isFinite(num('inHour')) ? num('inHour') : cur.h));
-  const mi = Math.min(59, Math.max(0, isFinite(num('inMin')) ? num('inMin') : cur.mi));
-  const ss = Math.min(59, Math.max(0, isFinite(num('inSec')) ? num('inSec') : cur.s));
-  simJD = dateToJD(y, mm, dd, hh, mi, ss);
-  if (el('chkPauseJump').checked) setPaused(true);
-  calDirty = false;
-  updateAll();
-});
+/* 「跳转」已并入「设为生辰」（见下方 btnSetB）：时间栏填好后一键＝定盘 + 把盘面时刻拨到该刻，
+   故这里不再有独立的「跳转」按钮与处理器。要浏览任意时刻，用 ±1年/月/日 步进或「回到现在」。 */
 function stepDays(n) { simJD += n; calDirty = false; updateAll(); }
 function stepMonths(n) {
   const c = jdToCalendar(simJD);
@@ -1614,6 +1621,11 @@ document.body.appendChild(chartStyle);
 /* ---------------- 面板 DOM ---------------- */
 const chartWrap = document.createElement('div');
 chartWrap.id = 'chartWrap';
+/* 开机默认收起：用户 2026-10-18「打开页面之后不要所有窗口都展开」。
+   此前创建时未带 hide，导致一进页面右侧「七政四余排盘／点选十一曜」条文面板就整块展开，
+   而右上「排盘」入口按钮早已移除，面板内 × 关掉后再无入口打开——现默认 hide，
+   只在需要时（点盘面曜等原有流程）由代码显隐。 */
+chartWrap.className = 'hide';
 document.body.appendChild(chartWrap);
 
 const chartTop = document.createElement('div');
@@ -1751,9 +1763,9 @@ function evalCond(c, ctx) {
     case 'night': { const n = isNightNow(); ok = n; why = '盘时真太阳时 ' + trueHourNow().toFixed(2) + ' 时 → ' + (n ? '夜' : '昼'); break; }
     case 'mingpos': {
       /* 命宫坐某宫：未定盘则不可判（严格化：四刑忌须「坐命宫」方论，非坐命宫毋论）。
-         命宫＝本命日太阳所居之宫（《七政四余（全）》188页起大限法之简化口径）。 */
+         命宫依《七政四余（全）》208页「以生时加在太阳所在之宫，顺数至卯」定（见 mingGongFrom）。 */
       if (birthJD === null) { ok = false; why = '未设生辰·命宫不可定（严格化：非坐命宫毋论）'; break; }
-      const mz = GONG[gongIndex(norm360(sunApparentLon(birthJD)))].chen;
+      const mz = GONG[mingGongFrom(birthJD)].chen;
       ok = (mz === c.g); why = '命宫在' + mz + (ok ? '宫（坐命应验）' : '宫（非' + c.g + '宫·毋论）');
       break;
     }
@@ -2072,14 +2084,20 @@ function pickAtPointer(clientX, clientY) {
 }
 function pickAndSelect(clientX, clientY) {
   const id = pickAtPointer(clientX, clientY);
-  /* 点地球（画面中心原点）：视角转到当前大限宫的「面向自己」方位（见 focusDayunGong） */
-  if (id === 'earth') { focusDayunGong(); return id; }
+  /* 点地球（画面中心原点）：弹「地球」二级菜单，由此选「跳转至地面」或「面向大限宫」 */
+  if (id === 'earth') { openEarthMenu(clientX, clientY); return id; }
   /* 点格局线（严格成格常驻线）：打开右侧「成格局」面板并选中该格 */
   if (id && id.indexOf('geju:') === 0) { openGejuById(id.slice(5)); return id; }
-  if (id) { selectYao(id); return id; }
-  /* 点在空白天空：取消曜选中，并收起宫位、格局、排盘面板与主面板 */
+  if (id) {
+    selectYao(id);
+    const b = bodyById(id);                 /* 点曜即展开「曜对命主影响」面板（与宫位/格局/评测同槽互斥） */
+    if (b) openYaoPanel(b.char);
+    return id;
+  }
+  /* 点在空白天空：取消曜选中，并收起宫位、格局、排盘、影响面板与主面板 */
   closeGongPanel();
   closeGejuView();
+  closeYaoPanel();
   if (sel) selectYao(sel);
   if (chartWrap.className.indexOf('hide') < 0) {
     chartWrap.className = 'hide';
@@ -2149,12 +2167,15 @@ for (const id of Object.keys(YAO)) {
     if (hover3d === id) { hover3d = null; updatePickVisuals(); }
   });
 }
-/* 地球标签同「点地球」一例：转到当前大限宫面向自己的方位（3D 里地球只有几个像素，
+/* 地球标签同「点地球」一例：弹同一个二级菜单（3D 里地球只有几个像素，
    标签正压在地球上，若标签与网格行为不一致，点中间的命中结果就成了掷骰子）。 */
 if (LBL.earth && LBL.earth.style) {
   LBL.earth.style.pointerEvents = 'auto';
   LBL.earth.style.cursor = 'pointer';
-  LBL.earth.addEventListener('click', function () { focusDayunGong(); });
+  LBL.earth.addEventListener('click', function () {
+    const r = this.getBoundingClientRect();
+    openEarthMenu(r.left + r.width / 2, r.bottom - 2);
+  });
 }
 
 
@@ -2796,19 +2817,94 @@ function updateEnergyLegend(bd, links) {
    这正是洞微大限的行限次序（限顺行，每宫管年数见 DX_YEARS）。
    xi ＝ 该宫在 YAO_GONG_XIANG 十二句数组中的下标（该数组仍按 命/财帛/兄弟/… 的宫义次序排列）。 */
 const GONG_SHIER = [
-  { name: '命宫',   xi: 0,  zhu: '主自身：性格、形貌、生命力与一生总体格局' },
-  { name: '相貌宫', xi: 11, zhu: '主容颜、仪表与性情流露' },
-  { name: '福德宫', xi: 10, zhu: '主福分厚薄、心境享乐与贵人缘分' },
-  { name: '官禄宫', xi: 9,  zhu: '主事业、升迁、地位与功名' },
-  { name: '迁移宫', xi: 8,  zhu: '主出行、迁移、改业与四方发展' },
-  { name: '疾厄宫', xi: 7,  zhu: '主疾病、伤害与灾厄' },
-  { name: '夫妻宫', xi: 6,  zhu: '主婚姻、配偶与情感缘分之顺逆' },
-  { name: '奴弍宫', xi: 5,  zhu: '主奴仆、下属与供驱使之人' },
-  { name: '男女宫', xi: 4,  zhu: '主子女、后代与传承' },
-  { name: '田宅宫', xi: 3,  zhu: '主家宅、田土、产业与居住' },
-  { name: '财帛宫', xi: 2,  zhu: '主正财与物质资源：赚钱能力、用度盈亏' },
-  { name: '兄弟宫', xi: 1,  zhu: '主兄弟姐妹与同辈朋友：往来助力' }
+  { name: '命宫',   xi: 0,  gw: '命宫', zhu: '主自身：性格、形貌、生命力与一生总体格局' },
+  { name: '相貌宫', xi: 11, gw: '相貌', zhu: '主容颜、仪表与性情流露' },
+  { name: '福德宫', xi: 10, gw: '福德', zhu: '主福分厚薄、心境享乐与贵人缘分' },
+  { name: '官禄宫', xi: 9,  gw: '官禄', zhu: '主事业、升迁、地位与功名' },
+  { name: '迁移宫', xi: 8,  gw: '迁移', zhu: '主出行、迁移、改业与四方发展' },
+  { name: '疾厄宫', xi: 7,  gw: '疾厄', zhu: '主疾病、伤害与灾厄' },
+  { name: '夫妻宫', xi: 6,  gw: '妻妾', zhu: '主婚姻、配偶与情感缘分之顺逆' },
+  { name: '奴仆宫', xi: 5,  gw: '奴仆', zhu: '主奴仆、下属与供驱使之人' },
+  { name: '男女宫', xi: 4,  gw: '男女', zhu: '主子女、后代与传承' },
+  { name: '田宅宫', xi: 3,  gw: '田宅', zhu: '主家宅、田土、产业与居住' },
+  { name: '财帛宫', xi: 2,  gw: '财帛', zhu: '主正财与物质资源：赚钱能力、用度盈亏' },
+  { name: '兄弟宫', xi: 1,  gw: '兄弟', zhu: '主兄弟姐妹与同辈朋友：往来助力' }
 ];
+/* 曜 × 宫位古法断语（RULES 里 kind='gongwei' 的条目，《星命溯源·論七政躔次喜忌》：日、月各十二宫）。
+   RULES.structure 原本声明它「须先定命宫，本页不参与命中」，故一直未接入盘面；
+   这里按「本盘宫位次（GONG_SHIER[].gw）」取用，供「点某宫 → 直接断事」。
+   索引：GW_MAP[曜字][宫位key] = 规则条目。 */
+const GW_MAP = {};
+for (const r of RULES.rules) {
+  if (r.kind !== 'gongwei' || !r.gongwei) continue;
+  (GW_MAP[r.yao] || (GW_MAP[r.yao] = {}))[r.gongwei] = r;
+}
+/* 十二宫「总断」：逐宫的所主、古法断语（原文摘录）与取吉取凶要点——点某宫即先答这一宫。
+   d＝古法断语原文（摘录，非自撰）；s＝出处（书名·页码/行号）；k＝取吉取凶要点。
+   命宫条取《七政四余星经杂注》（果老诸赋未单列命宫总断，因命宫为「体」，故旁参）；
+   余十一宫取《七政四余古赋注（中册）》第42–46页果老〈看星节要八十一条·论十二宫所守〉。 */
+const GONG_DUAN = {
+  '命宫': {
+    d: '诸星环拱命宫，其人必贵；三方伤犯身命，终世亦贫。',
+    s: '七政四余星经杂注 · 行3365–3366',
+    k: '命宫无星则看宫主星——居七强兼庙旺主富贵；落五弱、留逆或化忌主贫贱。'
+  },
+  '财帛': {
+    d: '财帛宫人生受用之大端也；福禄照财帛、日月照财帛、身命二主临财及财星，逢生旺得令得时，皆是有财之人。',
+    s: '七政四余古赋注（中册）· 43页',
+    k: '福禄日月临照主财；刑囚暗耗守之主贫破（「财主失经、刑囚暗耗照财，是无受用之人」）；财帛不好再看田宅。'
+  },
+  '兄弟': {
+    d: '田财官福入其宫者，主兄弟豪富；空亡劫杀的杀入此，主兄弟贫贱；孤寡居之则孤鴈独行；刃雄居之必带疾；马星入则兄弟东西；咸池入则酒色迷恋。',
+    s: '七政四余古赋注（中册）· 44页',
+    k: '吉星入宫则和睦，凶星入宫如仇敌忿争。'
+  },
+  '田宅': {
+    d: '田宅之位，人生受用之源，或有福禄照田宅、日月照田宅、身命主坐田宅，是有财帛名望之人。',
+    s: '七政四余古赋注（中册）· 43–44页',
+    k: '惟喜土星居之则安稳丰腴；忌刑囚暗耗恶煞（「刑囚暗耗坐其宫併有恶杀加之，皆主破财，外家冷落，兄弟无情」）。'
+  },
+  '男女': {
+    d: '男女宫坐贵人、禄马、长生及有吉星照者，皆主得贵子及孝顺贤能之子。',
+    s: '七政四余古赋注（中册）· 44–45页',
+    k: '有火罗计孛及化刑囚暗耗，多子而老皆不得力、忤逆之儿，虽有若无；夜生太阳独照、昼生太阴独见男女宫，主无子。'
+  },
+  '奴仆': {
+    d: '奴宫原是禄马、贵人、长生、帝旺、殿驾、崇勋之地，不可以奴僕论；若的杀、劫杀、阳刃、亡神、死绝败地而身命又陷其上，是奔波工役无成之人。',
+    s: '七政四余古赋注（中册）· 45页',
+    k: '本星强旺吉星生之主奴僕丰盛；主弱奴强则奴婢侵凌；驿马在奴宫多主逃走。'
+  },
+  '妻妾': {
+    d: '妻宫是禄贵、长生、帝旺之地，皆主好妻美貌多能；如是死绝、的杀、劫杀之宫，皆不得好妻，更会孤寡恶宿，必主无妻。',
+    s: '七政四余古赋注（中册）· 45页',
+    k: '妻主坐强实殿驾主妻凌夫；妻星化值难、值咸池必多产厄；妻星落陷得金气有力则另有小妻谐老。'
+  },
+  '疾厄': {
+    d: '八杀之宫非特主人疾厄，亦主人一生操权，若权星、印星、禄星、福星居之，皆主其人有重权。',
+    s: '七政四余古赋注（中册）· 45页',
+    k: '火罗计孛、刑囚暗耗併会其上皆主重疾；无星而三方对照有凶星主带疾；入杀得令得时诸星扶之为贵格（「身命登八杀，科名须早发」）。'
+  },
+  '迁移': {
+    d: '迁移主星守命主迁居；游行在驿马主人过房出祖；游行遇吉星则出入见贵扶持，会恶杀及浮沉水孛，主飘蕩而亡归。',
+    s: '七政四余古赋注（中册）· 45页',
+    k: '以马星为主，用马须用鞍、有马须用拦，无拦为流马；天马地驿会多主走动。'
+  },
+  '官禄': {
+    d: '官禄宫不宜财星生旺守照及犯天雄阳刃诸杀，主人贪财坏名；官禄剋命，以名立身，以名败身；更不宜十宫逢罗，主人粗豪健讼。',
+    s: '七政四余古赋注（中册）· 45–46页',
+    k: '官星只宜文魁、印星、禄神守照为纯粹；杀星剋其宫名曰官鬼，主健讼、破家、无官食禄。'
+  },
+  '福德': {
+    d: '福德官禄二宫最喜吉星临照，若福居福、禄居禄、身命主入官福、日月照官福，皆是有福之人。',
+    s: '七政四余古赋注（中册）· 42页、46页',
+    k: '刑囚暗耗诸杀居福者，必刻薄凶狠、不仁不义之人；福、田、财三宫俱无吉星则庸常命断；土计坐福德主寡言性沉重。'
+  },
+  '相貌': {
+    d: '相貌之宫，乃人性情之所锺，善恶之乡也；吉星临照则为人君子，若杀星来据更与福德阳刃同会，必寡情薄德、不仁不义之徒。',
+    s: '七政四余古赋注（中册）· 46页',
+    k: '金清秀、木瘦长、水俊丽、火日紫黑夜红白、土肥白长大定形貌；主星会刑囚暗耗主破相暗疾。'
+  }
+};
 /* 星曜入宫释义：每曜十二句，下标次序为 命0·财帛1·兄弟2·田宅3·男女4·奴弍5·
    夫妻6·疾厄7·迁移8·官禄9·福德10·相貌11（经 GONG_SHIER[].xi 映射到宫位）。
    取义于星命术诸曜性情与所主，结合该宫分野；庙旺／失垣的强弱增减在渲染时另行标注。 */
@@ -2969,13 +3065,30 @@ const YAO_GONG_XIANG = {
   ]
 };
 let gongPanelOpen = -1, gongPanelSig = '';
-let birthJD = null;                    /* 生辰定盘后：命宫取本命日所居之宫（固定）；未设则随太阳当前宫动态 */
+let birthJD = null;                    /* 生辰定盘后命宫固定（依生时定法）；未设则随太阳当前所居之宫动态 */
 const gongPanel = document.createElement('div');
 gongPanel.id = 'gongPanel';
 gongPanel.className = 'hide';
 document.body.appendChild(gongPanel);
+
+/* —— 生时与命宫定法 ——
+   命宫不再只取「太阳所居之宫」，须入生时：《七政四余（全）》第208页
+   「以生时加在太阳所在之宫，顺数至卯，即是命宫」；第4607行「以生时加在太阳度上」。 */
+function trueSolarHourOf(jd) {          /* 指定时刻的真太阳时（时.分），与 trueHourNow 同口径但取参数 jd */
+  const c = jdToCalendar(jd + lonDeg * 4 / 1440 + equationOfTimeMin(jd) / 1440);
+  return c.h + c.mi / 60 + (c.s || 0) / 3600;
+}
+function isNightBirth() { const h = trueSolarHourOf(birthJD); return h < 6 || h >= 18; }
+/* 生时地支序号：子=0…亥=11（子时自 23:00 起） */
+function hourZhiOf(jd) { return Math.floor(((trueSolarHourOf(jd) + 1) % 24) / 2); }
+/* 命宫宫下标：把生时支「加」在太阳所居之宫，自生时支顺数至卯（卯＝地支序 3）；
+   地支顺行＝本盘 GONG 下标递减方向，故命中宫下标 = 太阳台下标 − 步数。 */
+function mingGongFrom(jd) {
+  const sg = gongIndex(norm360(sunApparentLon(jd)));
+  return (sg - ((3 - hourZhiOf(jd) + 12) % 12) + 24) % 12;
+}
 function mingGongIdx() {
-  if (birthJD !== null) return gongIndex(sunApparentLon(birthJD));
+  if (birthJD !== null) return mingGongFrom(birthJD);
   if (!snap) return 0;
   for (const b of snap.bodies) if (b.id === 'sun') return gongIndex(b.lon);
   return 0;
@@ -3025,6 +3138,32 @@ function renderGongPanel() {
     + '<button id="btnGongClose" title="关闭">×</button></div>';
   html += '<div class="gpShi">本盘宫位次：<em>' + GONG_SHIER[shi].name + '</em></div>';
   html += '<div class="gpZhu">' + GONG_SHIER[shi].zhu + '</div>';
+
+  /* 本宫所主 · 断事：点此宫就直接回答「这一宫管什么事、本盘断吉凶、古法条文怎么说」 */
+  const gwKey = GONG_SHIER[shi].gw;
+  const zSt0 = stOf(zhuCh);
+  let nPos = (zSt0.cls === 'good' ? 1 : 0), nNeg = (zSt0.cls === 'bad' ? 1 : 0);
+  for (const b of occ) { const s0 = stOf(b.char); if (s0.cls === 'good') nPos++; else if (s0.cls === 'bad') nNeg++; }
+  const grade = nPos > nNeg ? '吉' : (nNeg > nPos ? '凶' : '平');
+  const gradeCol = grade === '吉' ? '#8ed9a2' : (grade === '凶' ? '#e08a8a' : '#93a9c4');
+  const gBits = ['宫主' + yaoName(GONG_ZHU[GG.chen]) + clsTxt(zSt0)];
+  if (occ.length) gBits.push('入驻' + occ.map(function (b) { return b.char + clsTxt(stOf(b.char)); }).join('、'));
+  else gBits.push('本宫空，借三方四正论');
+  html += '<div class="gpSec">本宫所主 · 断事</div>'
+    + '<div class="gpKey">' + GONG_SHIER[shi].zhu + '　本盘总断：'
+    + '<b style="color:' + gradeCol + '">' + grade + '</b>（' + gBits.join('；') + '）</div>';
+  const gd = GONG_DUAN[gwKey];
+  if (gd) html += '<div class="gpKey">古法总断　' + esc(gd.d)
+      + '<span class="gpNone">　（' + esc(gd.s) + '）</span></div>'
+    + '<div class="gpKey">取吉取凶　' + esc(gd.k) + '</div>';
+  const gwLines = [];
+  for (const b of occ) {
+    const g = GW_MAP[b.char] && GW_MAP[b.char][gwKey];
+    if (g) gwLines.push('<b>' + b.char + '</b>（' + esc(g.src || '') + '）：' + esc(g.text || '') + '　' + esc(g.pl || ''));
+  }
+  html += '<div class="gpKey' + (gwLines.length ? '' : ' gpNone') + '">'
+    + (gwLines.length ? '古法断语　' + gwLines.join('<br />')
+      : '本宫无日、月入驻，古法未载该曜此宫专断；依上方各曜入宫释义与下方断语论。') + '</div>';
 
   /* 命/身/行限标记：本宫在本盘担当什么 */
   const marks = [];
@@ -3140,6 +3279,7 @@ function openGongPanel(i) {
   gongPanelSig = '';
   if (gejuOpen) toggleGejuView(false);   /* 与格局面板同槽位，互斥 */
   if (pingceOpen) closePingce();         /* 与评测面板同槽位，互斥 */
+  closeYaoPanel();                       /* 与曜影响面板同槽位，互斥 */
   gongPanel.className = '';
   for (let j = 0; j < 12; j++) {
     gongLabels[j].classList.remove('gongSel');
@@ -3184,7 +3324,7 @@ for (let j = 0; j < 12; j++) {
      与 30°÷管年 的均速相符）。
    · 小限（推年运法）：「以生年支加在命宫，逆数至本年太岁宫，是为小限」。
    · 月限（推月运法）：「以小限宫起生月，按月逆寻，是为月限」（月以节气月计，寅为正）。
-   设生辰定盘后：命宫＝本命日太阳所居之宫（固定），大限小限月限随之起；
+   设生辰定盘后：命宫依「以生时加在太阳所在之宫，顺数至卯」定（见 mingGongFrom），大限小限月限随之起；
    未设生辰则本区仅提示，盘面宫位仍随太阳动态。 */
 const DX_YEARS = [null, 10, 11, 15, 8, 7, 11, 4.5, 4.5, 4.5, 5, 5];  /* 下标＝限次（0命宫·1相貌·2福德…） */
 /* 年支：与盘面太岁同例（ganzhiYearOf 以立春定年，北京时间） */
@@ -3200,7 +3340,7 @@ function dayunCalc() {
      行限循环落到第 1 限（童限），于是显示成「今虚岁 -6 今行 1限·申宫（命宫限）1–18 岁」，看着像算错。 */
   if (simJD < birthJD) { dayunPreBirth = true; return null; }
   const sunB = norm360(sunApparentLon(birthJD));
-  const giM = gongIndex(sunB);
+  const giM = mingGongFrom(birthJD);   /* 命宫依生时定法（非「太阳所居之宫」），限自命宫起 */
   /* 出童限（起大限法·《七政四余（全）》188页）：生日逆数至太阳交中气（黄经30°整倍数），
      三日为一年、一日为四个月、一时为十日，外加十年。中气即宫界，本式以真实太阳时精确折算。 */
   const prevQi = findTermJD(birthJD, Math.floor(sunB / 30) * 30);
@@ -3272,8 +3412,17 @@ function birthStatusText() {
 }
 function applyBirth() {
   bStatusEl.textContent = birthStatusText();
+  /* 依赖定盘的按钮：未定盘即禁用并给出理由（不用弹窗提示），定盘后恢复 */
+  const hasB = birthJD !== null;
+  const needTip = '须先点「设为生辰」定盘';
+  const bp = el('btnPingce'), bg = el('btnGeju'), bc = el('btnBClr');
+  if (bp) { bp.disabled = !hasB; bp.title = hasB ? '命盘评测：命主·宿度命度主·身度主·恩用财难余奴·星体宫位状态·严格格局·断语' : needTip; }
+  if (bg) { bg.disabled = !hasB; bg.title = hasB ? '显示／隐藏严格成格常驻线与离子点云' : needTip; }
+  if (bc) bc.disabled = !hasB;
+  if (!hasB) { if (pingceOpen) closePingce(); if (gejuOpen) toggleGejuView(false); }
   if (gongPanelOpen >= 0) { gongPanelSig = ''; renderGongPanel(); }
   if (pingceOpen) { pingceSig = ''; pingceRender(); }
+  if (yaoOpenChar) { yaoSig = ''; renderYaoPanel(); }
 }
 el('btnSetB').addEventListener('click', function () {
   const num = function (id) { return parseInt(el(id).value, 10); };
@@ -3287,6 +3436,12 @@ el('btnSetB').addEventListener('click', function () {
   const mi = hasHMS ? Math.min(59, Math.max(0, isFinite(num('inMin')) ? num('inMin') : 0)) : 0;
   const ss = hasHMS ? Math.min(59, Math.max(0, isFinite(num('inSec')) ? num('inSec') : 0)) : 0;
   birthJD = dateToJD(y, m, d0, hh, mi, ss);
+  /* 定盘同时把盘面时刻拨到生辰那一刻（＝「跳转」并入「设为生辰」）：
+     出生瞬间即本命盘本身，不能再停在「现在」而与生辰脱节。
+     想看当前行限，随后点「回到现在」即可（大限按盘面时刻−生辰推）。 */
+  simJD = birthJD;
+  if (el('chkPauseJump').checked) setPaused(true);
+  calDirty = false;
   saveBirth(birthJD);
   applyBirth();
 });
@@ -3364,6 +3519,7 @@ function gejuList() {
     try { ev = evalCond(r.c, ctx); } catch (e) { continue; }
     if (ev.ok) out.push({
       id: r.id, ge: r.ge || String(r.text || '').slice(0, 4),
+      name: r.name || '', pl: r.pl || '',
       verdict: r.verdict || '', yao: r.yao || '', why: ev.why, bad: gejuIsBad(r)
     });
   }
@@ -3482,6 +3638,10 @@ gejuStyle.textContent = [
   '.gejuCard .who{color:#ffd98a;font-size:12px;margin-top:2px}',
   '.gejuCard .why{color:#8fabc9;font-size:11.5px;margin-top:2px}',
   '.gejuCard .vd{color:#bcd2ee;font-size:11.5px;margin-top:1px}',
+  '.gejuCard .pl{color:#a9c6e6;font-size:12px;margin-top:3px;line-height:1.65;border-top:1px dashed #24354f;padding-top:4px}',
+  '.gejuCard .plk{color:#7fe0c8;font-size:11px;letter-spacing:.5px;margin-right:5px}',
+  '.gejuIntro{color:#7d94b3;font-size:11.5px;line-height:1.7;padding:2px 4px 6px;border-bottom:1px solid #1b2a41;margin-bottom:4px}',
+  '.gejuIntro b{color:#a8c8ee;font-weight:600}',
   '.gejuEmpty{color:#7d94b3;font-size:12px;padding:10px 4px;line-height:1.8}',
   '.lbl.gejuHot{color:#f4faff !important;text-shadow:0 0 5px #9fd8ff,0 0 14px rgba(150,215,255,.95),0 0 26px rgba(110,180,255,.6) !important}'
 ].join('');
@@ -3560,15 +3720,17 @@ function renderGejuPanel() {
     gejuPanelSig = '';
     return;
   }
-  let html = '';
+  let html = '<div class="gejuIntro">「成格」＝该曜组在本盘<b>全部</b>满足古法条件才成立（缺一即不成）。'
+    + '每格首行「此格何意」为白话释义，其后为古法依据与断语；点卡片或盘上白线可定位参与诸曜。</div>';
   for (const it of list) {
     const who = gejuChars(it.yao).map(function (c) { return CH2NAME[c] || c; }).join('　');
     html += '<div class="gejuCard' + (it.id === gejuActiveId ? ' on' : '') + '">'
       + '<span class="tag ' + (it.bad ? 'bad' : 'good') + '">' + (it.bad ? '凶' : '吉') + '</span>'
-      + '<span class="nm">' + escHtml(it.ge) + '</span>'
+      + '<span class="nm">' + escHtml(it.name || it.ge) + '</span>'
       + (who ? '<div class="who">因　' + escHtml(who) + '</div>' : '')
-      + (it.why ? '<div class="why">' + escHtml(it.why) + '</div>' : '')
-      + (it.verdict ? '<div class="vd">' + escHtml(it.verdict) + '</div>' : '')
+      + (it.pl ? '<div class="pl"><span class="plk">此格何意</span>' + escHtml(it.pl) + '</div>' : '')
+      + (it.why ? '<div class="why">古法依据　' + escHtml(it.why) + '</div>' : '')
+      + (it.verdict ? '<div class="vd">断语　' + escHtml(it.verdict) + '</div>' : '')
       + '</div>';
   }
   gejuListEl.innerHTML = html;
@@ -3593,6 +3755,7 @@ function toggleGejuView(force) {
     btnChartEl.className = '';
     closeGongPanel();
     if (pingceOpen) closePingce();   /* 与评测面板同槽位，互斥 */
+    closeYaoPanel();                 /* 与曜影响面板同槽位，互斥 */
     ensureGejuView();
     gejuPanelSig = '';
     renderGejuPanel();
@@ -3979,7 +4142,7 @@ function pingceCalc() {
   const clsCol = st => st.cls === 'good' ? '#8ed9a2' : (st.cls === 'bad' ? '#e08a8a' : '#93a9c4');
   /* —— 命宫·命度·命度主 —— */
   const sunB = norm360(sunApparentLon(birthJD));
-  const giM = gongIndex(sunB);
+  const giM = mingGongFrom(birthJD);               /* 命宫依生时定法（《（全）》208页），非「太阳所居之宫」 */
   const mingZhi = GONG[giM].chen;
   const mingDuLon = giM * 30 + (sunB % 30);
   const mingSu = suOf(simJD, mingDuLon);
@@ -4107,15 +4270,17 @@ function pingceRender() {
     rowOf('恩星（生我/所喜）', P.enStars) + rowOf('用星（我生）', P.yongStars) + rowOf('财星（我克）', P.caiStars) +
     rowOf('难星（克我/所怕）', P.nanStars) + rowOf('余奴（同行之余）', P.yuYao ? [P.yuYao] : []) + '</table></div>';
   /* 十一曜总表 */
-  h += '<div class="pcSec"><div class="pcH">十一曜状态总表</div><table class="pcTb"><tr><th>曜</th><th>黄经</th><th>宫</th><th>行度</th><th>状态</th><th>分</th><th>角色</th></tr>';
+  h += '<div class="pcSec"><div class="pcH">十一曜状态总表</div><table class="pcTb"><tr><th>曜</th><th>黄经</th><th>宫</th><th>行度</th><th>状态</th><th>分</th><th>角色</th><th>影响</th></tr>';
   for (const b of snap.bodies) {
     const st = stateMap[b.id] || evalYaoState(b.char, ctx);
     const mw = miaoWang(b.char, ctx.zh(b.char));
     const sy = shiYuan(b.char, ctx.zh(b.char));
     const dir = b.rate < -0.0055 ? '逆' : (b.rate < 0 ? '留' : '顺');
+    const M = impactModel(b.char, P);       /* 六层模型速判：只取等第入表，详细点「影响」展开 */
     h += '<tr><td style="color:' + b.color + '">' + b.char + '</td><td>' + norm360(b.lon).toFixed(1) + '°</td><td>' + ctx.zh(b.char) + '</td><td>' +
       dir + b.rate.toFixed(2) + '</td><td>' + (mw || (sy ? '失垣' : '—')) + '</td><td style="color:' + P.clsCol(st) + '">' + st.score + '</td><td>' +
-      (P.roles[b.char] ? P.roles[b.char].join('/') : '') + '</td></tr>';
+      (P.roles[b.char] ? P.roles[b.char].join('/') : '') + '</td><td><span class="pcLink" data-ch="' + b.char +
+      '" style="color:' + M.gradeCol + '">' + M.grade + '</span></td></tr>';
   }
   h += '</table></div>';
   /* 十二宫入驻 */
@@ -4135,8 +4300,10 @@ function pingceRender() {
   h += '<div class="pcSec"><div class="pcH">成格清单（严格：全部条件匹配才算）</div>';
   if (!gejuLastList.length) h += '<div class="pcTx">无格局成立。</div>';
   for (const g of gejuLastList) {
-    h += '<div class="pcGj"><b style="color:' + (g.bad ? '#e08a8a' : '#8ed9a2') + '">' + esc(g.ge) + '</b>（' + esc(g.verdict || '') + '）　' +
-      esc(gejuChars(g.yao).join(' ')) + '<div class="pcWhy">' + esc(g.why) + '</div></div>';
+    h += '<div class="pcGj"><b style="color:' + (g.bad ? '#e08a8a' : '#8ed9a2') + '">' + esc(g.name || g.ge) + '</b>（' + esc(g.verdict || '') + '）　' +
+      esc(gejuChars(g.yao).join(' ')) +
+      (g.pl ? '<div class="pcPl"><span class="pcPlk">此格何意</span>' + esc(g.pl) + '</div>' : '') +
+      '<div class="pcWhy">' + esc(g.why) + '</div></div>';
   }
   h += '</div>';
   /* 断语 */
@@ -4145,11 +4312,16 @@ function pingceRender() {
   h += '<div class="pcSec"><div class="pcNote">出处：《七政四余（全）》13页(十九)恩用仇难躔次得失·22页(三十)(三十一)安命度安身宫·23页(三十四)宫主度度主·18页(三十三)余奴犯主；《七政四余择日》量天尺命度法；《网络文献续编·果老星宗格局》243-246·641-649。命度取日躔宫度直下命宫（简化口径），古法全式须生时上升度。</div></div>';
   pingcePanel.innerHTML = h;
   document.getElementById('btnPingceClose').addEventListener('click', closePingce);
+  /* 「影响」列：委托到 openYaoPanel（面板随 innerHTML 重建，用委托避免重复绑定） */
+  for (const a of pingcePanel.querySelectorAll('.pcLink')) {
+    a.addEventListener('click', function () { openYaoPanel(this.dataset.ch); });
+  }
 }
 function openPingce() {
   pingceOpen = true;
   if (gongPanelOpen >= 0) closeGongPanel();
   if (gejuOpen) toggleGejuView(false);
+  closeYaoPanel();                 /* 与曜影响面板同槽位，互斥 */
   pingcePanel.className = '';
   pingceSig = '';
   pingceRender();
@@ -4168,10 +4340,881 @@ function pingceFrame() {
 }
 btnPingce.addEventListener('click', function () { pingceOpen ? closePingce() : openPingce(); });
 
-/* 气息测地积分小窗的最小化开关（用户指定：与「评测」按钮同置时间行）。
-   收起＝窗口只留标题行；展开＝恢复 canvas／图例／数显。 */
+/* ================= 曜对命主的影响 · 六层模型 =================
+   六层＝《宫星作用体系.md》「作用发生的六个层次」：①命身归属 ②星有地 ③星应时
+   ④经纬宫度 ⑤拱夹照会 ⑥身命飞化。逐层判定 → 加权合计 → 吉凶等第 → 总断。
+   四时喜忌表取自《七政四余古赋注（上册）》145–158页「七政四时论」逐曜正文；
+   四余（罗计炁孛）随其本气五行取该行四时论。 */
+const SI_SHI = {
+  '木': {
+    '春': { xi: ['火', '罗', '日'], ji: ['水', '孛'],
+      t: '孟春微寒未退，借火罗温其枝则舒泰，与太阳同宫名「向阳花木」必早占鳌头；水孛相逢则根损枝枯。春末夏初见金琢削，方成栋梁（「木繁而无金琢削，纵荣华而末岁孤穷」）。' },
+    '夏': { xi: ['水', '孛'], ji: ['火', '日'],
+      t: '夏木根燥叶干，喜水孛济润而苏醒欣欣（荣华之人）；昼生忌躔四火之度、又不宜与太阳交互，日烈木焦，不足论也。' },
+    '秋': { xi: ['水'], ji: ['火', '罗', '日'],
+      t: '夏末秋初气脉已虚：昼生忌躔四火之度、不宜与日交互；昼生躔四水之度而与日交光，是上下济润、木之秀丽，反主精神富贵。九月寒露遇火罗助，自能变化。秋当成实，水非滋木之时。' },
+    '冬': { xi: ['日', '火', '罗'], ji: ['水', '孛'],
+      t: '冬木萧疏：昼生与太阳交光名「日边红杏」，布占先魁；日生遇火罗为「寒谷回春」，富贵双全。夜生躔四土之度又逢水孛冻折，穷之极矣。' }
+  },
+  '火': {
+    '春': { xi: ['木', '炁', '罗', '月'], ji: ['金', '水', '孛'],
+      t: '正二月寒气未消，最喜火罗木炁互度，见太阴夜生则光彩（火本酷烈，逢木慈祥，以善化恶）。春末夏初火入水宫、水入火地名「桃花滚浪」，名利双清；与水孛同行则受克（逢土有救＝子来救母），见金为党鬼、气脉虚。' },
+    '夏': { xi: ['水', '孛'], ji: ['木', '炁'],
+      t: '夏末秋初秋阳杲杲，借水以济其盛乃刚柔变化；最不宜与木炁同照、火罗朝拱太阳而缺水，则万物摧枯——「火焰而无水淘溶，纵发而早年夭折」。一水贯日、一孛济火则淋漓普济，精神宛转富贵。' },
+    '秋': { xi: ['水', '孛'], ji: ['木', '炁'],
+      t: '秋令之火性息体休：得木生则有复明之庆（但与木炁同照仍忌）；秋阳正须水济，故喜水孛。土重掩光、金多损势。' },
+    '冬': { xi: ['木', '炁'], ji: ['水', '孛', '土', '计', '罗'],
+      t: '冬令黑帝司权、水德用事，火已失时，最喜木炁相扶；夜火贯日加以禄印则反能富贵。最忌水孛、土计、罗睺交互，火之气脉虚矣；一木飞来泄水之气、助火出色（水生木、木生火），命脉健而为贵。' }
+  },
+  '土': {
+    '春': { xi: ['日', '火', '罗'], ji: ['水', '孛'],
+      t: '春令之土昼生与太阳交会——阳和一点，天地皆春；夜生最喜火照，土德朝拱太阳，火土俱名精彩、代日行权。春初土计不宜与水孛交会（泥逢泛滑），躔四水之度又逢水孛则「土陷山崩」。' },
+    '夏': { xi: ['水', '孛'], ji: ['火', '罗', '日'],
+      t: '夏令之土最喜水孛同宫润其精神（万物长养结实，富贵无言）。夏末初秋不宜与罗火交会（火燥土烈），昼生与太阳交辉亦为日烈土焦；得水孛济润则上生下润、大降吉祥。' },
+    '秋': { xi: ['水', '孛'], ji: ['火', '罗', '日'],
+      t: '夏末初秋之土，忌罗火交会与日烈土焦，须水孛济润（无水则万物摧枯、一落千丈）。' },
+    '冬': { xi: ['日', '木', '炁', '火', '罗'], ji: ['水', '孛'],
+      t: '冬令之土最喜日温，自能变化；夜生得木炁、火罗佐助，朝拱太阳皆主文武富贵。倘与水孛同躔极主贫寒；得一木飞来泄水之气、又遇火飞来合度，则精神辗转为妙。' }
+  },
+  '金': {
+    '春': { xi: ['火', '罗', '日'], ji: ['水', '孛'],
+      t: '春令之金不怕火罗，借火罗温助谓之「炼金成器」、变化气质；春初无火日温之则极主贫寒。不宜与水孛同行（性柔体弱，水盛增寒）。' },
+    '夏': { xi: ['水'], ji: ['罗', '火'],
+      t: '夏令之金不宜生水，就赖水以制其刚（烁石逢源，主利名显达）；夏令罗火相逢则火炎金烁，贫夭居多。' },
+    '秋': { xi: ['火', '罗', '水'], ji: ['土', '计'],
+      t: '秋令白帝司权，金神用事不怕火罗而克，不喜土计而生；借水映色——「金白水清」，最喜秋生者贵，金水朝拱太阳最为奇特。金坚而无火锻炼，终见凶顽。' },
+    '冬': { xi: ['日', '火', '罗', '土'], ji: ['水', '孛'],
+      t: '冬令寒凝冻结：昼喜日光温之，夜喜火罗照之，定主文职蒙恩；昼土逢阳以温其土、火罗拱互（「金罗相会」）则阃外司权。不宜与水孛交互，水冷故也，极主贫寒。' }
+  },
+  '水': {
+    '春': { xi: ['木', '炁', '火', '罗', '日', '孛'], ji: ['金'],
+      t: '春令之水冰霜冻冷，借木炁火罗温之自能变化；昼生水孛与太阳同行名「光霁澄彻」，主台省扬名（昼生为妙，夜生贫寒）。所忌金星交互。二三月天气畅和、遇水济润则发生万物；四五月泛滥无定，必无福矣。' },
+    '夏': { xi: ['土', '计'], ji: ['火', '罗', '日'],
+      t: '夏令之水洪水滔天，得土堤防最为奇妙——「水盛而无土堤防，遂归愚浊」；土旺不以为倒限，反主名利发达。六月之水最怕火日罗枯涸。' },
+    '秋': { xi: ['土', '计'], ji: ['火', '木'],
+      t: '秋令之水七八月既济万物：借土堤防而不泛滥、又能润土结实万物，清源可爱、富贵荣华；若受克泄则气脉虚，不为福。' },
+    '冬': { xi: ['火', '日', '木', '土'], ji: ['金'],
+      t: '冬令之水秉令行权，得火为上令、土为次令、太阳佐之方可言令；冬水自得其时，不用金生——使之见金反为无义（道义相忘），唯喜在于火木也。' }
+  },
+  '日': {
+    '春': { xi: ['水', '金', '木', '炁', '火', '罗'], ji: ['土', '计', '孛'],
+      t: '春天之日秀丽，万物得宜，最妙三台引护、水金佐之，谓之「向阳花红」；木火炁罗交会朝拱则代日行权、天降吉祥。最不宜云雨之星（水孛土计金）与日交会，枝叶繁茂掩日光辉，不能变化。' },
+    '夏': { xi: ['水', '孛'], ji: ['木', '炁', '火', '罗'],
+      t: '夏令之日火烈阳刚，人皆可畏；最喜水孛同行，济润变化乃是晴霁兼行、万物精彩，富贵自然。最怕木炁火罗朝拱太阳，万物摧枯、一陷千丈。' },
+    '秋': { xi: ['金', '水'], ji: ['火', '罗'],
+      t: '秋天之日方而不圆、六亲早离，最喜金水辅日而行，方是淋雨济润、万物苏茂，精神可爱富贵荣华；如见火日迎照、无水济润，乃火炎未退，为祸最惨。' },
+    '冬': { xi: ['木', '金', '火', '罗'], ji: ['水', '孛', '土', '计'],
+      t: '冬天之日温暖熙熙，午时为福之大；夜生喜木金火罗朝日，皆有光霁、文武双全。不宜见水孛土计为云雨之星掩日光彩，限行遇之为祸最重；若水日同行得木飞来、火飞来合度，则太阳光霁，富贵。' }
+  },
+  '月': {
+    '春': { xi: ['日', '木', '炁', '火', '罗'], ji: ['土', '计', '孛'],
+      t: '春天之月最喜太阳逢时——阳辉明暖、丰盈财福；夜月见木则万木清清、文章秀发，夜月见火为「火月交辉」，人生富贵。不宜与土计交会（云掩月华，不足论），又不宜孛宠之星随月，掩太阴之光、为祸甚重。' },
+    '夏': { xi: ['木', '炁', '水', '孛', '火', '罗'], ji: ['土', '计'],
+      t: '夏天之月扬辉布暖：水孛润之而不寒、火罗照之而不燥，喜木炁以相扶，忌土计以掩蚀；金虽力薄，夜诞而喜月与同行。' },
+    '秋': { xi: ['水', '金', '孛', '炁'], ji: ['罗', '火', '土', '计'],
+      t: '秋天之月光辉朗耀、普照乾坤，逢水相涵如碧潭之皎洁、得金为助则精神倍佳；弦望之际岂宜罗火争光，晦朔之期那堪土计相迎。见孛者为「太乙抱蟾」而食禄非凡，会炁者乃「祥云捧月」，必清高而显贵。' },
+    '冬': { xi: ['木', '炁', '日', '火', '罗'], ji: ['水', '孛', '土', '计', '金'],
+      t: '冬天之月严凝可畏、孤洁有余而欠舒：所忌者水孛相逢，最嫌者土计关照，金星伴之无情，木气扶之安有益。生于昼者借日光而布暖，诞于夜者伏火罗以助辉。' }
+  }
+};
+const WANG_SEASON = { '木': '春', '火': '夏', '土': '四季', '金': '秋', '水': '冬' };
+const SI_SHI_SEASON_OF = ['冬', '春', '春', '春', '夏', '夏', '夏', '秋', '秋', '秋', '冬', '冬'];
+function siShiSeason(jd) { return SI_SHI_SEASON_OF[jieMonthZhi(jd)]; }          /* 春/夏/秋/冬（节气月） */
+function siShiSub(jd) { return ['孟', '仲', '季'][(jieMonthZhi(jd) + 1) % 3]; } /* 孟/仲/季 */
+const SI_SHI_SRC = '《七政四余古赋注（上册）》145–158页·七政四时论';
+const CLS_COL = st => st.cls === 'good' ? '#8ed9a2' : (st.cls === 'bad' ? '#e08a8a' : '#93a9c4');
+const CLS_TXT = st => st.cls === 'good' ? '吉' : (st.cls === 'bad' ? '凶' : '平');
+
+/* 六层判定：输入曜字符 + pingceCalc() 结果，输出逐层判定、加权合计、吉凶等第、总断与出处 */
+function impactModel(ch, P) {
+  const ctx = P.ctx, chen = ctx.zh(ch), st = P.stOf(ch);
+  const role = P.roles[ch] || [];
+  const layers = [];
+  let score = 0;
+  const add = (name, cls, w, v, txt, src) => {
+    score += (cls === 'good' ? 1 : (cls === 'bad' ? -1 : 0)) * w;
+    layers.push({ name: name, cls: cls, w: w, v: v, txt: txt, src: src });
+  };
+  const shiIdx = i => GONG_SHIER[(P.giM - i + 12) % 12].name;   /* 宫位次名（自命宫顺行） */
+  const sameGong = y => ctx.gi(y) === ctx.gi(ch);
+  const near12 = y => Math.abs(norm180(ctx.m[y].lon - ctx.m[ch].lon)) <= 12;
+  const d6 = P.dayun;
+  const xianZhu = d6 ? WX_MAIN_YAO[GONG_ZHU[GONG[d6.dxIdx].chen]] : null;
+  const roleBad = role.indexOf('难') >= 0 || role.indexOf('余奴') >= 0;
+
+  /* ① 命身归属：此曜在本盘担任何种身份（宫有主／命身） */
+  if (role.indexOf('命主') >= 0) add('①命身归属', 'good', 3, '命主（命宫宫主·管库星）',
+    ch + '即<b>' + P.mingZhi + '宫宫主</b>，为一生祸福之司命者；今飞居<b>' + chen + '宫</b>（' + shiIdx(ctx.gi(ch)) + '）——宫主飞入某宫，则该宫之事为一生所重（飞宫断）。',
+    '《七政四余（全）》23页(三十四)宫主度度主；《星学大成》卷六命宫主星歌·卷廿四宫主飞入休囚');
+  else if (role.indexOf('身主') >= 0) add('①命身归属', 'good', 3, '身主（身宫宫主）',
+    ch + '即' + P.shenZhi + '宫（身宫）宫主，主躯体作为之力；今居' + chen + '宫，一身之动静由此引动。',
+    '《七政四余（全）》22页(三十一)「月为身宫，宫主星即为身主星」；《星学大成》卷六身宫主星歌');
+  else if (role.indexOf('命度主') >= 0) add('①命身归属', st.cls === 'bad' ? 'bad' : 'good', 3, '命度主',
+    ch + '即<b>命度主</b>（' + P.duZhu + '）——命基所在：' + (st.cls === 'bad'
+      ? '今失陷受伤，命基不足，须恩用诸曜扶之。'
+      : '今居' + chen + '宫得地，命基稳固，一生格局可恃。'),
+    '《七政四余（全）》22页(三十)安命度·13页(十九)躔次得失');
+  else if (role.indexOf('身度主') >= 0) add('①命身归属', st.cls === 'bad' ? 'bad' : 'good', 2, '身度主',
+    ch + '即身度主（生月所躔宿度度主）：' + (st.cls === 'bad' ? '今失陷，劳而少功。' : '今得地，作为有力。'),
+    '《七政四余（全）》22页(三十一)安身宫');
+  else if (role.indexOf('恩') >= 0) add('①命身归属', 'good', 2, '恩星（生我／所喜）',
+    ch + '为命度主之<b>恩星</b>——生我有情、护命度主；' + (st.cls === 'good' ? '今又得地，生扶有力，吉。'
+      : (st.cls === 'bad' ? '惜今失陷，恩力减，逢之未必得力。' : '今居平安，生扶有限。')),
+    '《七政四余（全）》13页(十九)恩用仇难躔次得失');
+  else if (role.indexOf('用') >= 0) add('①命身归属', 'good', 1.5, '用星（我生）',
+    ch + '为命度主之<b>用星</b>（我生）——泄我秀气，聪明才华之所出；' + (st.cls === 'bad' ? '今失陷，秀气不足，恐虚名无实。' : '今居' + chen + '宫，才华可用。'),
+    '《七政四余（全）》13页(十九)');
+  else if (role.indexOf('财') >= 0) add('①命身归属', 'good', 1.5, '财星（我克）',
+    ch + '为命度主之<b>财星</b>（我克）——我克者为财，主钱帛妻财；' + (st.cls === 'bad' ? '今失陷，财源不聚。' : '今居' + chen + '宫，财源可求。'),
+    '《七政四余（全）》13页(十九)');
+  else if (role.indexOf('难') >= 0) add('①命身归属', 'bad', 3, '难星（克我／所怕）',
+    ch + '为命度主之<b>难星</b>——克我之急，逢之则伤病忧患；' + (ctx.gi(ch) === P.giM
+      ? '今又<b>临命宫</b>，克我尤紧，最宜防。'
+      : (st.cls === 'bad' ? '今受制（失陷），难轻，不为大害。'
+        : (st.cls === 'good' ? '今反得地，难势猖獗，克命有力，须忌。' : '今居平常。'))),
+    '《七政四余（全）》13页(十九)恩用仇难；《古赋注》「难星临命」条');
+  else if (role.indexOf('余奴') >= 0) add('①命身归属', 'bad', 2, '余奴（同行之余）',
+    ch + '为命度主之<b>余奴</b>——与主同气之四余；' + (ctx.gi(ch) === ctx.gi(P.mdzYao) || Math.abs(norm180(ctx.m[ch].lon - ctx.m[P.mdzYao].lon)) <= 12
+      ? '今与命度主同宫／近度，是<b>余奴犯主</b>——「纵吉为凶」，不享福发财之命。'
+      : '今不与命度主同宫犯度，奴不反主，吉。'),
+    '《七政四余（全）》18页(三十三)「十二宫主，第一怕余奴犯主」；《网络文献续编》649');
+  else add('①命身归属', 'mid', 0, '无命身恩难角色',
+    '此曜不属命主／身主／命度主／身度主／恩用财难余奴六类，其影响纯以星宫时位（②–⑥）论。',
+    '《宫星作用体系.md》一·①宫有主');
+
+  /* ② 星有地：庙旺／失垣／条文分 */
+  const mw = miaoWang(ch, chen), sy = shiYuan(ch, chen);
+  add('②星有地', st.cls, 2, (mw || (sy ? '失垣' : '常位')) + '·分 ' + st.score,
+    ch + '居' + chen + '宫：' + (mw ? '入<b>' + mw + '</b>（得地升殿），力足可用。'
+      : (sy ? '为<b>失垣</b>落陷，力弱，吉减凶增。' : '无庙陷明文，为常位。')) +
+    '状态分 ' + st.score + '（' + CLS_TXT(st) + '）。古法「得地不问居强弱，失时休夸强最雄」——③时令之判重于宫位强弱。',
+    '《星学大成》卷一庙旺克忌歌·卷三得地失时星歌·卷三十主星入庙旺；庙旺表见《七政四余知识结构.md》');
+
+  /* ③ 星应时：四时调候（本命节气月令 × 本盘喜忌曜当面） */
+  const ssKey = SI_SHI[ch] ? ch : YAO_WUXING[ch];
+  const season = siShiSeason(birthJD), sub = siShiSub(birthJD);
+  const dayNight = isNightBirth() ? '夜生' : '昼生';
+  const tab = ssKey && SI_SHI[ssKey] ? SI_SHI[ssKey][season] : null;
+  let deShiVar = null;
+  if (tab) {
+    deShiVar = (WANG_SEASON[ssKey] === season) || (ssKey === '土' && '辰未戌丑'.indexOf(chen) >= 0);
+    const hitXi = tab.xi.filter(y => y !== ch && (sameGong(y) || near12(y)));
+    const hitJi = tab.ji.filter(y => y !== ch && (sameGong(y) || near12(y)));
+    const shiTxt = WANG_SEASON[ssKey] ? (deShiVar ? '得时' : '失时') : '日月不论旺相';
+    const cls3 = hitJi.length ? 'bad' : (hitXi.length ? 'good' : (deShiVar ? 'good' : 'mid'));
+    let t3 = '本命生于' + season + '令之' + sub + '（' + dayNight + '，真太阳时取本命）。' + tab.t;
+    if (hitJi.length) t3 += '<br /><b style="color:#e08a8a">本盘忌曜当面：' + hitJi.map(yaoName).join('、') + '（同宫或近度 ≤12°）</b>——时令所忌，凶应尤切。';
+    else if (hitXi.length) t3 += '<br /><b style="color:#8ed9a2">本盘喜曜当面：' + hitXi.map(yaoName).join('、') + '（同宫或近度 ≤12°）</b>——时令所喜，得扶助之力。';
+    else t3 += '<br />本盘喜忌诸曜皆不同宫近度，' + (deShiVar ? '唯本曜当令得时，自能成用。' : '本曜又失时，力薄，须俟行限引之。');
+    add('③星应时', cls3, 2, season + '令·' + sub + '（' + dayNight + '）·' + shiTxt +
+      (hitJi.length ? '·忌曜当面' : (hitXi.length ? '·喜曜当面' : '')), t3, SI_SHI_SRC);
+  } else add('③星应时', 'mid', 0, '无四时条文', '本曜无对应四时论条目（本库未录），故得不判。', SI_SHI_SRC);
+
+  /* ④ 经纬宫度：宫五行关系 × 所躔宿度五行 */
+  const gwx = GONG_WUXING[chen], ywx = YAO_WUXING[ch];
+  const suNow = suOf(simJD, ctx.m[ch].lon);
+  let relSu = '', cls4 = 'mid';
+  if (suNow.attr === '日' || suNow.attr === '月') { relSu = '所躔' + suNow.name + '宿，本度属' + suNow.attr + '（房虚昴星／心危毕张），不套五行生克'; }
+  else if (suNow.attr === ywx) { relSu = '度同气（' + ywx + '度），宫度同气相助'; cls4 = 'good'; }
+  else if (SHENG_ME[ywx] === suNow.attr) { relSu = '度生曜（' + suNow.attr + '生' + ywx + '），入此为得次'; cls4 = 'good'; }
+  else if (KE_OF[ywx] === suNow.attr) { relSu = '度克曜（' + suNow.attr + '克' + ywx + '），入此为失次'; cls4 = 'bad'; }
+  else if (SHENG_OF[ywx] === suNow.attr) { relSu = '曜生度（' + ywx + '生' + suNow.attr + '），泄气'; }
+  else { relSu = '曜克度（' + ywx + '克' + suNow.attr + '），耗神'; }
+  if (cls4 === 'mid') {
+    if (ywx === gwx || SHENG_OF[gwx] === ywx) cls4 = 'good';                        /* 同气 / 宫生曜 */
+    else if (KE_OF[ywx] === gwx || KE_OF[gwx] === ywx) cls4 = 'bad';                /* 宫克曜 / 曜克宫 */
+  }
+  add('④经纬宫度', cls4, 1, '宫属' + gwx + relGcl(gwx, ch) + '·' + suNow.name + '度' + suNow.attr,
+    '经＝宫度五行，纬＝星体：' + chen + '宫属' + gwx + gongRelPhrase(ch, gwx) + '；' + ch + '（' + ywx + '）今躔'
+    + suNow.name + '宿' + suNow.deg.toFixed(1) + '°，' + relSu + '。' +
+    '「经克纬、纬克经之力不及星体直接相克战」——度上关系轻于曜曜同宫相见。',
+    '《星学大成》卷五宫度主用·各度喜忌说；《宫星作用体系.md》一·④经纬宫度；《七政四余择日》量天尺宿度');
+
+  /* ⑤ 拱夹照会：对命宫的四正相位与双侧夹持 */
+  const dToMing = (ctx.gi(ch) - P.giM + 12) % 12;
+  const ph = dToMing === 0 ? '临命（与命宫同宫，为「居」）'
+    : dToMing === 6 ? '对照命宫（冲）'
+      : (dToMing === 4 || dToMing === 8) ? '三合拱命'
+        : '不犯命宫相位（距命宫 ' + dToMing + ' 宫）';
+  const inAspect = dToMing === 0 || dToMing === 4 || dToMing === 6 || dToMing === 8;
+  const flankers = snap.bodies.filter(a => {
+    if (a.char === ch) return false;
+    const da = norm180(ctx.m[a.char].lon - ctx.m[ch].lon);
+    return Math.abs(da) <= 10 && snap.bodies.some(b2 => b2.char !== ch && b2.char !== a.char
+      && Math.abs(norm180(ctx.m[b2.char].lon - ctx.m[ch].lon)) <= 10 && da * norm180(ctx.m[b2.char].lon - ctx.m[ch].lon) < 0);
+  });
+  add('⑤拱夹照会', inAspect ? (roleBad ? 'bad' : 'good') : 'mid', 1.5, ph + (flankers.length ? '·被夹' : ''),
+    '本曜居' + chen + '宫，' + ph + '。' + (flankers.length ? '又有' + flankers.map(b => b.char).join('、') + '分居两侧 ≤10°（夹），其力被束。' : '') +
+    (inAspect ? '相位直接作用于命宫：' + (roleBad ? '凶曜临／冲／拱命，为患尤显。' : '吉曜临／冲／拱命，福力直达命主。')
+      : '对命主无直接相位，须由行限或飞宫引动。'),
+    '《网络文献续编·果老星宗格局》曜星定格（拱夹照会包犯）；《成格局.md》57格条件');
+
+  /* ⑥ 身命飞化：命主飞宫 · 限宫之主 · 余奴犯主 */
+  const tag6 = [];
+  let cls6 = 'mid';
+  if (ch === P.mingZhuYao) { tag6.push('命主飞宫'); if (st.cls === 'good') cls6 = 'good'; else if (st.cls === 'bad') cls6 = 'bad'; }
+  if (ch === P.mdzYao) tag6.push('命度主本体');
+  if (d6 && ch === xianZhu) { tag6.push('限宫之主'); if (st.cls === 'good') cls6 = 'good'; else if (st.cls === 'bad') cls6 = 'bad'; }
+  if (d6 && ctx.gi(ch) === d6.dxIdx) tag6.push('曜落大限宫');
+  if (d6 && ctx.gi(ch) === d6.xxIdx) tag6.push('曜落小限宫');
+  if (ch === P.yuYao && (ctx.gi(ch) === ctx.gi(P.mdzYao) || Math.abs(norm180(ctx.m[ch].lon - ctx.m[P.mdzYao].lon)) <= 12)) { tag6.push('余奴犯主'); cls6 = 'bad'; }
+  const t6 = [];
+  if (tag6.indexOf('命主飞宫') >= 0) t6.push('命主飞居' + chen + '宫（' + shiIdx(ctx.gi(ch)) + '）——宫主飞入某宫，则两宫之事互相勾连。');
+  if (tag6.indexOf('命度主本体') >= 0) t6.push('此曜即命度主本体，吉凶直关命基厚薄。');
+  if (tag6.indexOf('限宫之主') >= 0) t6.push('今行<b>' + (d6.xian + 1) + '限·' + GONG[d6.dxIdx].chen + '宫</b>（' + GONG_SHIER[d6.xian].name + '限 ' + d6.startAge + '–' + d6.endAge + ' 岁），此曜为<b>限宫之主</b>，此限吉凶由此曜引动。');
+  if (tag6.indexOf('曜落大限宫') >= 0) t6.push('此曜正落今大限宫，限内之事当面。');
+  if (tag6.indexOf('曜落小限宫') >= 0) t6.push('此曜正落今小限宫（流年引动）。');
+  if (tag6.indexOf('余奴犯主') >= 0) t6.push('<b>余奴犯主</b>：与命度主同宫／近度，「纵吉为凶」（《（全）》18页三十三）。');
+  if (!t6.length) t6.push('此曜非命主、非命度主、非今限宫之主，亦无余奴犯主之情——身命飞化层无特殊引动。');
+  if (!tag6.length) tag6.push('无特殊引动');
+  add('⑥身命飞化', cls6, 2, tag6.join('·'), t6.join('<br />'),
+    '《星学大成》卷廿四·廿五用在七强·宫主飞入休囚；《七政四余（全）》18页(三十三)·22页(三十/三十一)');
+
+  /* 合计 → 吉凶等第 → 总断 */
+  const grade = score >= 5 ? '上吉' : (score >= 2 ? '吉' : (score <= -5 ? '大凶' : (score <= -2 ? '凶' : '平')));
+  const gradeCol = (grade === '上吉' || grade === '吉') ? '#8ed9a2' : ((grade === '凶' || grade === '大凶') ? '#e08a8a' : '#93a9c4');
+  const dd = [];
+  dd.push('六层加权合力 <b>' + score + '</b> 分 → <b style="color:' + gradeCol + '">' + grade + '</b>。');
+  dd.push('定性：' + (role.length ? role.join('·') : '无命身恩难角色') + '；居' + chen + '宫' + (mw ? '（' + mw + '）' : (sy ? '（失垣）' : ''))
+    + '；' + (tab ? season + '令之' + sub + (WANG_SEASON[ssKey] ? (deShiVar ? '得时' : '失时') : '日月不论旺相') : '四时不论') + '。');
+  if (grade === '上吉') dd.push('一生最得力之曜：宜借其气行事，逢其行限更吉。');
+  else if (grade === '吉') dd.push('为吉曜：得其扶助可增福，逢其行限有喜。');
+  else if (grade === '平') dd.push('吉凶未定之曜：随行限与大限宫主之引动而变。');
+  else if (grade === '凶') dd.push('偏凶之曜：须防其克，逢其行限宜守；若为恩用则凶中仍有可取。');
+  else dd.push('克命最重之曜：既临命又失时，逢限尤须谨守，宜以恩用诸曜制化。');
+  return { ch: ch, chen: chen, layers: layers, score: score, grade: grade, gradeCol: gradeCol, duan: dd,
+    src: '《七政四余（全）》13页(十九)·18页(三十三)·22页(三十/三十一)·23页(三十四)；《星学大成》卷一·卷三·卷五·卷六·卷廿四；' + SI_SHI_SRC + '；《宫星作用体系.md》六层机制。' };
+}
+/* 宫曜五行关系（供④一句话短标签用，与 gongRelPhrase 同源，仅去括号） */
+function relGcl(gwx, ch) {
+  const s = gongRelPhrase(ch, gwx);
+  return s ? s.replace(/[（）]/g, '') : '';
+}
+
+/* —— 曜对本命命主影响面板（#yaoPanel，右上与宫位/格局/评测同槽互斥） —— */
+const yaoPanel = document.getElementById('yaoPanel');
+let yaoOpenChar = null, yaoSig = '';
+function renderYaoPanel() {
+  const ch = yaoOpenChar;
+  if (!ch || !yaoPanel) return;
+  const b = bodyById(snap.bodies.filter(x => x.char === ch)[0] ? snap.bodies.filter(x => x.char === ch)[0].id : null);
+  const P = birthJD !== null ? pingceCalc() : null;
+  let h = '<div class="ypTop"><b style="color:' + (b ? b.color : '#9ecbff') + '">' + yaoName(ch) + '（' + ch + '）</b>'
+    + '<span class="ypSub">对本命命主之影响 · 六层机制</span><button id="btnYaoClose" title="关闭">×</button></div>';
+  const posTxt = b ? '黄经 ' + norm360(b.lon).toFixed(2) + '° · ' + GONG[gongIndex(b.lon)].chen + '宫'
+    + ' · 行度 ' + (b.rate < -0.0055 ? '逆' : (b.rate < 0 ? '留' : '顺')) + b.rate.toFixed(3) + '°/日' : '—';
+  if (!P) {
+    h += '<div class="ypKey">当前星位：' + posTxt + '</div>'
+      + '<div class="ypNote">未设生辰：影响模型须先定盘（命宫依生时定、命度／身宫依本命日月所躔起，恩用财难亦以命度主推）。'
+      + '请在上方时间栏填好出生日期时间，点「设为生辰」，再点「回到现在」。</div>';
+    yaoPanel.innerHTML = h;
+    document.getElementById('btnYaoClose').addEventListener('click', closeYaoPanel);
+    return;
+  }
+  const M = impactModel(ch, P);
+  h += '<div class="ypKey">当前星位：' + posTxt + '　当前宫位次：' + GONG_SHIER[(P.giM - gongIndex(b.lon) + 12) % 12].name + '</div>';
+  h += '<div class="ypGrade">合力 <b style="color:' + M.gradeCol + '">' + M.score + '</b> 分　→　'
+    + '<b style="color:' + M.gradeCol + ';font-size:14px">' + M.grade + '</b></div>';
+  for (const L of M.layers) {
+    if (!L.w && L.cls === 'mid' && L.name === '③星应时') { /* 无四时条文时仍展示，不特殊处理 */ }
+    h += '<div class="ypSec"><div class="ypLayer"><span class="ypName">' + L.name + '</span>'
+      + '<span class="ypV" style="color:' + CLS_COL(L) + '">' + L.v + '</span>'
+      + '<span class="ypW">权重 ' + L.w + '</span></div>'
+      + '<div class="ypTxt">' + L.txt + '</div>'
+      + '<div class="ypSrc">出处：' + L.src + '</div></div>';
+  }
+  h += '<div class="ypSec"><div class="ypLayer"><span class="ypName">总断</span></div>'
+    + M.duan.map(t => '<div class="ypDuan">· ' + t + '</div>').join('') + '</div>';
+  h += '<div class="ypNote">模型＝《宫星作用体系.md》六层机制（命身归属·星有地·星应时·经纬宫度·拱夹照会·身命飞化）；'
+    + '四时喜忌逐曜条文出自《七政四余古赋注（上册）》145–158页「七政四时论」。半角数据（星位／宫位）随盘面实时刷新，'
+    + '本命参数（命宫·命度·四时）随生辰固定。</div>';
+  yaoPanel.innerHTML = h;
+  document.getElementById('btnYaoClose').addEventListener('click', closeYaoPanel);
+}
+function openYaoPanel(ch) {
+  if (yaoOpenChar === ch && yaoPanel.className.indexOf('hide') < 0) return;
+  yaoOpenChar = ch;
+  if (gongPanelOpen >= 0) closeGongPanel();
+  if (pingceOpen) closePingce();
+  toggleGejuView(false);
+  yaoPanel.className = '';
+  yaoSig = '';
+  renderYaoPanel();
+}
+function closeYaoPanel() {
+  yaoOpenChar = null;
+  if (yaoPanel) yaoPanel.className = 'hide';
+}
+function yaoPanelFrame() {
+  if (!yaoOpenChar || !snap) return;
+  const b = snap.bodies.filter(x => x.char === yaoOpenChar)[0];
+  if (!b) return;
+  const sig = yaoOpenChar + '|' + gongIndex(b.lon) + '|' + Math.round(simJD * 100) + '|' + birthJD + '|' + gejuLastList.map(g => g.id).join(',');
+  if (sig !== yaoSig) { yaoSig = sig; renderYaoPanel(); }
+}
+
+/* ================= 点地球的二级菜单 ＋「跳转至地面」（中国分野分区图） =================
+   用户 2026-10-18：点地球不再直接转视角，改为先弹二级菜单；
+   菜单第一项「跳转至地面」切到地面视图＝扁平的中国分野分区图（省按五行五色）。
+   实现只用已有的 three 依赖（不引 echarts-gl / d3 等地图库），省界数据内联进包。
+   —— 因此点地球的旧行为「视角转到大限宫」并未废弃，而是收进菜单第二项「面向大限宫」。 */
+
+/* ---------------- 地球二级菜单 ---------------- */
+const earthMenu = document.createElement('div');
+earthMenu.id = 'earthMenu';
+earthMenu.className = 'hide';
+document.body.appendChild(earthMenu);
+let earthMenuOpen = false;
+const EARTH_MENU_ITEMS = [
+  { t: '跳转至地面', d: '中国分野分区图 · 省按五行五色', fn: function () { openGroundView(); } },
+  { t: '面向大限宫', d: '视角转到当前大限宫正对面', fn: function () { focusDayunGong(); } }
+];
+function openEarthMenu(x, y) {
+  earthMenu.innerHTML = '<div class="emH">地球（观测原点）</div>';
+  for (const it of EARTH_MENU_ITEMS) {
+    const b = document.createElement('button');
+    b.className = 'emItem';
+    b.innerHTML = '<span class="emT">' + it.t + '</span><span class="emD">' + it.d + '</span>';
+    b.addEventListener('click', function () { closeEarthMenu(); it.fn(); });
+    earthMenu.appendChild(b);
+  }
+  /* 先隐形量尺寸再落位，避免在默认位置闪一帧；惰性出屏时夹回可视区 */
+  earthMenu.style.visibility = 'hidden';
+  earthMenu.className = '';
+  const r = earthMenu.getBoundingClientRect();
+  earthMenu.style.left = Math.max(8, Math.min(x - r.width / 2, window.innerWidth - r.width - 8)) + 'px';
+  earthMenu.style.top = Math.max(8, Math.min(y + 12, window.innerHeight - r.height - 8)) + 'px';
+  earthMenu.style.visibility = '';
+  earthMenuOpen = true;
+}
+function closeEarthMenu() {
+  earthMenuOpen = false;
+  earthMenu.className = 'hide';
+}
+/* 点别处／按 Esc 即收起（捕获阶段，早于点选所用的 pointerup，故不会「刚开就关」） */
+document.addEventListener('pointerdown', function (e) {
+  if (earthMenuOpen && !earthMenu.contains(e.target)) closeEarthMenu();
+}, true);
+document.addEventListener('keydown', function (e) { if (e.key === 'Escape') closeEarthMenu(); });
+
+/* ---------------- 地面视图：分野分区图（扁平五色 · 点选看分野） ----------------
+   数据：阿里 DataV 公开省界 GeoJSON（100000_full），存 src/assets/china.json。
+       分野＝十二次（十二州）据《晋书·天文志》：次 → 辰宫 → 列国 → 属州 → 星宿。
+   做法：经纬度等距投到 XY 平面（y＝北）→ 把每一省的多边形按其所属之州，
+        填进一张 Canvas（五色＝该州辰宫的宫主五行：木青·火赤·土黄·金白·水玄）
+        → 整张 canvas 作贴图铺在一块放平的 PlaneGeometry 上。**起伏已按用户
+        「如果这个 3D 效果不好就不要显示山了」去掉**，改扁平分区图；
+        原先的基准高程区／山系折线／名山点数据连同求交步进一并删除。
+   视觉：省外留透明像素（alphaTest 裁掉）故露出星野；省界细线可悬停／点选提亮；
+        左下常驻五行色例。古分野不常驻，点省版块才浮出卡片；
+        点空白／Esc 只收起卡片，不退出本视图（退出走「返回天盘」）。 */
+const GK = 0.132;                    /* 经纬→画面单位：73–135°E × 18–54°N ≈ 8.2 × 4.8 */
+const G_STAR_R0 = 58, G_STAR_R1 = 132;    /* 星野球壳半径区间 */
+const G_MAPW = 1400;                 /* 分野贴图像素宽；高按版图宽高比推 */
+let groundReady = false, groundRAF = 0;   /* groundOpen 见文件顶部声明（避 animate 首帧 TDZ） */
+let gFlyMs = 0, gFlyLast = 0, groundFadeTimer = 0;
+const G_FLY_MS = 1150;                                   /* 进场「俯冲」时长 */
+const G_FLY_FROM = { d: 96, ph: 0.05, th: 0 };            /* 起：高空远端、近垂直俯视（像从太空看下去） */
+const G_PH = 0.58;                                        /* 固定俯角（约与铅垂成 33°，斜俯视） */
+let gRend, gScene, gCam, gRoot, gFlat, gTerrain = null, gMapTex = null;
+let gProv = [], gHover = null, gSel = null;                /* gProv：省信息（投影环／描线材质／所属古州） */
+let gComposer, gBloom, gStars;
+let gTh = 0, gPh = G_PH, gD = 13;                          /* d 只是占位；真值每次进场由 gHomeDist() 按视口算 */
+let gThT = 0, gPhT = G_PH, gDT = 13;                       /* 方位／仰角／距离（含平滑目标值） */
+let gDrag = false, gLastX = 0, gLastY = 0, gPickAt = 0, gP0x = 0, gP0y = 0, gP0t = 0;
+const gRay = new THREE.Raycaster(), gPtr = new THREE.Vector2();
+const gProj = (lon, lat) => [(lon - 104) * GK, (lat - 36) * GK];
+let gBox = { x0: -4.1, x1: 4.1, y0: -2.4, y1: 2.4 };        /* 版图投影包围盒（buildGround 实测后覆盖） */
+
+/* 机位自适应：把整块版图框进当前视口（窄窗口自动后退；不再有环与标签要顾） */
+function gHomeDist() {
+  const th = Math.tan(20 * Math.PI / 180);                 /* 相机 fov 40° → 垂直半视场的 tan */
+  const asp = gClamp(window.innerWidth / Math.max(1, window.innerHeight), 0.8, 3.0);
+  const halfH = (gBox.y1 - gBox.y0) * 0.57;                /* 0.57≈半高×1.14（扁平图不必再给高度留余地） */
+  const halfW = (gBox.x1 - gBox.x0) * 0.57;
+  return Math.max(halfH / th, halfW / (th * asp)) * 1.04;
+}
+
+/* 十二次分野：次 → 辰(宫) → 列国 → 属州 → 星宿。据本地库
+   《星庐天文古籍库（索引与选摘）.md》第 141 行 晋书·天文志「十二次」条文
+   （班固取《三统厤》十二次配十二野）；辰位与《知识结构.md》宫↔次表一致；
+   《古赋注（中册）》66 页「秦地分野在未宮」互证鹑首＝未；星宿→州取同书
+   「二十八宿分野（十二州）」。卦位据《七政四余（全）》22 页「乾居戌亥、坎子、
+   艮丑寅、震卯、巽辰巳、离午、坤未申、兑酉」。
+   五行不另存一份：一律由该辰宫的**宫主五行**现算（`GONG_WUXING`，「子丑土·寅亥木·
+   卯戌火·辰酉金·巳申水·午火·未水」——《七政四余（全）》23 页三十四），
+   与全站生克／失垣／恩用财难同源，免得两处口径不一。
+   落点取各州古核心城经纬，系通说近似，非实测界线。 */
+const FENYE = [
+  { zhou:'雍州', ci:'鹑首', zhi:'未', guo:'秦',   su:'井鬼',   gua:'坤', lon:108.9, lat:34.3 },
+  { zhou:'三河', ci:'鹑火', zhi:'午', guo:'周',   su:'柳星张', gua:'离', lon:112.4, lat:34.6 },
+  { zhou:'荆州', ci:'鹑尾', zhi:'巳', guo:'楚',   su:'翼轸',   gua:'巽', lon:112.2, lat:30.3 },
+  { zhou:'兖州', ci:'寿星', zhi:'辰', guo:'郑',   su:'角亢氐', gua:'巽', lon:116.8, lat:35.6 },
+  { zhou:'豫州', ci:'大火', zhi:'卯', guo:'宋',   su:'房心',   gua:'震', lon:115.6, lat:34.4 },
+  { zhou:'幽州', ci:'析木', zhi:'寅', guo:'燕',   su:'尾箕',   gua:'艮', lon:116.4, lat:39.9 },
+  { zhou:'扬州', ci:'星纪', zhi:'丑', guo:'吴越', su:'斗牛女', gua:'艮', lon:118.8, lat:32.1 },
+  { zhou:'青州', ci:'玄枵', zhi:'子', guo:'齐',   su:'虚危',   gua:'坎', lon:118.0, lat:36.8 },
+  { zhou:'并州', ci:'娵訾', zhi:'亥', guo:'卫',   su:'室壁',   gua:'乾', lon:112.5, lat:37.9 },
+  { zhou:'徐州', ci:'降娄', zhi:'戌', guo:'鲁',   su:'奎娄胃', gua:'乾', lon:117.2, lat:34.3 },
+  { zhou:'冀州', ci:'大梁', zhi:'酉', guo:'赵',   su:'昴毕',   gua:'兑', lon:114.5, lat:36.6 },
+  { zhou:'益州', ci:'实沈', zhi:'申', guo:'魏',   su:'觜参',   gua:'坤', lon:104.1, lat:30.7 },
+];
+/* 州 → 条目／五行（按名查；五行现算自宫主五行表，见上注） */
+const FENYE_ZHOU = {}; for (const f of FENYE) FENYE_ZHOU[f.zhou] = f;
+const FENYE_WX = {};   for (const f of FENYE) FENYE_WX[f.zhou] = GONG_WUXING[f.zhi];
+
+/* 今省 → 古州：通说近似（非实测界线）。按 **adcode** 对应，不依赖 GeoJSON 的中文名写法；
+   一省只归一州（今省界横跨数州者取其主体）。京津冀辽吉黑→幽州·晋蒙→并州·
+   陕甘宁青新藏→雍州·川渝云贵→益州·鄂湘粤桂琼港澳→荆州·苏沪浙皖闽赣台→扬州·
+   鲁→青州·豫→豫州。**兖州（郑）·徐州（鲁）·三河（周）三州的古域今已分属数省，
+   故图面无纯色域**——色例仍把十二州列全，不隐去。 */
+const PROV_ZHOU = {
+  110000:'幽州', 120000:'幽州', 130000:'冀州', 140000:'并州', 150000:'并州',
+  210000:'幽州', 220000:'幽州', 230000:'幽州', 310000:'扬州', 320000:'扬州',
+  330000:'扬州', 340000:'扬州', 350000:'扬州', 360000:'扬州', 370000:'青州',
+  410000:'豫州', 420000:'荆州', 430000:'荆州', 440000:'荆州', 450000:'荆州',
+  460000:'荆州', 500000:'益州', 510000:'益州', 520000:'益州', 530000:'益州',
+  540000:'雍州', 610000:'雍州', 620000:'雍州', 630000:'雍州', 640000:'雍州',
+  650000:'雍州', 710000:'扬州', 810000:'荆州', 820000:'荆州',
+};
+/* 五色＝五行本色（低饱和，免得在近黑底上刺眼、抢了省界细线）：
+   木青·火赤·土黄·金白·水玄（玄＝深青黑，靠描线与底色区分） */
+const WX_ORDER = ['木', '火', '土', '金', '水'];
+const WX_FILL = { '木':[46,132,110], '火':[166,74,56], '土':[176,140,62], '金':[150,166,184], '水':[34,60,96] };
+const WX_CSS  = { '木':'#2e846e', '火':'#a64a38', '土':'#b08c3e', '金':'#96a6b8', '水':'#223c60' };
+
+/* 星野点贴图：Canvas 径向渐变，中心白、边缘透明（加色混合后成柔和光点） */
+function gDotTexture() {
+  const c = document.createElement('canvas');
+  c.width = c.height = 64;
+  const x = c.getContext('2d');
+  const g = x.createRadialGradient(32, 32, 0, 32, 32, 32);
+  g.addColorStop(0, 'rgba(255,255,255,1)');
+  g.addColorStop(0.35, 'rgba(255,255,255,.5)');
+  g.addColorStop(1, 'rgba(255,255,255,0)');
+  x.fillStyle = g; x.fillRect(0, 0, 64, 64);
+  const t = new THREE.CanvasTexture(c);
+  t.colorSpace = THREE.SRGBColorSpace;
+  return t;
+}
+/* 版图重心 → 最近的分野落点（近似归属，非实测界线）。只作兜底：
+   省→州以 PROV_ZHOU 表为准；仅当表里没列出该 adcode 时用它按距离归属。 */
+function nearestFenye(cx, cy) {
+  if (!isFinite(cx) || !isFinite(cy)) return null;
+  let best = null, bd = Infinity;
+  for (const f of FENYE) {
+    const p = gProj(f.lon, f.lat);
+    const d = (p[0] - cx) * (p[0] - cx) + (p[1] - cy) * (p[1] - cy);
+    if (d < bd) { bd = d; best = f; }
+  }
+  return best;
+}
+/* 点在环内（射线穿越法，投影后坐标直接算——投影是线性变换，包含关系不变） */
+function gPip(px, py, ring) {
+  let inside = false;
+  for (let i = 0, j = ring.length - 1; i < ring.length; j = i++) {
+    const xi = ring[i][0], yi = ring[i][1], xj = ring[j][0], yj = ring[j][1];
+    if ((yi > py) !== (yj > py) && px < (xj - xi) * (py - yi) / (yj - yi) + xi) inside = !inside;
+  }
+  return inside;
+}
+/* 命中点落在哪个省：逐块多边形判（外环含、内环挖），取「面积最小的那块」——
+   否则飞地／直辖市会被外面的大省先吃掉（如河北的洞正对北京）。 */
+function gProvAt(px, py) {
+  let best = null, ba = Infinity;
+  for (const pr of gProv) {
+    if (px < pr.x0 || px > pr.x1 || py < pr.y0 || py > pr.y1) continue;
+    for (const pg of pr.polys) {
+      if (px < pg.x0 || px > pg.x1 || py < pg.y0 || py > pg.y1) continue;
+      let ok = gPip(px, py, pg.rings[0]);
+      for (let k = 1; ok && k < pg.rings.length; k++) if (gPip(px, py, pg.rings[k])) ok = false;
+      if (ok && pg.area < ba) { ba = pg.area; best = pr; }
+    }
+  }
+  return best;
+}
+const gArea = function (ring) {                    /* 鞋带面积（用来挑「最内层」那块） */
+  let s = 0;
+  for (let i = 0, n = ring.length - 1; i < n; i++) {
+    s += ring[i][0] * ring[i + 1][1] - ring[i + 1][0] * ring[i][1];
+  }
+  return Math.abs(s / 2);
+};
+
+/* ---- 分野贴图：每一省按其所属之州填五色；省外留透明像素（材质 alphaTest 裁掉） ---- */
+function gBuildFenyeMap() {
+  const wW = gBox.x1 - gBox.x0, wH = gBox.y1 - gBox.y0;
+  const W = G_MAPW, H = Math.max(64, Math.round(G_MAPW * wH / wW));
+  const c = document.createElement('canvas');
+  c.width = W; c.height = H;
+  const x = c.getContext('2d');
+  const kx = W / wW, ky = H / wH;
+  const toPx = q => [(q[0] - gBox.x0) * kx, (gBox.y1 - q[1]) * ky];   /* 投影坐标 → 贴图像素 */
+  for (const pr of gProv) {
+    if (!pr.fy) continue;                              /* 无对应古州（如南海诸岛）＝不着色 */
+    const rgb = WX_FILL[FENYE_WX[pr.fy.zhou]];
+    /* 同五行诸州／诸省靠明度差分开：按省名散列取 0.90–1.14 的系数 */
+    let hs = 0;
+    for (let i = 0; i < pr.name.length; i++) hs = (hs * 31 + pr.name.charCodeAt(i)) % 997;
+    const k = 0.90 + (hs / 997) * 0.24;
+    x.fillStyle = 'rgb(' + rgb.map(v => Math.round(Math.min(255, v * k))).join(',') + ')';
+    for (const pg of pr.polys) {
+      x.beginPath();
+      for (const ring of pg.rings) {
+        ring.forEach(function (q, i) {
+          const s = toPx(q);
+          if (i) x.lineTo(s[0], s[1]); else x.moveTo(s[0], s[1]);
+        });
+        x.closePath();
+      }
+      x.fill('evenodd');                               /* 内环（飞地／直辖市）挖空，用非零会糊填 */
+    }
+  }
+  const t = new THREE.CanvasTexture(c);
+  t.colorSpace = THREE.SRGBColorSpace;
+  t.anisotropy = gRend.capabilities.getMaxAnisotropy();   /* 斜视时省界不发毛 */
+  return t;
+}
+/* 左下五行色例：十二州按五行分组常驻列出（哪几州今在图上、哪几州已无纯色域，一目了然） */
+function gBuildLegend() {
+  let h = '<div class="glTitle">分野 · 五行色例</div>';
+  for (const wx of WX_ORDER) {
+    const zs = FENYE.filter(f => FENYE_WX[f.zhou] === wx)
+      .map(f => f.zhou + '（' + f.guo + '·' + f.zhi + '宫）').join('　');
+    h += '<div class="glRow"><span class="glSw" style="background:' + WX_CSS[wx] + '"></span>' +
+         '<b style="color:' + WX_CSS[wx] + '">' + wx + '</b><span>' + zs + '</span></div>';
+  }
+  h += '<div class="glFoot">※ 今省所属古州系通说近似，非实测界线</div>';
+  el('groundLegend').innerHTML = h;
+}
+function buildGround() {
+  const cv = document.getElementById('groundCanvas');
+  gRend = new THREE.WebGLRenderer({ canvas: cv, antialias: true });
+  gRend.setPixelRatio(Math.min(window.devicePixelRatio || 1, 2));
+  /* 与地心盘同一套色彩管线：ACES 色调映射 + sRGB 输出，泛光的辉光才有电影感 */
+  gRend.toneMapping = THREE.ACESFilmicToneMapping;
+  gRend.toneMappingExposure = 1.15;
+  gRend.outputColorSpace = THREE.SRGBColorSpace;
+  gScene = new THREE.Scene();
+  gScene.background = new THREE.Color(0x02040b);
+  gScene.fog = new THREE.FogExp2(0x02040b, 0.0115);      /* 远端省界化进星野，造纵深 */
+  gCam = new THREE.PerspectiveCamera(40, 1, 0.1, 400);
+  /* 不再布灯：起伏地形已按用户要求去掉，整块分野图是自发光贴图（MeshBasicMaterial），
+     省界细线与星野也都用不受光材质，故灯组一并删去，免得留下无用的场景对象。 */
+
+  /* 星野：900 枚加色光点，铺在 r≈58–132 的球壳上，随星盘极缓自转（静中有动） */
+  (function () {
+    const N = 900, pos = new Float32Array(N * 3), col = new Float32Array(N * 3);
+    const cc = new THREE.Color();
+    for (let i = 0; i < N; i++) {
+      const r = G_STAR_R0 + Math.random() * (G_STAR_R1 - G_STAR_R0);
+      const t = Math.random() * Math.PI * 2, p = Math.acos(2 * Math.random() - 1);
+      pos[i * 3] = r * Math.sin(p) * Math.cos(t);
+      pos[i * 3 + 1] = r * Math.cos(p);
+      pos[i * 3 + 2] = r * Math.sin(p) * Math.sin(t);
+      const k = Math.pow(Math.random(), 2.4);              /* 多数暗、少数亮，才有真星空的不均匀 */
+      cc.setHSL(0.50 + Math.random() * 0.16, 0.30 + 0.30 * Math.random(), 0.50 + 0.45 * k);
+      col[i * 3] = cc.r; col[i * 3 + 1] = cc.g; col[i * 3 + 2] = cc.b;
+    }
+    const geo = new THREE.BufferGeometry();
+    geo.setAttribute('position', new THREE.BufferAttribute(pos, 3));
+    geo.setAttribute('color', new THREE.BufferAttribute(col, 3));
+    gStars = new THREE.Points(geo, new THREE.PointsMaterial({
+      size: 1.5, sizeAttenuation: true, map: gDotTexture(), vertexColors: true,
+      transparent: true, opacity: .95, depthWrite: false,
+      blending: THREE.AdditiveBlending, fog: false }));
+    gScene.add(gStars);
+  })();
+
+  gRoot = new THREE.Group();                          /* 拖动时绕世界 Y 转 */
+  gFlat = new THREE.Group();                          /* XY 平面 → 铺平成地面 */
+  gFlat.rotation.x = -Math.PI / 2;
+  gRoot.add(gFlat);
+  gScene.add(gRoot);
+
+  /* ── 1) 读省界：投影成 XY 环，量包围盒，备好「点选判定」所需的逐块多边形 ── */
+  gProv = [];
+  let bx0 = 1e9, bx1 = -1e9, by0 = 1e9, by1 = -1e9;
+  for (const f of chinaGeo.features) {
+    const gm = f.geometry;
+    if (!gm) continue;
+    const polys = gm.type === 'Polygon' ? [gm.coordinates] : gm.coordinates;
+    const adc = String((f.properties && f.properties.adcode) || '');
+    /* 所属古州：按 adcode 查表；查不到（如南海诸岛）先留空，稍后按最近古核心兜底 */
+    const pr = { name: (f.properties && f.properties.name) || '', polys: [],
+                 fy: FENYE_ZHOU[PROV_ZHOU[adc]] || null,
+                 x0: 1e9, x1: -1e9, y0: 1e9, y1: -1e9, cx: 0, cy: 0 };
+    let sx = 0, sy = 0, sn = 0;
+    for (const rings of polys) {
+      const pg = { rings: [], area: 0, x0: 1e9, x1: -1e9, y0: 1e9, y1: -1e9 };
+      for (const ring of rings) {
+        const pts = new Array(ring.length);
+        for (let i = 0; i < ring.length; i++) {
+          const q = gProj(ring[i][0], ring[i][1]);
+          pts[i] = q;
+          sx += q[0]; sy += q[1]; sn++;
+          if (q[0] < pg.x0) pg.x0 = q[0];
+          if (q[0] > pg.x1) pg.x1 = q[0];
+          if (q[1] < pg.y0) pg.y0 = q[1];
+          if (q[1] > pg.y1) pg.y1 = q[1];
+        }
+        pg.rings.push(pts);
+      }
+      if (!pg.rings.length) continue;
+      pg.area = gArea(pg.rings[0]);
+      pr.polys.push(pg);
+      if (pg.x0 < pr.x0) pr.x0 = pg.x0;
+      if (pg.x1 > pr.x1) pr.x1 = pg.x1;
+      if (pg.y0 < pr.y0) pr.y0 = pg.y0;
+      if (pg.y1 > pr.y1) pr.y1 = pg.y1;
+    }
+    if (!pr.polys.length) continue;
+    pr.cx = sn ? sx / sn : 0; pr.cy = sn ? sy / sn : 0;
+    /* 兜底：表里没列出的省按「离哪个古核心最近」归属（无名者如南海诸岛则不着色） */
+    if (!pr.fy && pr.name) pr.fy = nearestFenye(pr.cx, pr.cy);
+    gProv.push(pr);
+    if (pr.x0 < bx0) bx0 = pr.x0;
+    if (pr.x1 > bx1) bx1 = pr.x1;
+    if (pr.y0 < by0) by0 = pr.y0;
+    if (pr.y1 > by1) by1 = pr.y1;
+  }
+  gBox = { x0: bx0, x1: bx1, y0: by0, y1: by1 };
+
+  /* ── 2) 分野贴图 → 一块放平的 PlaneGeometry（不再位移顶点：扁平分区图） ──
+     贴图只填色不描边：省界细线另建（见 3），故两者互不干扰。
+     alphaTest 裁掉省外透明像素（＝露出星野），且材质不透明 → 与线、星无排序问题。 */
+  gMapTex = gBuildFenyeMap();
+  const wW = gBox.x1 - gBox.x0, wH = gBox.y1 - gBox.y0;
+  const tGeo = new THREE.PlaneGeometry(wW, wH);
+  tGeo.translate((gBox.x0 + gBox.x1) / 2, (gBox.y0 + gBox.y1) / 2, 0);
+  gTerrain = new THREE.Mesh(tGeo, new THREE.MeshBasicMaterial({
+    map: gMapTex, alphaTest: 0.5, side: THREE.DoubleSide, toneMapped: false }));
+  gFlat.add(gTerrain);
+  gBuildLegend();
+
+  /* ── 3) 省界细线：平铺在贴图上方 0.004（免与贴图共面闪烁）；每省一份材质，
+         便于悬停／点选单独提亮 ── */
+  for (const pr of gProv) {
+    const pts = [];
+    for (const pg of pr.polys) {
+      for (const ring of pg.rings) {
+        for (let i = 0, n = ring.length; i < n; i++) {
+          const a = ring[i], b = ring[(i + 1) % n];
+          pts.push(new THREE.Vector3(a[0], a[1], 0.004),
+                   new THREE.Vector3(b[0], b[1], 0.004));
+        }
+      }
+    }
+    if (!pts.length) continue;
+    pr.hMat = new THREE.LineBasicMaterial({
+      color: 0x8fb0c8, transparent: true, opacity: 0.42, blending: THREE.AdditiveBlending, fog: false });
+    gFlat.add(new THREE.LineSegments(new THREE.BufferGeometry().setFromPoints(pts), pr.hMat));
+  }
+
+  /* 后处理：泛光只对过阈像素起辉 → 省界细线与星野亮星自然发光 */
+  gComposer = new EffectComposer(gRend);
+  gComposer.addPass(new RenderPass(gScene, gCam));
+  gBloom = new UnrealBloomPass(new THREE.Vector2(window.innerWidth, window.innerHeight), 0.55, 0.55, 0.62);
+  gComposer.addPass(gBloom);
+  gComposer.addPass(new OutputPass());
+
+  groundReady = true;
+  groundResize();
+}
+function groundResize() {
+  if (!groundReady) return;
+  const w = window.innerWidth, h = window.innerHeight;
+  gRend.setSize(w, h, false);
+  gCam.aspect = w / h;
+  gCam.updateProjectionMatrix();
+  if (gComposer) gComposer.setSize(w, h);
+}
+const gClamp = (v, a, b) => v < a ? a : (v > b ? b : v);
+function groundCamApply() {
+  gCam.position.set(gD * Math.sin(gPh) * Math.sin(gTh), gD * Math.cos(gPh), gD * Math.sin(gPh) * Math.cos(gTh));
+  gCam.lookAt(0, 0.15, 0);
+}
+/* 屏幕点 → 板上投影坐标。面已放平成世界 y＝0 的平面，故直接以射线与该平面求交
+   （扁平图不必再沿地形步进；比逐三角形射线检测快，且海面／省外也会给出坐标，
+   交给 gProvAt 判「不在任何省」即＝点空白）。 */
+const _gA = new THREE.Vector3(), _gB = new THREE.Vector3();
+const gPlaneY = new THREE.Plane(new THREE.Vector3(0, 1, 0), 0);
+function gPointAt(cx, cy) {
+  const r = gRend.domElement.getBoundingClientRect();
+  gPtr.set(((cx - r.left) / r.width) * 2 - 1, -(((cy - r.top) / r.height) * 2 - 1));
+  gRay.setFromCamera(gPtr, gCam);
+  if (!gRay.ray.intersectPlane(gPlaneY, _gA)) return null;
+  gTerrain.updateMatrixWorld();
+  const q = gTerrain.worldToLocal(_gB.copy(_gA));      /* 世界点 → 地形局部（+y＝北） */
+  return { x: q.x, y: q.y };
+}
+/* 省界描线的三种状态（常态／悬停／选中） */
+function gProvPaint(pr) {
+  if (!pr || !pr.hMat) return;
+  const sel = pr === gSel, hov = pr === gHover;
+  pr.hMat.color.setHex(sel ? 0xffe27a : (hov ? 0xffffff : 0x8fb0c8));
+  pr.hMat.opacity = sel ? 1 : (hov ? 0.92 : 0.42);
+}
+/* 某屏幕点上命中的省（落在海面或省外＝null） */
+function gAt(cx, cy) {
+  const p = gPointAt(cx, cy);
+  return p ? gProvAt(p.x, p.y) : null;
+}
+function groundHover(cx, cy) {
+  const pr = gAt(cx, cy);
+  if (pr !== gHover) {
+    const old = gHover;
+    gHover = pr;
+    gProvPaint(old); gProvPaint(pr);
+  }
+  const tip = el('groundTip');
+  if (pr) {
+    const f = pr.fy;
+    tip.textContent = pr.name + (f
+      ? '　·　' + f.zhou + '　' + f.ci + '　' + f.zhi + '宫　' + f.guo
+      : '　·　无古州对应');
+    tip.className = '';
+    tip.style.left = (cx + 14) + 'px';
+    tip.style.top = (cy + 14) + 'px';
+  } else tip.className = 'hide';
+}
+/* 点选：亮起该省描线，并在点击处浮出卡片（省名 · 分野 · 五行 · 卦位 · 星宿）；
+   点空白／Esc ＝ 只收起卡片（不退出本视图，退出走「返回天盘」） */
+function groundCard(pr, cx, cy) {
+  if (gSel !== pr) { const old = gSel; gSel = pr; gProvPaint(old); gProvPaint(pr); }
+  const card = el('groundCard');
+  if (!pr) { card.className = ''; return; }
+  const f = pr.fy;
+  const wx = f ? FENYE_WX[f.zhou] : '';
+  let h = '<div class="gcName">' + pr.name + '</div>';
+  if (f) {
+    h += '<div class="gcRow"><i>分野</i><b>' + f.zhou + '　' + f.ci + '　' + f.zhi + '宫　' + f.guo + '</b></div>';
+    h += '<div class="gcRow"><i>五行</i><b style="color:' + WX_CSS[wx] + '">' + wx + '</b>' +
+         '<span class="gcNote">　' + f.zhi + '宫宫主五行</span></div>';
+    h += '<div class="gcRow"><i>卦位</i><b>' + f.gua + '</b>　<i>星宿</i><b>' + f.su + '</b></div>';
+    h += '<div class="gcSrc">据《晋书·天文志》十二次分野；五行取宫主五行表；' +
+         '省属之州为通说近似，非实测界线</div>';
+  } else h += '<div class="gcRow">此域今无对应之州</div>';
+  h += '<div class="gcHint">点击空白处收起</div>';
+  card.innerHTML = h;
+  card.className = 'on';
+  const w = card.offsetWidth, hh = card.offsetHeight;   /* 贴点击点右下，再夹进可视区，免得弹出屏外 */
+  card.style.left = Math.min(Math.max(8, cx + 18), Math.max(8, window.innerWidth - w - 8)) + 'px';
+  card.style.top = Math.min(Math.max(8, cy - 10), Math.max(8, window.innerHeight - hh - 8)) + 'px';
+}
+function groundFrame() {
+  /* groundFading＝关闭过渡仍在跑：那 0.5s 地面要继续渲染（相机余滑），否则渐隐的是一张死图 */
+  if (!groundOpen && !groundFading) { groundRAF = 0; return; }
+  groundRAF = requestAnimationFrame(groundFrame);
+  const t = performance.now();
+  const dtms = Math.min(64, t - gFlyLast);
+  gFlyLast = t;
+  if (groundFlying) {
+    /* 进场：相机自 G_FLY_FROM（高空远端近俯视）easeOutCubic 缓入目标位＝「俯冲到地面」 */
+    gFlyMs += dtms;
+    const k = gFlyMs >= G_FLY_MS ? 1 : gFlyMs / G_FLY_MS;
+    const e = 1 - Math.pow(1 - k, 3);
+    gTh = G_FLY_FROM.th + (gThT - G_FLY_FROM.th) * e;
+    gPh = G_FLY_FROM.ph + (gPhT - G_FLY_FROM.ph) * e;
+    gD = G_FLY_FROM.d + (gDT - G_FLY_FROM.d) * e;
+    if (k >= 1) groundFlying = false;
+  } else {
+    gTh += (gThT - gTh) * 0.18;
+    gPh += (gPhT - gPh) * 0.18;
+    gD += (gDT - gD) * 0.18;
+  }
+  groundCamApply();
+  if (gStars) gStars.rotation.y += dtms * 0.000012;     /* 星野极缓自转：静中有动 */
+  gComposer.render();                                   /* 走泛光通道，刻线与分野金字才起辉 */
+}
+function openGroundView() {
+  if (!groundReady) buildGround();
+  clearTimeout(groundFadeTimer);                 /* 若恰在淡出中途又进来，取消那次收尾 */
+  groundFading = false;
+  closeGongPanel(); closeGejuView(); closeYaoPanel(); closePingce();
+  el('groundTip').className = 'hide';
+  el('groundReadout').textContent = '点击省份看分野（点空白收起）· 拖动旋转 · 滚轮缩放';
+  const oldSel = gSel; gSel = null; gHover = null; gProvPaint(oldSel);   /* 每次进来都从「未选」态起 */
+  el('groundCard').className = '';
+  gThT = 0; gPhT = G_PH; gDT = gHomeDist();    /* 每次进来都从默认机位起（按当前视口算，配合俯冲） */
+  groundOpen = true;
+  el('groundWrap').className = 'on';             /* CSS 渐显＋推近；相机俯冲由下面这组状态驱动 */
+  groundFlying = true; gFlyMs = 0; gFlyLast = performance.now();
+  if (!groundRAF) groundRAF = requestAnimationFrame(groundFrame);
+}
+function closeGroundView() {
+  if (!groundOpen && !groundFading) return;
+  groundFlying = false;
+  groundFading = true;                           /* 淡出期间天盘恢复渲染 → 与渐隐的地面交叉过渡 */
+  el('groundWrap').className = '';               /* CSS 渐隐；display 不切，故过渡能跑完 */
+  el('groundTip').className = 'hide';
+  el('groundCard').className = '';
+  clearTimeout(groundFadeTimer);
+  groundFadeTimer = setTimeout(function () {
+    groundFading = false;
+    groundOpen = false;
+    lastRealMs = performance.now();              /* 回天盘时重置步长基准，时间不跳 */
+  }, 520);                                       /* 与 #groundWrap 的 .5s 过渡对齐 */
+}
+
+(function groundBindOnce() {
+  const cv = document.getElementById('groundCanvas');
+  if (!cv) return;
+  cv.addEventListener('pointerdown', function (e) {
+    if (e.button !== 0) return;
+    groundFlying = false;              /* 用户一动手即接管，不再让进场动画跟他抢镜头 */
+    gDrag = true; gLastX = e.clientX; gLastY = e.clientY;
+    gP0x = e.clientX; gP0y = e.clientY; gP0t = Date.now();   /* 记按下起点，用来区分「点」与「拖」 */
+    cv.setPointerCapture(e.pointerId);
+  });
+  cv.addEventListener('pointerup', function (e) {
+    gDrag = false;
+    if (cv.hasPointerCapture(e.pointerId)) cv.releasePointerCapture(e.pointerId);
+    /* 位移＜6px 且按下＜500ms 才算点击——否则是拖动视角，不该弹卡片 */
+    if (Math.abs(e.clientX - gP0x) + Math.abs(e.clientY - gP0y) > 6 || Date.now() - gP0t > 500) return;
+    groundCard(gAt(e.clientX, e.clientY), e.clientX, e.clientY);   /* 命中省＝亮线并浮出卡片；空白＝收起 */
+  });
+  cv.addEventListener('pointercancel', function () { gDrag = false; });   /* 指针被系统取消（切窗/右键）也要解除拖动态 */
+  window.addEventListener('blur', function () { gDrag = false; });
+  cv.addEventListener('pointermove', function (e) {
+    if (gDrag) {
+      gThT -= (e.clientX - gLastX) * 0.007;
+      gPhT = gClamp(gPhT - (e.clientY - gLastY) * 0.006, 0.16, 1.36);
+      gLastX = e.clientX; gLastY = e.clientY;
+      el('groundTip').className = 'hide';
+      return;
+    }
+    const now = Date.now();
+    if (now - gPickAt < 45) return;
+    gPickAt = now;
+    groundHover(e.clientX, e.clientY);
+  });
+  cv.addEventListener('pointerleave', function () {
+    const old = gHover; gHover = null; gProvPaint(old);
+    el('groundTip').className = 'hide';
+  });
+  cv.addEventListener('wheel', function (e) {
+    e.preventDefault();
+    groundFlying = false;              /* 同上：滚轮一滚就交还用户控制 */
+    gDT = gClamp(gDT * (1 + e.deltaY * 0.0013), 4, 34);
+  }, { passive: false });
+  el('btnGroundClose').addEventListener('click', closeGroundView);
+  el('btnGroundReset').addEventListener('click', function () {
+    gThT = 0; gPhT = G_PH; gDT = gHomeDist();   /* 复位＝回到默认斜俯视机位（距离按当前视口重算） */
+  });
+  /* Esc 收起信息卡（与天盘的 Esc 行为一致；地面视图开着时才动手） */
+  document.addEventListener('keydown', function (e) {
+    if (e.key === 'Escape' && groundOpen && gSel) groundCard(null, 0, 0);
+  });
+})();
+window.addEventListener('resize', groundResize);
+
+/* 气息测地积分小窗的最小化开关（与「收起面板」「评测」同置右上 #topbar）。
+   收起＝窗口只留标题行；展开＝恢复 canvas／图例／数显。
+   开机默认「收起」（qiGeoMin=true）：用户 2026-10-18「打开页面之后不要所有窗口都展开」——
+   页面一打开只留标题行，顶栏按钮显示「展开气息窗」，点一下才展开积分图。 */
 const btnQiGeoMin = document.getElementById('btnQiGeoMin');
-let qiGeoMin = false;
+let qiGeoMin = true;
 function qiGeoMinApply() {
   qiGeoEl.classList.toggle('min', qiGeoMin);
   btnQiGeoMin.textContent = qiGeoMin ? '展开气息窗' : '收起气息窗';
@@ -4187,7 +5230,7 @@ qiGeoMinApply();
 
 /* 上次的生辰若已存于本地，开机即自动定盘（宫带大限指示随之出现） */
 restoreBirth();
-if (birthJD !== null) applyBirth();
+applyBirth();   /* 无论有无生辰都跑一次：同步依赖定盘的按钮禁用态与生辰状态行 */
 
 setSpeed(1);
 setPaused(false);

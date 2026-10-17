@@ -40,6 +40,10 @@
   #topbar { position: fixed; top: 10px; right: 12px; z-index: 12; display: flex; align-items: center; gap: 6px; }
   #topbar > button { background: rgba(21, 34, 56, 0.94); padding: 4px 10px; }
   #topbar > button:hover { background: #1e3252; }
+  /* 顶栏按钮的 disabled 态须单独压过上面两条（id 选择器优先级更高） */
+  #topbar > button:disabled, #topbar > button:disabled:hover {
+    background: #101a2b; border-color: #22334c; color: #8fa3bd; opacity: .38; cursor: not-allowed; transform: none;
+  }
 
   #panel {
     position: fixed; top: 10px; left: 10px; width: 470px;
@@ -60,14 +64,31 @@
     border-radius: 4px; padding: 2px 4px; font-size: 12px; font-family: var(--dsh-mono);
   }
   input[type=number].wide { width: 76px; }
+  /* 按钮四态：默认 / 悬停 / 按下 / 聚焦 / 禁用；统一最小高度与过渡，避免各处高低参差 */
   button {
     background: #152238; color: #cfe0f5; border: 1px solid #2b3f5c; border-radius: 5px;
-    padding: 3px 8px; font-size: 12px; cursor: pointer; font-family: inherit;
+    padding: 4px 10px; min-height: 24px; font-size: 12px; cursor: pointer; font-family: inherit;
+    transition: background .12s ease, border-color .12s ease, color .12s ease, opacity .12s ease;
   }
-  button:hover { background: #1e3252; }
+  button:hover { background: #1e3252; border-color: #3c5a86; }
+  button:active { background: #122036; border-color: #4a86d8; transform: translateY(1px); }
+  button:focus-visible { outline: 2px solid #4a86d8; outline-offset: 1px; }
   button.on { background: #2b5c9c; border-color: #4a86d8; color: #fff; }
+  button.on:hover { background: #356ab0; }
+  button:disabled, button:disabled:hover {
+    opacity: .38; cursor: not-allowed; background: #101a2b; border-color: #22334c; color: #8fa3bd; transform: none;
+  }
   .sec { border-top: 1px solid #1b2a41; margin-top: 7px; padding-top: 7px; }
-  .sec > .h { color: #7fa8de; font-size: 11.5px; letter-spacing: .5px; margin-bottom: 5px; }
+  /* 分区可折叠：点标题即收展，默认只展开「时间」区（缓解面板文字过多、难看清） */
+  .sec > .h {
+    color: #7fa8de; font-size: 11.5px; letter-spacing: .5px; margin-bottom: 5px;
+    display: flex; align-items: center; gap: 6px; cursor: pointer; user-select: none;
+  }
+  .sec > .h:hover { color: #a9c7f0; }
+  .sec > .h .caret { margin-left: auto; color: #5d7898; font-size: 9px; transition: transform .18s ease; }
+  .sec.fold > .h { margin-bottom: 0; }
+  .sec.fold > .h .caret { transform: rotate(-90deg); }
+  .sec.fold > .secBody { display: none; }
   table.grid { border-collapse: collapse; width: 100%; font-family: var(--dsh-mono); font-size: 11.5px; }
   table.grid th { color: #6f8bab; font-weight: normal; text-align: left; padding: 1px 4px; border-bottom: 1px solid #22334c; }
   table.grid td { padding: 1px 4px; border-bottom: 1px solid #131f33; white-space: nowrap; }
@@ -220,9 +241,122 @@
   #pingcePanel table.pcTb th { color: #6f8bab; font-weight: normal; text-align: left; padding: 1px 4px; border-bottom: 1px solid #22334c; }
   #pingcePanel table.pcTb td { padding: 1px 4px; border-bottom: 1px solid #131f33; }
   #pingcePanel .pcGj { margin-bottom: 4px; }
+  #pingcePanel .pcPl { color: #c3d4ea; font-size: 11px; margin-left: 1.2em; padding-left: 8px; border-left: 2px solid #2c4160; }
+  #pingcePanel .pcPlk { color: #7fe0c8; margin-right: 4px; }
   #pingcePanel .pcWhy { color: #8aa6c8; font-size: 10.5px; margin-left: 1.2em; padding-left: 8px; border-left: 2px solid #24354f; }
   #pingcePanel .pcDuan { color: #d6e4f6; font-size: 11.5px; margin-bottom: 3px; }
   #pingcePanel .pcDuan b { color: #ffd9a0; font-weight: 600; }
+  /* 十一曜总表「影响」列：可点，展开 #yaoPanel */
+  #pingcePanel .pcLink { cursor: pointer; text-decoration: underline dotted; text-underline-offset: 2px; }
+  #pingcePanel .pcLink:hover { filter: brightness(1.4); }
+
+  /* 曜对本命命主影响面板：右上（与宫位/格局/评测同槽位互斥），内容较长可滚动 */
+  #yaoPanel {
+    position: fixed; right: 12px; top: 46px; width: 402px; z-index: 13;
+    max-height: calc(100vh - 230px); overflow-y: auto;
+    background: rgba(10, 16, 28, .95); border: 1px solid #2c4160; border-radius: 10px;
+    padding: 8px 11px 10px; color: #cfe0f5; font: 12px/1.6 var(--dsh-ui);
+    backdrop-filter: blur(4px); box-shadow: 0 6px 24px rgba(0,0,0,.6);
+  }
+  #yaoPanel.hide { display: none; }
+  #yaoPanel::-webkit-scrollbar { width: 8px; }
+  #yaoPanel::-webkit-scrollbar-thumb { background: #24344d; border-radius: 4px; }
+  #yaoPanel .ypTop { display: flex; align-items: center; gap: 8px; border-bottom: 1px solid #24354f; padding-bottom: 5px; margin-bottom: 6px; }
+  #yaoPanel .ypTop b { font-size: 14px; letter-spacing: .05em; }
+  #yaoPanel .ypSub { flex: 1; color: #7d94b3; font-size: 10.5px; }
+  #yaoPanel #btnYaoClose { background: none; border: 0; color: #8aa6c8; font-size: 17px; line-height: 1; cursor: pointer; padding: 0 2px; }
+  #yaoPanel .ypKey { color: #b8cbe4; font-size: 11.5px; }
+  #yaoPanel .ypGrade { color: #c3d4ea; font-size: 12px; border-top: 1px solid #1b2a41; padding-top: 5px; margin-top: 5px; }
+  #yaoPanel .ypSec { border-top: 1px solid #1b2a41; margin-top: 5px; padding-top: 5px; }
+  #yaoPanel .ypLayer { display: flex; align-items: baseline; gap: 7px; flex-wrap: wrap; }
+  #yaoPanel .ypName { color: #7fa8de; font-size: 11.5px; letter-spacing: .4px; }
+  #yaoPanel .ypV { font-size: 11.5px; }
+  #yaoPanel .ypW { color: #6f89a8; font-size: 10.5px; margin-left: auto; }
+  #yaoPanel .ypTxt { color: #c3d4ea; font-size: 11.5px; line-height: 1.6; margin-top: 2px; }
+  #yaoPanel .ypTxt b { color: #ffd9a0; font-weight: 600; }
+  #yaoPanel .ypSrc { color: #6f89a8; font-size: 10.5px; margin-top: 2px; }
+  #yaoPanel .ypDuan { color: #d6e4f6; font-size: 11.5px; margin-bottom: 3px; }
+  #yaoPanel .ypDuan b, #yaoPanel .ypGrade b { font-weight: 600; }
+  #yaoPanel .ypNote { color: #6f89a8; font-size: 10.5px; line-height: 1.5; margin-top: 6px; border-top: 1px solid #1b2a41; padding-top: 4px; }
+
+  /* 点地球弹出的二级菜单：跟随点击点落位，夹在可视区内 */
+  #earthMenu {
+    position: fixed; z-index: 30; min-width: 188px;
+    background: rgba(10, 16, 28, .96); border: 1px solid #2c4160; border-radius: 9px;
+    padding: 5px; box-shadow: 0 8px 26px rgba(0,0,0,.62); backdrop-filter: blur(4px);
+    animation: emPop .2s cubic-bezier(.2,.9,.3,1);   /* 每次展开都从点击点轻轻化开，不是硬闪 */
+  }
+  @keyframes emPop { from { opacity: 0; transform: translateY(-5px) scale(.95); } to { opacity: 1; transform: none; } }
+  #earthMenu.hide { display: none; }
+  #earthMenu .emH { color: #7fa8de; font-size: 10.5px; letter-spacing: .5px; padding: 2px 6px 5px; border-bottom: 1px solid #1b2a41; margin-bottom: 4px; }
+  #earthMenu .emItem { display: block; width: 100%; text-align: left; background: none; border: 0; padding: 5px 7px; border-radius: 6px; }
+  #earthMenu .emItem:hover { background: #1e3252; }
+  #earthMenu .emT { display: block; color: #dbe4f0; font-size: 12px; }
+  #earthMenu .emD { display: block; color: #7d94b3; font-size: 10.5px; margin-top: 1px; }
+
+  /* 地面视图：铺满全屏，盖住天盘与其面板（比 #topbar 的 12 高）
+     显隐不用 display，改用 opacity/visibility/transform 过渡——「跳转至地面」才不是硬切：
+     进场＝地面渐显＋轻微推近（.94→1），同时里面相机由高空远端缓入（见 main.js 的 gFlying）。 */
+  #groundWrap {
+    position: fixed; inset: 0; z-index: 40;
+    /* 深空底：与外层星野同色系的近黑蓝紫，让五色分野图「浮」在星海里 */
+    background: radial-gradient(130% 100% at 50% 6%, #061426 0%, #020610 48%, #000104 100%);
+    opacity: 0; visibility: hidden; pointer-events: none;
+    transform: scale(.94); transform-origin: 50% 42%;
+    transition: opacity .5s ease, transform .5s cubic-bezier(.2,.7,.3,1), visibility .5s;
+  }
+  #groundWrap.on { opacity: 1; visibility: visible; pointer-events: auto; transform: scale(1); }
+  #groundWrap canvas { position: absolute; inset: 0; width: 100%; height: 100%; display: block; touch-action: none; cursor: grab; }
+  #groundWrap canvas:active { cursor: grabbing; }
+  /* 暗角：压在 canvas 之上、按钮之下，把视线收拢到星图主体（不吃交互） */
+  #groundWrap::before {
+    content: ''; position: absolute; inset: 0; z-index: 1; pointer-events: none;
+    background: radial-gradient(118% 96% at 50% 52%, rgba(0,0,0,0) 54%, rgba(0,0,0,.62) 100%);
+  }
+  #groundBar { position: absolute; left: 12px; top: 12px; right: 12px; z-index: 2;
+    display: flex; align-items: center; gap: 8px;
+    opacity: 0; transition: opacity .32s ease .3s; }        /* 顶栏滞后 0.3s 淡入，先让地形自己化开 */
+  #groundWrap.on #groundBar { opacity: 1; }
+  #groundBar .gbTitle { color: #e6cfa0; font-size: 13px; letter-spacing: 1.6px; }
+  #groundBar .gbTitle b { color: #9ff0e2; font-weight: 600; letter-spacing: 1.6px; }
+  #groundBar .gbSub { flex: 1; color: #7d94b3; font-size: 11.5px; letter-spacing: .3px; }
+  #groundWrap #groundTip { z-index: 3; }
+  /* 点选信息卡：贴点击点浮出（不吃交互，故点它下面的地形照常生效） */
+  #groundCard {
+    position: fixed; z-index: 42; max-width: 300px; padding: 9px 11px 7px;
+    background: rgba(7, 14, 26, .93); border: 1px solid #2b4a63; border-left: 2px solid #7fe4dc;
+    border-radius: 8px; box-shadow: 0 8px 26px rgba(0,0,0,.6); pointer-events: none;
+    opacity: 0; visibility: hidden; transform: translateY(6px) scale(.97);
+    transition: opacity .22s ease, transform .22s cubic-bezier(.2,.7,.3,1), visibility .22s;
+  }
+  #groundCard.on { opacity: 1; visibility: visible; transform: none; }
+  #groundCard .gcName { font-family: var(--dsh-scan); font-size: 17px; color: #e6f6ff; letter-spacing: 2px; margin-bottom: 5px; }
+  #groundCard .gcRow { font-size: 11.5px; line-height: 1.7; color: #9fc4dd; }
+  #groundCard .gcRow i { font-style: normal; color: #6f8ba6; margin-right: 7px; letter-spacing: 1px; }
+  #groundCard .gcRow b { color: #c8a75c; font-weight: 600; }
+  #groundCard .gcHint { margin-top: 5px; padding-top: 4px; border-top: 1px solid #1c2c40; font-size: 10.5px; color: #5d7893; }
+  #groundCard .gcNote { color: #6f8ba6; font-size: 10.5px; }
+  #groundCard .gcSrc { margin-top: 5px; font-size: 10.5px; line-height: 1.5; color: #5d7893; }
+  /* 左下分野五行色例：十二州按五行分组常驻（与地面视图同节奏淡入） */
+  #groundLegend {
+    position: absolute; left: 12px; bottom: 12px; z-index: 2;
+    background: rgba(7, 14, 26, .74); border: 1px solid #22384f; border-radius: 8px;
+    padding: 7px 10px 6px; font-size: 11px; line-height: 1.65; color: #9fc4dd;
+    opacity: 0; transition: opacity .32s ease .3s; pointer-events: none;
+  }
+  #groundWrap.on #groundLegend { opacity: 1; }
+  #groundLegend .glTitle { color: #e6cfa0; font-size: 11.5px; letter-spacing: 1.4px; margin-bottom: 4px; }
+  #groundLegend .glRow { display: flex; align-items: center; gap: 6px; }
+  #groundLegend .glRow b { flex: 0 0 15px; font-weight: 600; }
+  #groundLegend .glSw { flex: 0 0 11px; width: 11px; height: 11px; border-radius: 2px;
+    border: 1px solid rgba(255,255,255,.22); display: inline-block; }
+  #groundLegend .glFoot { margin-top: 4px; padding-top: 3px; border-top: 1px solid #1c2c40; font-size: 10px; color: #5d7893; }
+  #groundTip {
+    position: fixed; z-index: 41; padding: 2px 7px; pointer-events: none;
+    background: rgba(10, 16, 28, .94); border: 1px solid #2c4160; border-radius: 5px;
+    color: #d6e4f6; font-size: 11.5px;
+  }
+  #groundTip.hide { display: none; }
 </style>
 </head>
 <body>
@@ -231,106 +365,120 @@
   <h1><span class="brand">沛然堂观星 <span class="brandEn">PeirangStar</span></span>七政四余 · 太阳系天盘（地心 · 回归黄道）</h1>
 
   <div class="sec" style="border-top:none;margin-top:0;padding-top:0;">
-    <div class="h">时间（UTC）</div>
-    <div class="row mono"><span id="timeNow">—</span></div>
-    <div class="row">
-      <input id="inYear" class="cal" type="number" step="1" /><label>年</label>
-      <input id="inMonth" class="cal" type="number" min="1" max="12" step="1" /><label>月</label>
-      <input id="inDay" class="cal" type="number" min="1" max="31" step="1" /><label>日</label>
-      <input id="inHour" class="cal" type="number" min="0" max="23" step="1" /><label>时</label>
-      <input id="inMin" class="cal" type="number" min="0" max="59" step="1" /><label>分</label>
-      <input id="inSec" class="cal" type="number" min="0" max="59" step="1" /><label>秒</label>
-    </div>
-    <div class="row">
-      <button id="btnJump">跳转</button>
-      <button id="btnNow">回到现在</button>
-      <button id="btnSetB" title="把上方时间栏填好的日期时间设为生辰，后台自动定盘起大运">设为生辰</button>
-      <button id="btnYm">−1年</button><button id="btnMm">−1月</button><button id="btnDm">−1日</button>
-      <button id="btnDp">+1日</button><button id="btnMp">+1月</button><button id="btnYp">+1年</button>
-    </div>
-    <div class="row">
-      <button id="btnPause">暂停</button>
-      <button class="spd" data-s="1">1×</button>
-      <button class="spd" data-s="100">100×</button>
-      <button class="spd" data-s="1000">1000×</button>
-      <button class="spd" data-s="10000">1万×</button>
-      <button class="spd" data-s="60000">6万×</button>
-      <button class="spd" data-s="300000">30万×</button>
-    </div>
-    <div class="row note">
-      <label style="color:#8194ad;"><input type="checkbox" id="chkPauseJump" checked /> 跳转后暂停</label>
-      <span id="julianOut" class="mono"></span>
-    </div>
-    <div class="row">
-      <button id="btnBClr">清除生辰</button>
-      <span class="note" id="bStatus">未设生辰 · 填好上方时间后点「设为生辰」即后台自动定盘、起大运</span>
-    </div>
-    <div class="row note" id="dayunInfo" style="display:block">—</div>
-  </div>
-
-  <div class="sec">
-    <div class="h">地方时 / 真太阳时 / 节气 / 干支</div>
-    <div class="row">
-      <label>经度(°E)</label><input id="inLon" type="number" step="0.01" value="120" class="wide" />
-      <span class="note">用于地方平时与真太阳时（东经为正）</span>
-    </div>
-    <div id="timeInfo" class="note mono"></div>
-  </div>
-
-  <div class="sec">
-    <div class="h">十一曜黄经（地心 · 回归黄道）</div>
-    <table class="grid" id="tbl">
-      <thead><tr><th>曜</th><th style="text-align:right">黄经</th><th>宫位</th><th style="text-align:right">行度/日</th></tr></thead>
-      <tbody id="tbody"></tbody>
-    </table>
-  </div>
-
-  <div class="sec">
-    <div class="h">虚星参数</div>
-    <div class="row">
-      <label>紫炁定例</label>
-      <select id="selZiqi" class="wide">
-        <option value="moira">Moira 定例（28 恒星年 · 10227.1792 日）</option>
-        <option value="ming">明史稿行度（1/28 度/日 · 10080 日）</option>
-      </select>
-      <span class="note">历元 1975-03-13 16:00 UT 在 230.5°</span>
-      <label>紫炁历元微调</label>
-      <input id="inZiqi" type="number" step="0.1" value="0" class="wide" />
-      <span class="note">° — 古籍仅载行度、未载历元；Moira 给出定例，此处仅作微调</span>
+    <div class="h">时间（UTC）<span class="caret">▾</span></div>
+    <div class="secBody">
+      <div class="row mono"><span id="timeNow">—</span></div>
+      <div class="row">
+        <input id="inYear" class="cal" type="number" step="1" /><label>年</label>
+        <input id="inMonth" class="cal" type="number" min="1" max="12" step="1" /><label>月</label>
+        <input id="inDay" class="cal" type="number" min="1" max="31" step="1" /><label>日</label>
+        <input id="inHour" class="cal" type="number" min="0" max="23" step="1" /><label>时</label>
+        <input id="inMin" class="cal" type="number" min="0" max="59" step="1" /><label>分</label>
+        <input id="inSec" class="cal" type="number" min="0" max="59" step="1" /><label>秒</label>
+      </div>
+      <div class="row">
+        <button id="btnNow" title="回到当前真实时刻；定盘后须点此，行限才按「此刻」推算">回到现在</button>
+        <button id="btnSetB" title="把上方时间栏填好的日期时间设为生辰，并把盘面时刻拨到该刻（后台自动定盘起大运）">设为生辰</button>
+        <button id="btnBClr" title="清除生辰，停止推大运；时间栏不变">清除生辰</button>
+      </div>
+      <div class="row">
+        <label>步进</label>
+        <button id="btnYm" title="盘面时间 −1 年">−1年</button><button id="btnMm" title="盘面时间 −1 月">−1月</button><button id="btnDm" title="盘面时间 −1 日">−1日</button>
+        <button id="btnDp" title="盘面时间 +1 日">+1日</button><button id="btnMp" title="盘面时间 +1 月">+1月</button><button id="btnYp" title="盘面时间 +1 年">+1年</button>
+      </div>
+      <div class="row note" id="bStatus">未设生辰 · 填好上方时间后点「设为生辰」即定盘，并把盘面时刻拨到该刻</div>
+      <div class="row note" id="dayunInfo" style="display:block">—</div>
     </div>
   </div>
 
-  <div class="sec">
-    <div class="h">显示</div>
-    <div class="row">
-      <button id="btnLabels" class="on">名称标签</button>
-      <button id="btnRing" class="on">十二宫刻度环</button>
-      <button id="btnOrbits" class="on">行星轨道</button>
-      <button id="btnMoon" class="on">白道与交点线</button>
-      <button id="btnXuyu" class="on">四余</button>
-      <button id="btnStars" class="on">星空</button>
-      <button id="btnState" class="on">状态</button>
-      <button id="btnGeju" class="on">成格局</button>
-      <button id="btnSpin" class="on">自转与月相</button>
-      <button id="btnEnergy" class="on">生克能量线</button>
-      <button id="btnQiGeo" class="on">气息测地积分</button>
-      <button id="btnStrip" class="on">黄道宫带</button>
+  <div class="sec fold">
+    <div class="h">时间流速<span class="caret">▾</span></div>
+    <div class="secBody">
+      <div class="row">
+        <button id="btnPause" title="暂停／继续时间推进">暂停</button>
+        <button class="spd" data-s="1" title="时间流速 1×（与真实时间同步）">1×</button>
+        <button class="spd" data-s="100" title="时间流速 100×">100×</button>
+        <button class="spd" data-s="1000" title="时间流速 1000×">1000×</button>
+        <button class="spd" data-s="10000" title="时间流速 1万×（1 秒 ≈ 2.8 小时盘面）">1万×</button>
+        <button class="spd" data-s="60000" title="时间流速 6万×（1 秒 ≈ 16.7 小时盘面）">6万×</button>
+        <button class="spd" data-s="300000" title="时间流速 30万×（1 秒 ≈ 3.5 日盘面）">30万×</button>
+      </div>
+      <div class="row note">
+        <label style="color:#8194ad;"><input type="checkbox" id="chkPauseJump" checked /> 定盘／改时间后暂停</label>
+        <span id="julianOut" class="mono"></span>
+      </div>
     </div>
-    <div class="row">
-      <label>视野</label>
-      <button id="btnV1">地心近景</button>
-      <button id="btnV2">内行星</button>
-      <button id="btnV3">七政</button>
-      <button id="btnV4">全系</button>
-      <button id="btnReset">复位视角</button>
+  </div>
+
+  <div class="sec fold">
+    <div class="h">地方时 · 真太阳时 · 节气 · 干支<span class="caret">▾</span></div>
+    <div class="secBody">
+      <div class="row">
+        <label>经度(°E)</label><input id="inLon" type="number" step="0.01" value="120" class="wide" title="出生地东经度数（东经为正），用于地方平时与真太阳时" />
+      </div>
+      <div id="timeInfo" class="note mono"></div>
     </div>
-    <div class="row note">行星表面纹理：Solar System Scope（solarsystemscope.com/textures）· 许可 CC BY 4.0</div>
+  </div>
+
+  <div class="sec fold">
+    <div class="h">十一曜黄经（地心 · 回归黄道）<span class="caret">▾</span></div>
+    <div class="secBody">
+      <table class="grid" id="tbl">
+        <thead><tr><th>曜</th><th style="text-align:right">黄经</th><th>宫位</th><th style="text-align:right">行度/日</th></tr></thead>
+        <tbody id="tbody"></tbody>
+      </table>
+    </div>
+  </div>
+
+  <div class="sec fold">
+    <div class="h">虚星参数<span class="caret">▾</span></div>
+    <div class="secBody">
+      <div class="row">
+        <label>紫炁定例</label>
+        <select id="selZiqi" class="wide" title="紫炁行度定例；古籍仅载行度、未载历元">
+          <option value="moira">Moira 定例（28 恒星年 · 10227.1792 日）</option>
+          <option value="ming">明史稿行度（1/28 度/日 · 10080 日）</option>
+        </select>
+        <label>历元微调</label>
+        <input id="inZiqi" type="number" step="0.1" value="0" class="wide" title="紫炁历元微调（度）；历元 1975-03-13 16:00 UT 在 230.5°" />
+        <span class="note">°</span>
+      </div>
+    </div>
+  </div>
+
+  <div class="sec fold">
+    <div class="h">显示<span class="caret">▾</span></div>
+    <div class="secBody">
+      <div class="row">
+        <button id="btnLabels" class="on" title="显示／隐藏曜名与宫名标签">名称标签</button>
+        <button id="btnRing" class="on" title="显示／隐藏黄道十二宫刻度环">十二宫刻度环</button>
+        <button id="btnOrbits" class="on" title="显示／隐藏行星轨道线">行星轨道</button>
+        <button id="btnMoon" class="on" title="显示／隐藏白道与罗计交点线">白道与交点线</button>
+        <button id="btnXuyu" class="on" title="显示／隐藏四余（罗睺·计都·紫炁·月孛）">四余</button>
+        <button id="btnStars" class="on" title="显示／隐藏恒星背景">星空</button>
+        <button id="btnState" class="on" title="显示／隐藏各曜庙旺失垣等状态">状态</button>
+        <button id="btnGeju" class="on" title="显示／隐藏严格成格常驻线与离子点云（须先设生辰定盘）">成格局</button>
+        <button id="btnSpin" class="on" title="显示／隐藏星体自转与月相变化">自转与月相</button>
+        <button id="btnEnergy" class="on" title="显示／隐藏选中曜的五行生克线">生克能量线</button>
+        <button id="btnQiGeo" class="on" title="显示／隐藏右下「赤道面阴阳气息测地积分」小窗">气息测地积分</button>
+        <button id="btnStrip" class="on" title="显示／隐藏底部黄道十二宫带（含大限青格与限度线）">黄道宫带</button>
+      </div>
+      <div class="row">
+        <label>视野</label>
+        <button id="btnV1" title="视角：贴近地心的近景档">地心近景</button>
+        <button id="btnV2" title="视角：内行星（水金）范围">内行星</button>
+        <button id="btnV3" title="视角：七政（日月五星）范围">七政</button>
+        <button id="btnV4" title="视角：含四余的全系范围">全系</button>
+        <button id="btnReset" title="恢复默认视角与朝向">复位视角</button>
+      </div>
+      <div class="row note">行星表面纹理：Solar System Scope（solarsystemscope.com/textures）· CC BY 4.0</div>
+    </div>
   </div>
 
 </div>
 
 <div id="topbar">
-  <button id="btnPanel">收起面板</button>
+  <button id="btnPanel" title="收起／展开左侧设置面板">收起面板</button>
   <button id="btnPingce" title="命盘评测：命主·宿度命度主·身度主·恩用财难余奴·星体宫位状态·严格格局·断语">评测</button>
   <button id="btnQiGeoMin" title="最小化／展开右下「赤道面阴阳气息测地积分」小窗">收起气息窗</button>
 </div>
@@ -346,6 +494,22 @@
 </div>
 
 <div id="pingcePanel" class="hide"></div>
+<div id="yaoPanel" class="hide"></div>
+
+<!-- 地面视图：点地球 →「跳转至地面」后铺满全屏的中国分野分区图（省按五行五色）。
+     常驻 DOM、靠 #groundWrap.on 切换（opacity/visibility/transform 过渡），不做 display 硬切。 -->
+<div id="groundWrap">
+  <canvas id="groundCanvas"></canvas>
+  <div id="groundBar">
+    <div class="gbTitle">地面分野 · <b>中国</b></div>
+    <div class="gbSub" id="groundReadout">点击省份看分野（点空白收起）· 拖动旋转 · 滚轮缩放</div>
+    <button id="btnGroundReset" title="复位到默认俯视角度与距离">复位视角</button>
+    <button id="btnGroundClose" title="返回天盘（地心）视角">返回天盘</button>
+  </div>
+  <div id="groundLegend"></div>
+  <div id="groundTip" class="hide"></div>
+  <div id="groundCard"></div>
+</div>
 
 <script type="module" src="./src/main.js"></script>
 </body>

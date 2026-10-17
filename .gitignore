@@ -11,6 +11,7 @@ solar-system-app/dist/
 .backup-original-*/
 
 # 系统与编辑器
+.trae/
 .DS_Store
 Thumbs.db
 .vscode/
